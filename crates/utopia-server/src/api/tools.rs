@@ -1084,6 +1084,8 @@ pub(super) fn fact_line(f: &EntityFact) -> String {
         to_precision: f.valid_to_precision.as_deref(),
         holds_from: f.holds_from,
         holds_to: f.holds_to,
+        end_derived: f.end_derived,
+        corrected: f.time_corrected,
     });
     let range = if range.is_empty() {
         range
@@ -1249,6 +1251,9 @@ fn change_line(c: &GraphChange) -> String {
         to_precision: c.valid_to_precision.as_deref(),
         holds_from: None,
         holds_to: None,
+        // 记录轴上的一次变更，不是事实行：它自己就说了改的是什么
+        end_derived: false,
+        corrected: false,
     });
     let range = if range.is_empty() {
         range
@@ -1481,6 +1486,8 @@ mod tests {
             evidence_count: 1,
             stale: false,
             corrected: false,
+            end_derived: false,
+            time_corrected: false,
             last_evidence_time: None,
             contested: None,
         }
