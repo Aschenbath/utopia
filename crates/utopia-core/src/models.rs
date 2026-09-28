@@ -842,9 +842,20 @@ pub struct EntityFact {
     /// 终点是时间线推出来的（`facts.end_derived`）：后一条事实开始时引擎把它关上，原文没说
     /// 这一天（#970）
     pub end_derived: bool,
-    /// 区间是人改过的：supersedes 链上有一条 `fact.time_corrected` 审计（#970）。与
-    /// `corrected` 不同，那一位是任何一次改写：自动接续、审阅裁决、人手改
+    /// 区间是人改过的（#970）：`corrected_ends` 有值。与 `corrected` 不同，那一位是任何一次
+    /// 改写：自动接续、审阅裁决、人手改
     pub time_corrected: bool,
+    /// 人改过哪一端：`start` / `end` / `both`（`facts.corrected_ends`，随修正行写下）。终点后来
+    /// 是时间线推出来的，就不再算终点被人改过
+    pub corrected_ends: Option<String>,
+    /// 时间线把它关上时接的那一行（#970 第二步）：只在 `end_derived`、而且找得到时有
+    pub closed_by_id: Option<Uuid>,
+    /// 接的那一行变了的那一端：接任者，或新的宾语实体的名字
+    pub closed_by: Option<String>,
+    /// 接的那一行的新值（属性事实）
+    pub closed_by_value: Option<serde_json::Value>,
+    /// 人改区间时写下的备注：链上最近那一次修正的
+    pub correction_note: Option<String>,
     /// 证据集合里最新的文档时间——开放事实的"最后确认时间"（时效性透明化）
     pub last_evidence_time: Option<DateTime<Utc>>,
     /// 有争议（0017 §3）：`{ kind, ref_id, derived? }`——哪一种（违规的 kind，或
