@@ -397,7 +397,13 @@ pub async fn resolve_document(state: &AppState, document_id: Uuid) -> anyhow::Re
             // 文档自己的日期（决定 3）：只在它还没有内容或来源给的日期时写
             if crate::extraction_open::dated_at(&doc).is_none() {
                 if let Some((t, _)) = dating.date.as_ref().and_then(parts_to_time) {
-                    utopia_store::documents::set_content_date(pool, document_id, t).await?;
+                    // 日期跟到引用这篇文档的事实上（#987）：抽取先跑，那时锚点填的是此刻
+                    let moved =
+                        utopia_store::documents::set_content_date(pool, document_id, t).await?;
+                    if moved > 0 {
+                        tracing::info!(%document_id, moved, "文档的日期认出来了，事实的锚点挪到了它上面");
+                        state.emit_graph(doc.kb_id);
+                    }
                 }
             }
             dating

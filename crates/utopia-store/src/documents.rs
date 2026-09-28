@@ -659,16 +659,95 @@ pub async fn set_time_context(
 
 /// 文档自己的日期，从正文里读出来的（0045 决定 3）：`doc_time_source = 'content'`。
 /// 只有正文或来源系统给的日期算文档的日期（[`Document::dated_at`]）；上传时刻不进这里
-pub async fn set_content_date(pool: &PgPool, id: Uuid, date: DateTime<Utc>) -> AppResult<()> {
-    sqlx::query(
+///
+/// **日期要跟到事实上**（#987）。抽取在定日期之前跑：那时文档还没有日期，陈述入库时
+/// `attested_from` 填的是此刻。日期认出来之后若只写在文档上，读的人拿到的下界就是处理
+/// 文档的那一刻——一份 2020 年的报告今天传上来，它没写起点的事实全都读作「今天才有」，
+/// 正是 #714 说不许发生的事。所以同一个事务里把引用这篇文档的事实的锚点挪到文档日期
+/// （只往早挪，与 `attest_earlier` 同一条规矩），再把它们所在的时间线重算一遍：引擎排
+/// 没起点的行用的就是证据的日期，日期来了次序可能变。返回挪了几条
+pub async fn set_content_date(pool: &PgPool, id: Uuid, date: DateTime<Utc>) -> AppResult<u64> {
+    let mut tx = pool.begin().await?;
+    let kb_id: Option<Uuid> = sqlx::query_scalar(
         "UPDATE documents SET doc_time = $2, doc_time_source = 'content', updated_at = now()
-          WHERE id = $1",
+          WHERE id = $1 RETURNING kb_id",
     )
     .bind(id)
     .bind(date)
-    .execute(pool)
+    .fetch_optional(&mut *tx)
     .await?;
-    Ok(())
+    let Some(kb_id) = kb_id else {
+        tx.commit().await?;
+        return Ok(0);
+    };
+    // 这一版的日期也记在版本上（#900）：证据停在这一版上的行按它算，日后再推一份新内容
+    // 换了文档的日期，它们不跟着变
+    sqlx::query(
+        "UPDATE document_versions SET doc_time = $2
+          WHERE document_id = $1 AND doc_time IS NULL
+            AND version = (SELECT max(version) FROM document_versions WHERE document_id = $1)",
+    )
+    .bind(id)
+    .bind(date)
+    .execute(&mut *tx)
+    .await?;
+    let (cited, timelines) = lock_cited_timelines(&mut tx, kb_id, id, &[]).await?;
+    let moved = attest_earlier_from_documents_tx(&mut tx, &cited).await?;
+    if moved > 0 {
+        crate::temporal::tidy_timelines_tx(&mut tx, kb_id, &timelines).await?;
+    }
+    tx.commit().await?;
+    Ok(moved)
+}
+
+/// 这些事实的锚点挪到它们最早的**带日期的**证据上（文档的日期来自正文或来源系统才算，
+/// 与 `temporal::DATED_AT` 同一口径），只往早挪。说「结束了不知哪天」的那一端同理。
+/// 类型化的行自己没有出处，跟着物化它的那条陈述走
+async fn attest_earlier_from_documents_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    fact_ids: &[Uuid],
+) -> AppResult<u64> {
+    if fact_ids.is_empty() {
+        return Ok(0);
+    }
+    let moved: Vec<(Uuid,)> = sqlx::query_as(
+        "UPDATE facts f
+            SET attested_from = LEAST(f.attested_from, e.first),
+                attested_to = CASE WHEN f.attested_to IS NOT NULL
+                                   THEN LEAST(f.attested_to, e.first) END
+           FROM (SELECT fe.fact_id, min(COALESCE(v.doc_time, d.doc_time)) AS first
+                   FROM fact_evidence fe
+                   JOIN documents d ON d.id = fe.document_id
+              LEFT JOIN document_versions v ON v.document_id = fe.document_id
+                                           AND v.version = fe.doc_version
+                  WHERE fe.fact_id = ANY($1) AND d.deleted_at IS NULL
+                    AND d.doc_time_source IN ('content', 'source')
+                    AND COALESCE(v.doc_time, d.doc_time) IS NOT NULL
+                  GROUP BY fe.fact_id) e
+          WHERE f.id = e.fact_id AND f.invalidated_at IS NULL
+            AND (f.attested_from IS NULL OR f.attested_from > e.first
+                 OR f.attested_to > e.first)
+        RETURNING f.id",
+    )
+    .bind(fact_ids)
+    .fetch_all(&mut **tx)
+    .await?;
+    let ids: Vec<Uuid> = moved.into_iter().map(|(id,)| id).collect();
+    let typed = sqlx::query(
+        "UPDATE facts t
+            SET attested_from = LEAST(t.attested_from, s.attested_from),
+                attested_to = CASE WHEN t.attested_to IS NOT NULL
+                                   THEN LEAST(t.attested_to, s.attested_from) END
+           FROM facts s
+          WHERE s.id = ANY($1) AND t.from_statement_id = s.id
+            AND t.layer = 'typed' AND t.invalidated_at IS NULL
+            AND (t.attested_from IS NULL OR t.attested_from > s.attested_from
+                 OR t.attested_to > s.attested_from)",
+    )
+    .bind(&ids)
+    .execute(&mut **tx)
+    .await?;
+    Ok(ids.len() as u64 + typed.rows_affected())
 }
 
 /// 变更：原地替换文档内容（新 sha），状态回 pending 待重跑管道。
