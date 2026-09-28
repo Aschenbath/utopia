@@ -93,6 +93,8 @@ pub struct OpenExtraction {
     pub entities: Vec<OpenEntity>,
     pub statements: Vec<OpenStatement>,
     pub names: Vec<OpenName>,
+    /// what the passage states about the document's own time (0064): dates with their names
+    pub time: Vec<crate::time::TimeEntry>,
     /// items skipped because they were malformed (counted per array item; must be reported by the caller)
     pub skipped: usize,
     /// the reply was truncated and repaired to the last complete object
@@ -107,7 +109,8 @@ Output one JSON object and nothing else, shaped like this:\n\
 \n\
 {\"e\": [[\"name or description\", \"kind word\", 1]],\n\
  \"s\": [[\"the sentence that states it, verbatim\", \"subject name\", \"relation phrase as written\", \"object name\", null, {\"to\": \"name of a listed thing\", \"amount\": \"$2 million\"}, \"when it holds or happened, as written\", \"when it ended, as written\"]],\n\
- \"n\": [[\"name as listed in e\", \"another name\", \"the sentence that uses it, verbatim\"]]}\n\
+ \"n\": [[\"name as listed in e\", \"another name\", \"the sentence that uses it, verbatim\"]],\n\
+ \"t\": [[\"now\", \"label as written\", \"the date as written\", {\"y\": 2011, \"m\": 3, \"d\": 4}, null]]}\n\
 \n\
 1. \"e\" lists the things the passage talks about, one entry each: [name, kind, named]. Every \
 thing a statement refers to is listed here once, under exactly the name the statements use. \
@@ -180,22 +183,36 @@ the coating are part of the description.\n\
 words that say when it stopped, each copied exactly as written (\"March 4, 2011\", \"去年冬天\", \
 \"by the end of next season\"). Never compute, convert or normalise a date, and never write one \
 the passage does not. Each is null when the passage gives none.\n\
+   Words that say when go in when or ended and nowhere else, never in the phrase, the \
+object, the value or a qualifier; also when they count from now or from another event \
+(\"三个月后\", \"last week\", \"six months after the launch\") and when the statement is \
+planned. If that leaves no value, the value is the word for what happened (\"发布\"). A \
+statement with no time of its own, under a heading that names one time and nothing else \
+(\"## 2025年第三季度\"), takes the heading's words as when.\n\
 6. Every \"s\" and \"n\" entry carries its own quote, copied verbatim from the passage: the first \
 slot of an \"s\" entry, the last slot of an \"n\" entry.\n\
 7. \"n\" lists other names, one entry each: [name as listed, other name, quote] — a short form, \
 a former name, a spelling in another script that this passage uses for a thing in \"e\" or a \
 thing already recorded. Only names actually written in the passage; never a pronoun or a \
 description.\n\
-8. State nothing the passage does not state, and state each thing once: with a value or with \
+8. \"t\" lists the dates the passage states about the document itself, one entry each: \
+[kind, label, words, from, to]. kind is \"now\" for the moment the text speaks from (a \
+dateline, the date a report was submitted or published, a meeting's date), \"date\" for any \
+other labelled date (a cut-off, an effective date, a deadline), \"period\" for a named period \
+with stated bounds. label and words are copied as written; from and to transcribe the numbers \
+the words state (y, m, d), to only for a period. A date inside a sentence about something that \
+happened is that statement's when and is not listed. [] when there are none.\n\
+9. State nothing the passage does not state, and state each thing once: with a value or with \
 an object, not both. The Document line, the opening of the document and the list of things \
 already recorded only say where the passage comes from; write nothing about them. If the \
-passage states nothing, output {\"e\":[],\"s\":[],\"n\":[]}.\n\
+passage states nothing, output {\"e\":[],\"s\":[],\"n\":[],\"t\":[]}.\n\
 \n\
 Example. The passage \"The city council awarded the paving contract to Brightway Builders for \
 $2 million on March 4, 2011.\" gives:\n\
 {\"e\": [[\"city council\", \"council\", 0], [\"paving contract\", \"contract\", 0], [\"Brightway Builders\", \"builders\", 1]],\n\
  \"s\": [[\"The city council awarded the paving contract to Brightway Builders for $2 million on March 4, 2011.\", \"city council\", \"awarded\", \"paving contract\", null, {\"to\": \"Brightway Builders\", \"amount\": \"$2 million\"}, \"March 4, 2011\", null]],\n\
- \"n\": []}";
+ \"n\": [],\n\
+ \"t\": []}";
 
 /// 构造开放抽取的两条消息：常量系统消息 + `Document:` / 开头 / 已知实体 / `Passage:`。
 ///
@@ -443,6 +460,12 @@ pub fn parse_open_response(raw: &str) -> anyhow::Result<OpenExtraction> {
     for item in items(&value, "n") {
         match item.as_array().and_then(|a| parse_name(a)) {
             Some(n) => out.names.push(n),
+            None => out.skipped += 1,
+        }
+    }
+    for item in items(&value, "t") {
+        match crate::time::time_entry(item) {
+            Some(t) => out.time.push(t),
             None => out.skipped += 1,
         }
     }
@@ -765,10 +788,16 @@ mod tests {
             assert!(!s.contains("Relation types"), "{s}");
             assert!(!s.contains("Attributes ("), "{s}");
             assert!(!s.contains("\"q\""), "没有引文表: {s}");
-            assert!(!s.contains("\"t\""), "没有时间表: {s}");
             assert!(!s.contains("k1"), "句柄不给模型看: {s}");
         }
         assert!(system.contains("Never compute, convert or normalise a date"));
+        // 0064：文档自己说到的日期由这一块报上来（`t`），时间词只进 when / ended；
+        // 提示词里仍然没有文档日期，也不让模型算
+        assert!(
+            system.contains("\"t\" lists the dates the passage states about the document itself")
+        );
+        assert!(system.contains("go in when or ended and nowhere else"));
+        assert!(system.contains("transcribe the numbers"));
         assert!(system.contains("do not translate it into any vocabulary of your own"));
         assert!(system.contains("written exactly as listed in \"e\""));
         assert!(system.contains("copied verbatim"));
