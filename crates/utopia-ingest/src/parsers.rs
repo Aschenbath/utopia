@@ -480,7 +480,8 @@ pub(crate) fn docx_xml_to_text(
     Ok(out)
 }
 
-/// PPTX: extract a:t text in the presentation's logical slide order.
+/// PPTX: extract a:t text in the presentation's logical slide order. Tables under a:tbl
+/// become Markdown grids through the same renderer as DOCX and spreadsheet tables.
 pub fn pptx(bytes: &[u8]) -> anyhow::Result<String> {
     let mut archive =
         zip::ZipArchive::new(Cursor::new(bytes.to_vec())).context("Failed to unzip pptx")?;
@@ -510,7 +511,7 @@ pub fn pptx(bytes: &[u8]) -> anyhow::Result<String> {
     let mut out = String::new();
     for (num, name) in slides {
         let xml = pptx_part(&mut archive, &name)?;
-        let text = extract_xml_text(&xml, "a:t", "a:p", "a:br")?;
+        let text = pptx_xml_to_text(&xml)?;
         if !text.trim().is_empty() {
             out.push_str(&format!("\n## Slide {num}\n{text}\n"));
         }
@@ -1015,45 +1016,159 @@ fn read_zip_entry(
     Ok(content)
 }
 
-/// 从 OOXML 里抽取 `text_tag`（如 a:t）内的文本，遇 `para_tag`（如 a:p）结束换行，
-/// 遇 `break_tag`（如 a:br）也换行。
-fn extract_xml_text(
-    xml: &str,
-    text_tag: &str,
-    para_tag: &str,
-    break_tag: &str,
-) -> anyhow::Result<String> {
+/// 从 PPTX 的 slide XML 里读文字。表外的 `a:p`/`a:br` 仍按原来的换行规则；
+/// `a:tbl` 里的每个 `a:tr` 收成一行，每个 `a:tc` 收成一格，格内段落用空格连接。
+fn pptx_xml_to_text(xml: &str) -> anyhow::Result<String> {
+    #[derive(Default)]
+    struct TableCell {
+        text: String,
+        span: usize,
+        horizontal_merge: bool,
+        vertical_merge: bool,
+    }
+
+    fn attr(e: &quick_xml::events::BytesStart<'_>, name: &str) -> Option<String> {
+        e.attributes()
+            .flatten()
+            .find(|a| a.key.as_ref() == name)
+            .map(|a| a.value.to_string())
+    }
+
+    fn truthy(e: &quick_xml::events::BytesStart<'_>, name: &str) -> bool {
+        matches!(attr(e, name).as_deref(), Some("1" | "true" | "on"))
+    }
+
     let mut reader = Reader::from_str(xml);
     let mut out = String::new();
     let mut in_text = false;
+    let mut table_depth = 0usize;
+    let mut rows: Vec<GridRow> = Vec::new();
+    let mut row: GridRow = Vec::new();
+    let mut cell: Option<TableCell> = None;
+    let mut first_is_header = false;
     loop {
         match reader.read_event() {
-            Ok(Event::Start(e)) if e.name().as_ref() == text_tag => in_text = true,
-            // 段落里换的行（Shift+Enter）不是新段落，是两个 run 之间的一个 `<a:br>`。丢了它，
-            // 标题「Q1」换行「2024」读成「Q12024」，季度和年份一起没了（Word 格子里的同一件事
-            // 见 #813）
-            Ok(Event::Start(e) | Event::Empty(e)) if e.name().as_ref() == break_tag => {
-                out.push('\n');
-            }
-            Ok(Event::End(e)) => {
-                let name = e.name();
-                if name.as_ref() == text_tag {
-                    in_text = false;
-                } else if name.as_ref() == para_tag {
-                    out.push('\n');
+            Ok(Event::Start(e)) => match e.name().as_ref() {
+                "a:tbl" => {
+                    table_depth += 1;
+                    if table_depth == 1 {
+                        rows.clear();
+                        row.clear();
+                        cell = None;
+                        first_is_header = false;
+                    }
+                }
+                "a:tblPr" if table_depth == 1 => {
+                    first_is_header = truthy(&e, "firstRow");
+                }
+                "a:tr" if table_depth == 1 => row.clear(),
+                "a:tc" if table_depth == 1 => {
+                    cell = Some(TableCell {
+                        span: 1,
+                        ..TableCell::default()
+                    });
+                }
+                "a:tcPr" if table_depth == 1 => {
+                    if let Some(c) = cell.as_mut() {
+                        if let Some(span) = attr(&e, "gridSpan").and_then(|v| v.parse().ok()) {
+                            c.span = span;
+                        }
+                        c.horizontal_merge = truthy(&e, "hMerge");
+                        c.vertical_merge = truthy(&e, "vMerge");
+                    }
+                }
+                "a:t" => {
+                    if cell.is_some() || table_depth == 0 {
+                        in_text = true;
+                    }
+                }
+                "a:br" => match cell.as_mut() {
+                    Some(c) => c.text.push(' '),
+                    None if table_depth == 0 => out.push('\n'),
+                    _ => {}
+                },
+                _ => {}
+            },
+            Ok(Event::Empty(e)) => match e.name().as_ref() {
+                "a:tblPr" if table_depth == 1 => {
+                    first_is_header = truthy(&e, "firstRow");
+                }
+                "a:tcPr" if table_depth == 1 => {
+                    if let Some(c) = cell.as_mut() {
+                        if let Some(span) = attr(&e, "gridSpan").and_then(|v| v.parse().ok()) {
+                            c.span = span;
+                        }
+                        c.horizontal_merge = truthy(&e, "hMerge");
+                        c.vertical_merge = truthy(&e, "vMerge");
+                    }
+                }
+                "a:br" => match cell.as_mut() {
+                    Some(c) => c.text.push(' '),
+                    None if table_depth == 0 => out.push('\n'),
+                    _ => {}
+                },
+                "a:tab" => {
+                    if let Some(c) = cell.as_mut() {
+                        c.text.push(' ');
+                    }
+                }
+                _ => {}
+            },
+            Ok(Event::End(e)) => match e.name().as_ref() {
+                "a:t" => in_text = false,
+                "a:p" => match cell.as_mut() {
+                    Some(c) => c.text.push(' '),
+                    None if table_depth == 0 => out.push('\n'),
+                    _ => {}
+                },
+                "a:tc" if table_depth == 1 => {
+                    if let Some(mut c) = cell.take() {
+                        if !c.horizontal_merge {
+                            if c.vertical_merge {
+                                c.text.clear();
+                            }
+                            row.push((c.text, c.span.max(1), 0));
+                        }
+                    }
+                }
+                "a:tr" if table_depth == 1 => rows.push(std::mem::take(&mut row)),
+                "a:tbl" => {
+                    table_depth = table_depth.saturating_sub(1);
+                    if table_depth == 0 {
+                        if let Some(md) = crate::table::render_grid(&rows, first_is_header) {
+                            out.push('\n');
+                            out.push_str(&md);
+                            out.push_str("\n\n");
+                        }
+                        rows.clear();
+                        row.clear();
+                        cell = None;
+                        first_is_header = false;
+                    }
+                }
+                _ => {}
+            },
+            Ok(Event::Text(t)) if in_text => {
+                let text = t.xml_content(quick_xml::XmlVersion::Implicit1_0);
+                match cell.as_mut() {
+                    Some(c) => c.text.push_str(&text),
+                    None => out.push_str(&text),
                 }
             }
-            Ok(Event::Text(t)) if in_text => {
-                out.push_str(&t.xml_content(quick_xml::XmlVersion::Implicit1_0));
-            }
             Ok(Event::CData(t)) if in_text => {
-                out.push_str(&t.xml_content(quick_xml::XmlVersion::Implicit1_0));
+                let text = t.xml_content(quick_xml::XmlVersion::Implicit1_0);
+                match cell.as_mut() {
+                    Some(c) => c.text.push_str(&text),
+                    None => out.push_str(&text),
+                }
             }
             Ok(Event::GeneralRef(e)) if in_text => {
                 let reference = format!("&{};", e.into_inner());
-                match quick_xml::escape::unescape(&reference) {
-                    Ok(s) => out.push_str(&s),
-                    Err(_) => out.push_str(&reference),
+                let text = quick_xml::escape::unescape(&reference)
+                    .unwrap_or(std::borrow::Cow::Borrowed(&reference));
+                match cell.as_mut() {
+                    Some(c) => c.text.push_str(&text),
+                    None => out.push_str(&text),
                 }
             }
             Ok(Event::Eof) => break,
