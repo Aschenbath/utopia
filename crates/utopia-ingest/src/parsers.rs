@@ -6,6 +6,9 @@ use quick_xml::Reader;
 use std::io::{Cursor, Read, Write};
 use std::process::Command;
 
+const SPREADSHEET_ROW_LIMIT: usize = 2_000;
+const CSV_RECORD_LIMIT: usize = 10_000;
+
 /// 文本解码：chardetng 探测编码（覆盖 GBK/GB18030/BIG5 等中文常见编码）。
 pub fn plain_text(bytes: &[u8]) -> String {
     use chardetng::{EncodingDetector, Iso2022JpDetection, Utf8Detection};
@@ -754,11 +757,12 @@ fn pptx_order(
 }
 
 /// xlsx / xls / ods: calamine 全格式读取，每 sheet 输出制表符表格（限前 2000 行）。
-pub fn spreadsheet(bytes: &[u8]) -> anyhow::Result<String> {
+pub fn spreadsheet(bytes: &[u8]) -> anyhow::Result<(String, Vec<crate::ParseWarning>)> {
     use calamine::Reader as _;
     let mut workbook = calamine::open_workbook_auto_from_rs(Cursor::new(bytes.to_vec()))
         .context("Failed to open spreadsheet")?;
     let mut out = String::new();
+    let mut warnings = Vec::new();
     for sheet_name in workbook.sheet_names() {
         let Ok(range) = workbook.worksheet_range(&sheet_name) else {
             continue;
@@ -777,6 +781,19 @@ pub fn spreadsheet(bytes: &[u8]) -> anyhow::Result<String> {
             _ => Vec::new(),
         };
         out.push_str(&format!("\n# Sheet: {sheet_name}\n\n"));
+        let rows_total = range.height();
+        if rows_total > SPREADSHEET_ROW_LIMIT {
+            let rows_read = SPREADSHEET_ROW_LIMIT;
+            warnings.push(crate::ParseWarning {
+                kind: crate::ParseWarning::SPREADSHEET_ROWS_TRUNCATED,
+                detail: serde_json::json!({
+                    "sheet": sheet_name.clone(),
+                    "rows_read": rows_read,
+                    "rows_total": rows_total,
+                    "rows_omitted": rows_total - rows_read,
+                }),
+            });
+        }
         // 每张表按网格渲染成带列头的 Markdown 表；一格字都没有的表退回制表符分隔
         let (rows, headers) = spreadsheet_grid(&range, &merges);
         match crate::table::render_grid_with_headers(&rows, headers) {
@@ -793,7 +810,7 @@ pub fn spreadsheet(bytes: &[u8]) -> anyhow::Result<String> {
             }
         }
     }
-    Ok(out)
+    Ok((out, warnings))
 }
 
 #[derive(Clone)]
@@ -812,7 +829,7 @@ fn spreadsheet_grid(
     let Some((start_row, start_col)) = range.start() else {
         return (Vec::new(), None);
     };
-    let height = range.height().min(2000);
+    let height = range.height().min(SPREADSHEET_ROW_LIMIT);
     let width = range.width();
     if height == 0 || width == 0 {
         return (Vec::new(), None);
@@ -971,7 +988,7 @@ pub fn html(bytes: &[u8]) -> anyhow::Result<String> {
     Ok(crate::html::page_to_markdown(&plain_text(bytes), None)?)
 }
 
-pub fn csv_text(bytes: &[u8], tsv: bool) -> anyhow::Result<String> {
+pub fn csv_text(bytes: &[u8], tsv: bool) -> anyhow::Result<(String, Vec<crate::ParseWarning>)> {
     let decoded = plain_text(bytes);
     let mut reader = csv::ReaderBuilder::new()
         .delimiter(if tsv { b'\t' } else { b',' })
@@ -979,15 +996,28 @@ pub fn csv_text(bytes: &[u8], tsv: bool) -> anyhow::Result<String> {
         .has_headers(false)
         .from_reader(decoded.as_bytes());
     let mut rows: Vec<GridRow> = Vec::new();
-    for (i, record) in reader.records().enumerate() {
-        if i >= 10_000 {
-            break;
-        }
+    let mut records_total = 0usize;
+    for record in reader.records() {
         let record = record?;
-        rows.push(record.iter().map(|s| (s.to_string(), 1, 0)).collect());
+        records_total += 1;
+        if rows.len() < CSV_RECORD_LIMIT {
+            rows.push(record.iter().map(|s| (s.to_string(), 1, 0)).collect());
+        }
+    }
+    let mut warnings = Vec::new();
+    if records_total > CSV_RECORD_LIMIT {
+        let records_read = rows.len();
+        warnings.push(crate::ParseWarning {
+            kind: crate::ParseWarning::CSV_RECORDS_TRUNCATED,
+            detail: serde_json::json!({
+                "records_read": records_read,
+                "records_total": records_total,
+                "records_omitted": records_total - records_read,
+            }),
+        });
     }
     // 第一条记录是列头（csv 的惯例）；渲染不出表时退回竖线分隔的行
-    Ok(match crate::table::render_grid(&rows, true) {
+    let text = match crate::table::render_grid(&rows, true) {
         Some(md) => md + "\n",
         None => {
             rows.iter()
@@ -1001,7 +1031,8 @@ pub fn csv_text(bytes: &[u8], tsv: bool) -> anyhow::Result<String> {
                 .join("\n")
                 + "\n"
         }
-    })
+    };
+    Ok((text, warnings))
 }
 
 // ---- 工具 ----
@@ -1251,7 +1282,9 @@ mod tests {
     /// csv 的第一条记录是列头，哪怕列头是年份
     #[test]
     fn a_csv_is_a_table_whose_first_record_is_the_header() {
-        let text = csv_text(b"Item,2025,2024\nRevenue,10,8\nCost,4,3\n", false).unwrap();
+        let text = csv_text(b"Item,2025,2024\nRevenue,10,8\nCost,4,3\n", false)
+            .unwrap()
+            .0;
         assert_eq!(
             text,
             "| Item | 2025 | 2024 |\n| --- | --- | --- |\n| Revenue | 10 | 8 |\n| Cost | 4 | 3 |\n"
@@ -1268,7 +1301,8 @@ mod tests {
 ",
             false,
         )
-        .unwrap();
+        .unwrap()
+        .0;
         assert!(text.starts_with("| no | name | score |"), "{text}");
         assert!(text.contains("| 1 |  |  |"), "{text}");
         assert!(text.contains("| 2 | Ada | 9 |"), "{text}");
@@ -1277,7 +1311,9 @@ mod tests {
     /// 一格数字都没有的 csv 也是表：标签列是最左那格
     #[test]
     fn a_csv_of_words_is_still_a_table() {
-        let text = csv_text(b"name,role\nAda,engineer\nGrace,admiral\n", false).unwrap();
+        let text = csv_text(b"name,role\nAda,engineer\nGrace,admiral\n", false)
+            .unwrap()
+            .0;
         assert!(
             text.starts_with("| name | role |\n| --- | --- |\n| Ada | engineer |"),
             "{text}"
