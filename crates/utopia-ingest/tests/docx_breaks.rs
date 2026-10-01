@@ -43,19 +43,91 @@ fn explicit_cell_breaks_separate_numbers_and_words() {
 }
 
 #[test]
-fn paragraph_breaks_remain_newlines_and_formatting_runs_join() {
+fn paragraph_ends_are_blank_lines_but_explicit_breaks_are_newlines() {
     for br in ["<w:br/>", "<w:cr/>", "<w:br></w:br>", "<w:cr></w:cr>"] {
         let text = read(&format!(
             "<w:p><w:r><w:t>Hel</w:t></w:r><w:r><w:t>lo</w:t>{br}<w:t>world</w:t></w:r></w:p>"
         ));
-        assert_eq!(text.trim(), "Hello\nworld", "{br}");
+        assert_eq!(
+            text.trim(),
+            "Hello\nworld",
+            "a break inside one paragraph: {br}"
+        );
     }
     let text = read(&table(
         "<w:t>Hel</w:t></w:r><w:r><w:t>lo</w:t><w:tab/><w:t>world</w:t>",
     ));
     assert!(text.contains("| Sample | Hello world |"), "{text}");
     let text = read("<w:p><w:r><w:t>first</w:t><w:tab/><w:t>line</w:t></w:r></w:p><w:p><w:r><w:t>second</w:t></w:r></w:p>");
-    assert_eq!(text.trim(), "first line\nsecond");
+    assert_eq!(text.trim(), "first line\n\nsecond");
+}
+
+#[test]
+fn empty_word_paragraphs_do_not_make_empty_blocks_or_blank_runs() {
+    let text = read(concat!(
+        "<w:p><w:r><w:t>first</w:t></w:r></w:p>",
+        "<w:p/>",
+        "<w:p><w:r><w:t> </w:t></w:r></w:p>",
+        "<w:p><w:r><w:t>second</w:t></w:r></w:p>",
+    ));
+    assert_eq!(text.trim(), "first\n\nsecond");
+    assert!(!text.contains("\n\n\n"), "{text}");
+}
+
+#[test]
+fn a_long_word_list_packs_multiple_items_per_chunk() {
+    let body: String = (1..=30)
+        .map(|i| format!("<w:p><w:r><w:t>List item {i} is short.</w:t></w:r></w:p>"))
+        .collect();
+    let text = read(&body);
+    assert_eq!(text.matches("List item").count(), 30, "{text}");
+
+    let pieces = utopia_ingest::chunk_with_budget(&text, 40);
+    assert!(pieces.len() < 30, "{pieces:#?}");
+    assert!(
+        pieces
+            .iter()
+            .any(|piece| piece.text.matches("List item").count() > 1),
+        "{pieces:#?}"
+    );
+}
+
+fn long_table(rows: usize) -> String {
+    let mut table = String::from(
+        r#"<w:tbl><w:tr><w:tc><w:p><w:r><w:t>区域</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>2024 年营收</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>单位</w:t></w:r></w:p></w:tc></w:tr>"#,
+    );
+    for row in 1..=rows {
+        table.push_str(&format!(
+            "<w:tr><w:tc><w:p><w:r><w:t>区域 {row}</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>{row}00</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>万元</w:t></w:r></w:p></w:tc></w:tr>"
+        ));
+    }
+    table.push_str("</w:tbl>");
+    table
+}
+
+#[test]
+fn a_word_caption_is_repeated_for_every_piece_of_a_split_table() {
+    let analysis = "本段分析说明营业收入同比变化、客户结构和主要风险，不是表格的说明句。".repeat(4);
+    let caption = "表1 2024 年分区域营收（单位：万元）";
+    let text = read(&format!(
+        "<w:p><w:r><w:t>{analysis}</w:t></w:r></w:p><w:p><w:r><w:t>{caption}</w:t></w:r></w:p>{}",
+        long_table(40)
+    ));
+    assert!(
+        text.contains(&format!("{analysis}\n\n{caption}\n\n|")),
+        "{text}"
+    );
+
+    let pieces = utopia_ingest::chunk_text(&text);
+    let table_pieces: Vec<_> = pieces
+        .iter()
+        .filter(|piece| piece.text.contains("| --- |"))
+        .collect();
+    assert!(table_pieces.len() >= 2, "{pieces:#?}");
+    for piece in table_pieces {
+        assert!(piece.text.contains(caption), "{:#?}", piece.text);
+        assert!(!piece.text.contains(&analysis), "{:#?}", piece.text);
+    }
 }
 
 #[test]

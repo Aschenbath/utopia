@@ -35,7 +35,10 @@ table travels with its caption and header and a continuation repeats both; a cap
 every table that follows it; a row is never split; headings become a breadcrumb prefix and
 `chunks.heading`; a thematic break is not a boundary and a table it split is joined back; no
 overlap; chunk text is verbatim slices so a quote is found by offset; a document is re-chunked on
-its next reprocess [0039]. A DOCX paragraph outside a table is a heading when it has an outline
+its next reprocess [0039]. A Word paragraph outside a table ends a Markdown paragraph, so the
+caption and packing rules see the same boundaries as Markdown and HTML: a blank line follows it, a
+`w:br` inside it stays a single newline, a paragraph inside a table cell stays a space, and empty
+paragraphs disappear [#1024]. A DOCX paragraph outside a table is a heading when it has an outline
 level: its own `w:outlineLvl`, else its style's, else a style named `heading N`, else the style it
 is based on (style ids differ by the language of Word, the names do not); so a Word file's
 sections reach the chunks and the section dates of 0064.

@@ -133,10 +133,11 @@ fn pdf_with_poppler(bytes: &[u8]) -> anyhow::Result<String> {
     String::from_utf8(output.stdout).context("pdftotext returned invalid UTF-8")
 }
 
-/// docx：解压 word/document.xml。正文 w:t 取字、w:p 分段；表格（w:tbl）收成网格交给
-/// `table::render_grid`，和 HTML 表走同一套渲染：w:gridSpan 跨列，上下合并（w:vMerge）的
-/// 续格留空，格内段落的左缩进 w:ind 当内边距（小节行靠它折进标签）。套在格子里的表按格子
-/// 文字处理。标题（有大纲级别的段落，见 [`docx_heading_styles`]）写成 Markdown 标题。
+/// docx：解压 word/document.xml。正文 w:t 取字；不在表格里的 w:p 是一段，段末留空行；
+/// 段内的 w:br/w:cr 仍是单换行。表格（w:tbl）收成网格交给 `table::render_grid`，和 HTML 表
+/// 走同一套渲染：w:gridSpan 跨列，上下合并（w:vMerge）的续格留空，格内段落的左缩进 w:ind
+/// 当内边距（小节行靠它折进标签）。套在格子里的表按格子文字处理。标题（有大纲级别的段落，
+/// 见 [`docx_heading_styles`]）写成 Markdown 标题。
 pub fn docx(bytes: &[u8]) -> anyhow::Result<String> {
     let mut archive =
         zip::ZipArchive::new(Cursor::new(bytes)).context("Malformed docx structure")?;
@@ -254,9 +255,12 @@ pub(crate) fn docx_xml_to_text(
     let mut cell: Option<(String, usize, u32)> = None;
     // 正文里的一段（不在表格里、不是文本框里套着的段）是不是标题。`paragraphs` 数套了几层
     // w:p，`para_start` 是这一段在 out 里开始的位置。级别先看段落自己写的 w:outlineLvl，
-    // 再看它的样式；两样都只认第一次出现的，w:pPrChange 里记的是修订之前的样式，不算
+    // 再看它的样式；两样都只认第一次出现的，w:pPrChange 里记的是修订之前的样式，不算。
+    // 另一个栈记每段开始的位置，用来在段末把空段丢掉、非空段之间只留一个空行。文本框会
+    // 在宿主段里再套 w:p，栈让内层段落也能各自收尾，而标题判定仍只看最外层。
     let mut paragraphs = 0usize;
     let mut para_start = 0usize;
+    let mut paragraph_starts: Vec<usize> = Vec::new();
     let mut own_level: Option<Option<u8>> = None;
     let mut style_level: Option<Option<u8>> = None;
     let mut in_revision = false;
@@ -333,6 +337,9 @@ pub(crate) fn docx_xml_to_text(
                 "w:t" => in_text = true,
                 "w:p" => {
                     paragraphs += 1;
+                    if cell.is_none() {
+                        paragraph_starts.push(out.len());
+                    }
                     if paragraphs == 1 && cell.is_none() {
                         para_start = out.len();
                         own_level = None;
@@ -387,11 +394,12 @@ pub(crate) fn docx_xml_to_text(
                     match cell.as_mut() {
                         Some(c) => c.0.push(' '),
                         None => {
+                            let start = paragraph_starts.pop().unwrap_or(out.len());
                             // 标题写成一行 Markdown 标题：分块器靠它给每块开头补上所在的各级标题，
                             // 时间解释靠块里的标题行分节（0064 决定 1 按 cut 2 修订的那段）。没有
                             // 它，一份 Word 里各节的日期都算成第一节的
                             let level = own_level.unwrap_or(style_level.flatten());
-                            if let Some(level) = level.filter(|_| paragraphs == 1) {
+                            if let Some(level) = level.filter(|_| paragraph_starts.is_empty()) {
                                 let title = out[para_start..]
                                     .split_whitespace()
                                     .collect::<Vec<_>>()
@@ -403,7 +411,15 @@ pub(crate) fn docx_xml_to_text(
                                     out.push_str(&title);
                                 }
                             }
-                            out.push('\n');
+                            // 一个 Word 段落是一个 Markdown 段。收尾时先去掉段内末尾的空白，
+                            // 空段不留痕；非空段只补一个空行，w:br 产生的段内单换行不受影响。
+                            let end = start + out[start..].trim_end().len();
+                            if end == start {
+                                out.truncate(start);
+                            } else {
+                                out.truncate(end);
+                                out.push_str("\n\n");
+                            }
                         }
                     }
                     paragraphs = paragraphs.saturating_sub(1);
@@ -418,7 +434,11 @@ pub(crate) fn docx_xml_to_text(
                     depth = depth.saturating_sub(1);
                     if depth == 0 {
                         if let Some(md) = crate::table::render_grid(&rows, false) {
-                            out.push('\n');
+                            if !out.is_empty() {
+                                let end = out.trim_end().len();
+                                out.truncate(end);
+                                out.push_str("\n\n");
+                            }
                             out.push_str(&md);
                             out.push_str("\n\n");
                         }
@@ -1059,14 +1079,14 @@ mod tests {
     #[test]
     fn a_docx_table_is_rendered_under_its_headings() {
         let text = docx_xml_to_text(DOC, &Default::default()).unwrap();
-        assert!(text.starts_with("Segment results\n"), "{text}");
+        assert!(text.starts_with("Segment results\n\n"), "{text}");
         assert!(
             text.contains(
                 "| Segment | Revenue |\n| --- | --- |\n| Cloud | $1,200 |\n| Devices | $300 |"
             ),
             "{text}"
         );
-        assert!(text.ends_with("After the table.\n"), "{text}");
+        assert!(text.ends_with("After the table.\n\n"), "{text}");
     }
 
     /// 套在格子里的表不单独成表：它的字算外层格子的字
