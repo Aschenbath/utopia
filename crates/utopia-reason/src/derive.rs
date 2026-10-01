@@ -128,8 +128,12 @@ pub fn overlap(
     Some((from, to))
 }
 
-/// 从某个主语出发的一条边：(宾语, 起, 止, 事实 id)。
-type Hop = (Uuid, Option<i64>, Option<i64>, Uuid);
+/// 从某个主语出发的一条边：(宾语, 起, 止, 支撑它的事实 id 列表)。
+///
+/// 第四项是**列表**而不是单个 id：这一项也会装进派生出来的边，而派生的证明可以
+/// 有好几条前提。只留第一条的话，传递再接一条派生边时，证明就短了——链上少一条
+/// 前提，而 `validity` 只对留下来的那几条求交集，于是结论的有效期比实际宽。
+type Hop = (Uuid, Option<i64>, Option<i64>, Vec<Uuid>);
 
 /// 派生的中间态:一个 (主语, 宾语) 对是怎么来的。
 #[derive(Clone)]
@@ -184,7 +188,7 @@ pub fn derive(edges: &[TimedEdge], axioms: &HashMap<Uuid, Axioms>) -> Derivation
     for e in edges {
         adj.entry((e.edge.predicate, e.edge.subject))
             .or_default()
-            .push((e.edge.object, e.from, e.to, e.edge.fact));
+            .push((e.edge.object, e.from, e.to, vec![e.edge.fact]));
     }
 
     let mut frontier: Vec<(Triple, Reached)> = edges
@@ -260,7 +264,7 @@ pub fn derive(edges: &[TimedEdge], axioms: &HashMap<Uuid, Axioms>) -> Derivation
             // ---- 传递：需要接一条同谓词的出边
             if ax.transitive {
                 let outs = adj.get(&(pred, obj)).cloned().unwrap_or_default();
-                for (c, from, to, fact) in outs {
+                for (c, from, to, hop_premises) in outs {
                     // **不推自环。** `A p A` 在一个传递+反对称的谓词上是矛盾
                     // 而不是知识，R0 那边会把这个环连路径一起报出来
                     if subj == c {
@@ -276,7 +280,7 @@ pub fn derive(edges: &[TimedEdge], axioms: &HashMap<Uuid, Axioms>) -> Derivation
                         &acc,
                         nf,
                         nt,
-                        Some(fact),
+                        Some(&hop_premises),
                         &asserted,
                         &mut reached,
                         &mut per_pred,
@@ -312,8 +316,8 @@ fn emit(
     acc: &Reached,
     from: Option<i64>,
     to: Option<i64>,
-    // 传递多用掉的那一条前提；一跳规则没有
-    extra_premise: Option<Uuid>,
+    // 传递多用掉的那一条边所依赖的全部前提；一跳规则没有
+    extra_premises: Option<&[Uuid]>,
     asserted: &HashSet<Triple>,
     reached: &mut HashMap<Triple, Reached>,
     per_pred: &mut HashMap<Uuid, usize>,
@@ -332,6 +336,17 @@ fn emit(
     if asserted.contains(&t) || reached.contains_key(&t) {
         return false;
     }
+    let mut premises = acc.premises.clone();
+    if let Some(extra) = extra_premises {
+        premises.extend_from_slice(extra);
+    }
+    // 深度上限在这里再判一次。展开 frontier 时那条 `premises.len() >= MAX_DEPTH`
+    // 只看得到当前这一份；传递接上来的那条边可能自带好几条前提，一次就能把长度
+    // 顶过上限，所以**拼完之后**才是判得上限的地方
+    if premises.len() > MAX_DEPTH {
+        return false;
+    }
+
     let n = per_pred.entry(pred).or_insert(0);
     if *n >= MAX_DERIVED_PER_PREDICATE {
         capped.insert(pred);
@@ -339,21 +354,18 @@ fn emit(
     }
     *n += 1;
 
-    let mut premises = acc.premises.clone();
-    if let Some(p) = extra_premise {
-        premises.push(p);
-    }
     let r = Reached {
         from,
         to,
         premises: premises.clone(),
     };
     reached.insert(t, r.clone());
-    // 派生出来的边也能被后续传递接上
-    if let Some(&first) = premises.first() {
+    // 派生出来的边也能被后续传递接上。**整份证明都要带上**：邻接表里的这一项
+    // 以后会被当作前提拼进下一条派生，只留首条会让链上的证明越拼越短
+    if !premises.is_empty() {
         adj.entry((pred, subj))
             .or_default()
-            .push((obj, from, to, first));
+            .push((obj, from, to, premises.clone()));
     }
     out.facts.push(Derived {
         predicate: pred,
@@ -712,6 +724,38 @@ mod tests {
             "证明要按推导顺序带上三条前提"
         );
         assert_eq!(long.rule, Rule::Transitive);
+    }
+
+    #[test]
+    fn a_chained_derivation_keeps_every_premise() {
+        // 4→1→2 推出 4→2，而 4→2 已经是一条证明；传递再接 2→3 时，那条派生边
+        // 自带的两条前提要一起进证明。少了任一条，`validity` 就只对留下的前提求
+        // 交集，结论会比实际宽
+        let edges = [
+            te(1, 1, 2, Some(0), Some(100)),
+            te(2, 2, 3, Some(40), Some(50)),
+            te(3, 4, 1, Some(0), Some(100)),
+        ];
+        let d = derive(&edges, &transitive());
+        let to3 = d
+            .facts
+            .iter()
+            .find(|x| x.subject == n(4) && x.object == n(3))
+            .expect("4→3 应由 4→1→2→3 推出");
+        assert_eq!(
+            to3.premises,
+            vec![f(3), f(1), f(2)],
+            "证明要带上链上三条前提，中间那条派生边的两条都在内"
+        );
+        let by_fact: HashMap<Uuid, _> = edges
+            .iter()
+            .map(|x| (x.edge.fact, (x.from, x.to)))
+            .collect();
+        assert_eq!(
+            validity(&to3.premises, &by_fact),
+            Some((Some(40), Some(50))),
+            "有效期应是三条前提的交集，而不是漏掉中间那条的宽区间"
+        );
     }
 
     #[test]
