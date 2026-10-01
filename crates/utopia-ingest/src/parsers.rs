@@ -734,7 +734,7 @@ fn pptx_order(
 
 /// xlsx / xls / ods: calamine 全格式读取，每 sheet 输出制表符表格（限前 2000 行）。
 pub fn spreadsheet(bytes: &[u8]) -> anyhow::Result<String> {
-    use calamine::{Data, Reader as _};
+    use calamine::Reader as _;
     let mut workbook = calamine::open_workbook_auto_from_rs(Cursor::new(bytes.to_vec()))
         .context("Failed to open spreadsheet")?;
     let mut out = String::new();
@@ -745,27 +745,20 @@ pub fn spreadsheet(bytes: &[u8]) -> anyhow::Result<String> {
         if range.is_empty() {
             continue;
         }
+        // xlsx/xls 把 merge 单独给出；xlsb/ods 的 calamine reader 没有这一步，按无 merge 读。
+        let merges = match &mut workbook {
+            calamine::Sheets::Xlsx(book) => book
+                .merge_cells_by_sheet_name(&sheet_name)
+                .unwrap_or_default(),
+            calamine::Sheets::Xls(book) => book
+                .merge_cells_by_sheet_name(&sheet_name)
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
         out.push_str(&format!("\n# Sheet: {sheet_name}\n\n"));
         // 每张表按网格渲染成带列头的 Markdown 表；一格字都没有的表退回制表符分隔
-        let rows: Vec<GridRow> = range
-            .rows()
-            .take(2000)
-            .map(|row| {
-                row.iter()
-                    .map(|c| {
-                        let text = match c {
-                            Data::Empty => String::new(),
-                            Data::DateTime(d) => excel_date(d),
-                            Data::Float(f) => excel_number(*f),
-                            other => other.to_string(),
-                        };
-                        (text, 1, 0)
-                    })
-                    .collect::<GridRow>()
-            })
-            .filter(|line| line.iter().any(|(s, _, _)| !s.is_empty()))
-            .collect();
-        match crate::table::render_grid(&rows, true) {
+        let (rows, headers) = spreadsheet_grid(&range, &merges);
+        match crate::table::render_grid_with_headers(&rows, headers) {
             Some(md) => {
                 out.push_str(&md);
                 out.push('\n');
@@ -780,6 +773,117 @@ pub fn spreadsheet(bytes: &[u8]) -> anyhow::Result<String> {
         }
     }
     Ok(out)
+}
+
+#[derive(Clone)]
+struct GridMerge {
+    start: (usize, usize),
+    end: (usize, usize),
+    text: String,
+}
+
+/// 把 calamine 的矩形 range 和 merge 信息铺成 [`GridRow`]。横向 merge 变成一格的
+/// span，纵向 merge 把锚点的值带到覆盖的每一行；anchor 之外的值不再单独成格。
+fn spreadsheet_grid(
+    range: &calamine::Range<calamine::Data>,
+    merges: &[calamine::Dimensions],
+) -> (Vec<GridRow>, Option<std::ops::Range<usize>>) {
+    let Some((start_row, start_col)) = range.start() else {
+        return (Vec::new(), None);
+    };
+    let height = range.height().min(2000);
+    let width = range.width();
+    if height == 0 || width == 0 {
+        return (Vec::new(), None);
+    }
+    let end_row = start_row + height as u32 - 1;
+    let end_col = start_col + width as u32 - 1;
+
+    let mut regions = Vec::new();
+    for merge in merges {
+        if merge.start.0 > merge.end.0
+            || merge.start.1 > merge.end.1
+            || merge.end.0 < start_row
+            || merge.end.1 < start_col
+            || merge.start.0 > end_row
+            || merge.start.1 > end_col
+        {
+            continue;
+        }
+        let start = (
+            (merge.start.0.max(start_row) - start_row) as usize,
+            (merge.start.1.max(start_col) - start_col) as usize,
+        );
+        let end = (
+            (merge.end.0.min(end_row) - start_row) as usize,
+            (merge.end.1.min(end_col) - start_col) as usize,
+        );
+        regions.push(GridMerge {
+            start,
+            end,
+            text: spreadsheet_cell_text(range.get(start)),
+        });
+    }
+
+    let mut owner = vec![usize::MAX; height * width];
+    for (index, region) in regions.iter().enumerate() {
+        for row in region.start.0..=region.end.0 {
+            for col in region.start.1..=region.end.1 {
+                owner[row * width + col] = index;
+            }
+        }
+    }
+
+    let mut rows: Vec<GridRow> = Vec::with_capacity(height);
+    for row in 0..height {
+        let mut cells = GridRow::new();
+        let mut col = 0usize;
+        while col < width {
+            let index = owner[row * width + col];
+            if index == usize::MAX {
+                cells.push((spreadsheet_cell_text(range.get((row, col))), 1, 0));
+                col += 1;
+                continue;
+            }
+            let region = &regions[index];
+            if col == region.start.1 {
+                cells.push((region.text.clone(), region.end.1 - region.start.1 + 1, 0));
+                col = region.end.1 + 1;
+            } else {
+                col += 1;
+            }
+        }
+        rows.push(cells);
+    }
+
+    let headers = spreadsheet_headers(&regions, &rows);
+    (rows, headers)
+}
+
+fn spreadsheet_cell_text(cell: Option<&calamine::Data>) -> String {
+    match cell {
+        None | Some(calamine::Data::Empty) => String::new(),
+        Some(calamine::Data::DateTime(d)) => excel_date(d),
+        Some(calamine::Data::Float(f)) => excel_number(*f),
+        Some(other) => other.to_string(),
+    }
+}
+
+/// 表头从第一排至少两格有字的行开始；这一块里纵向 merge 伸到的行也是表头。
+fn spreadsheet_headers(regions: &[GridMerge], rows: &[GridRow]) -> Option<std::ops::Range<usize>> {
+    let start = rows
+        .iter()
+        .position(|row| row.iter().filter(|(text, _, _)| !text.is_empty()).count() >= 2)?;
+    let mut end = start + 1;
+    while let Some(next) = regions
+        .iter()
+        .filter(|region| region.start.0 >= start && region.start.0 < end && region.end.0 >= end)
+        .map(|region| region.end.0 + 1)
+        .max()
+    {
+        end = next;
+    }
+    Some(start..end.min(rows.len()))
 }
 
 /// 日期格按它显示的样子写。
