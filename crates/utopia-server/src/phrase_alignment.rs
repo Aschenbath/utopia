@@ -20,7 +20,7 @@ use crate::state::AppState;
 use std::collections::{HashMap, HashSet};
 use utopia_core::models::RelationTypeView;
 use utopia_extract::phrase_align::{
-    build_phrase_messages, parse_phrase_response, Direction, PhraseItem, PropertyCandidate,
+    build_phrase_messages, parse_phrase_response, Direction, Marks, PhraseItem, PropertyCandidate,
 };
 use utopia_store::phrase_bindings::{self, Decision, PhraseSignature};
 use uuid::Uuid;
@@ -30,14 +30,27 @@ const BATCH: usize = 12;
 /// 筛过定义域/值域之后候选属性最多这么多，再多就不判。
 const CANDIDATE_LIMIT: usize = 60;
 
-/// 一票：这条签名选了哪个属性、哪个方向（None = 没有属性对得上）。
-type Vote = Option<(String, Direction)>;
+/// 一票：这条签名选了哪个属性、哪个方向，属性是状态时还有一刻标哪一端（#966）。
+/// None = 没有属性对得上
+type Vote = Option<(String, Direction, Option<Marks>)>;
+
+/// 代理绑到状态属性、却从没问过一刻标哪一端的绑定（这一列之前的判定，#966）：指纹没变也问
+/// 一次，只问这一格，不重判绑定（0053 修订 2026-09-27）。问过的不再问，没得到值的列进对齐
+/// 队列等人。只进开跑时的 todo，不进收尾的「变了没有」
+fn awaits_marks(b: &phrase_bindings::Binding, props: &[RelationTypeView]) -> bool {
+    b.status == "bound"
+        && b.marks.is_none()
+        && b.marks_asked_at.is_none()
+        && b.relation_type_id
+            .and_then(|id| props.iter().find(|p| p.id == id))
+            .is_some_and(|p| p.temporal == "state")
+}
 
 /// 一个类连同它的全部祖先。候选按它命中：属性的定义域声明在 legal_entity 上，
 /// organization 是它的子类，这条属性对 organization 的签名就是候选（#807 第一条）。
-type Closure = HashMap<Uuid, Vec<Uuid>>;
+pub(crate) type Closure = HashMap<Uuid, Vec<Uuid>>;
 
-fn closures<'a>(classes: impl IntoIterator<Item = (Uuid, &'a [Uuid])>) -> Closure {
+pub(crate) fn closures<'a>(classes: impl IntoIterator<Item = (Uuid, &'a [Uuid])>) -> Closure {
     let classes: Vec<(Uuid, &[Uuid])> = classes.into_iter().collect();
     let parents: HashMap<Uuid, &[Uuid]> = classes.iter().copied().collect();
     classes
@@ -85,6 +98,15 @@ fn within(
         .iter()
         .find(|d| up.contains(d))
         .map(|d| Some((*d, c)))
+}
+
+/// 结构上对得上（本体代理给每批裁词表时用的判据，同对齐的候选）
+pub(crate) fn structurally_fits(
+    p: &RelationTypeView,
+    sig: &PhraseSignature,
+    closure: &Closure,
+) -> bool {
+    fits(p, sig, closure).is_some()
 }
 
 /// 签名两端的类落在属性声明的域/值域里，经继承也算；正反两个方向都算。
@@ -160,6 +182,64 @@ fn consider<'a>(
             (s.key(), (fitting, basis))
         })
         .collect()
+}
+
+/// 第二票要不要投。第二票防的是「选第一个」冒充一致，要两票一致的是**绑定**；第一票
+/// 说没有一条对得上的签名，第二票怎么答都绑不上：答没有是「无」，答了一条是「拿不定」。
+/// 测量库一轮 864 条签名里第一票说没有的 317 条，没有一条最后绑上（bench README，
+/// 2026-09-28），这一票省下。第一票没答到的也不投：少一票本来就不下结论。
+/// 补问 marks 的照旧投两票：它要两票说同一个值
+fn second_vote_is_due(first: &Vote, first_answered: bool, marks_only: bool) -> bool {
+    marks_only || (first_answered && first.is_some())
+}
+
+/// 类别词规则的宾语是从类别词自己的字里读出来的（「british film」读出英国），只有中心词
+/// 的类别词（「state」「ship」）没有可读的字：一轮 159 个类别词里 127 个是单个词，提出
+/// 的 8 条规则没有一条读得出宾语（bench README，2026-09-28）。这种不问。
+///
+/// 只认得出用空格分词的写法：一串 ASCII 字母是一个词。带连字符、数字的（「1968」、
+/// 「british-governed」）和不分词的文字（「英国电影」）看不出有没有修饰语，照旧问
+fn has_modifier(kind_word: &str) -> bool {
+    !kind_word.trim().chars().all(|c| c.is_ascii_alphabetic())
+}
+
+/// 把签名分成批，候选相近的放在一起。返回每批里签名的下标。
+///
+/// 属性定义表在一批里只写一遍，占一次调用输入的将近一半：按到来的次序每十二条切一批时，
+/// 同批的签名互不相干（一条讲出生地、一条讲导演、一条讲所属球队），各自十条候选几乎不
+/// 重叠，合起来就是本体的一半（测量库上九十六条属性里约五十条）。这里只改排法：每条签名
+/// 看到的候选一条不少，判断一字不变。
+///
+/// 贪心：每批从还没排的第一条起，每次加进让这一批的候选并集长得最少的那一条，并列时取
+/// 靠前的——结果只由输入决定，同样的签名每次排成同样的批。没有候选的签名不问模型，
+/// 排在最后，不占有候选的批里的位置
+fn batch_by_candidates<K: Copy + Eq + std::hash::Hash>(
+    sets: &[Vec<K>],
+    size: usize,
+) -> Vec<Vec<usize>> {
+    let size = size.max(1);
+    let mut left: Vec<usize> = (0..sets.len()).filter(|i| !sets[*i].is_empty()).collect();
+    let empty: Vec<usize> = (0..sets.len()).filter(|i| sets[*i].is_empty()).collect();
+    let mut out: Vec<Vec<usize>> = Vec::new();
+    while !left.is_empty() {
+        let first = left.remove(0);
+        let mut batch = vec![first];
+        let mut union: HashSet<K> = sets[first].iter().copied().collect();
+        while batch.len() < size && !left.is_empty() {
+            let (at, _) = left
+                .iter()
+                .enumerate()
+                .map(|(at, i)| (at, sets[*i].iter().filter(|k| !union.contains(k)).count()))
+                .min_by_key(|(at, added)| (*added, *at))
+                .expect("left is not empty");
+            let i = left.remove(at);
+            union.extend(sets[i].iter().copied());
+            batch.push(i);
+        }
+        out.push(batch);
+    }
+    out.extend(empty.chunks(size).map(<[usize]>::to_vec));
+    out
 }
 
 /// 日志里放得下的一段回复：空白折成一个空格，最多这么多字符。
@@ -361,6 +441,36 @@ pub async fn align_phrases_reasking(
     // 对齐是判断题：让模型按端点默认的强度想，不用工作区给抽取设的 minimal
     let client = llm_util::chat_client_thinking(&settings)
         .ok_or_else(|| anyhow::anyhow!("Chat model not configured; cannot align phrases"))?;
+    // 类别词对齐还排着或跑着：两端的类还没定，现在判的签名指纹马上就变，判了也是重判。
+    // 等它收尾再来——排一份半分钟后的，排着的至多一份。别的入口（本体页、审核页、每篇文档
+    // 抽完）排的短语对齐也从这里过，所以这一道守住就够。
+    //
+    // 本体向量还在补也等：编辑器建了属性先排 `embed_ontology` 再排这个任务，没向量的属性
+    // 进不了短名单，形状的指纹不变，现在判了它照样不在候选里（`bordered_by` 第一次真跑
+    // 就是这么漏的）。补齐任务几秒到几分钟，等得起
+    let waiting_on = if utopia_store::jobs::pending_for_kb(pool, "align_types", kb_id).await? {
+        Some("类别词对齐")
+    } else if utopia_store::jobs::pending_for_kb(pool, "embed_ontology", kb_id).await? {
+        Some("本体向量补齐")
+    } else {
+        None
+    };
+    if let Some(what) = waiting_on {
+        tracing::info!(%kb_id, "短语对齐：{what}还没收尾，半分钟后再看");
+        let payload = if reask == 0 {
+            serde_json::json!({ "kb_id": kb_id })
+        } else {
+            serde_json::json!({ "kb_id": kb_id, "reask": reask })
+        };
+        utopia_store::jobs::enqueue_unless_queued_after(
+            pool,
+            "align_phrases",
+            payload,
+            std::time::Duration::from_secs(30),
+        )
+        .await?;
+        return Ok(());
+    }
     // 一个库同时只跑一份，理由同类别词对齐（并行跑会把端点打出 502）
     let mut guard = pool.acquire().await?;
     let locked: bool =
@@ -409,18 +519,30 @@ async fn align_phrases_locked(
     let short = shortlist(state, settings, kb_id, &sigs, &full).await?;
     let considered = consider(&sigs, &props, &closure, &versions, Some(&short));
     // 过期 = 存下的指纹和此刻的不一样（没有指纹的是这一列出现前判的，各重判一次）。
-    // 不再按时间戳：父边的增删、请求途中的编辑（#795）时间戳看不见。人的判定不重判
+    // 不再按时间戳：父边的增删、请求途中的编辑（#795）时间戳看不见。人的判定不重判。
+    // 绑到状态属性、从没问过一刻标哪一端的代理判定也问（`awaits_marks`，#966）
     let todo: Vec<&PhraseSignature> = sigs
         .iter()
         .filter(|s| match existing.get(&s.key()) {
             None => true,
             Some(b) => {
                 b.decided_by != "person"
-                    && b.basis.as_deref() != Some(considered[&s.key()].1.as_str())
+                    && (b.basis.as_deref() != Some(considered[&s.key()].1.as_str())
+                        || awaits_marks(b, &props))
             }
         })
         .collect();
     let attempted: HashSet<_> = todo.iter().map(|s| s.key()).collect();
+    // 其中指纹没变、只为补问 marks 进来的：这一问只能写 marks，绑定原样（0053 修订 2026-09-27）。
+    // 从前整条重判，两票没选属性就把绑上的签名判成 none，它的类型化行跟着作废
+    let marks_only: HashMap<_, &phrase_bindings::Binding> = todo
+        .iter()
+        .filter_map(|s| {
+            let b = existing.get(&s.key())?;
+            (b.basis.as_deref() == Some(considered[&s.key()].1.as_str()) && awaits_marks(b, &props))
+                .then_some((s.key(), b))
+        })
+        .collect();
     tracing::info!(%kb_id, signatures = sigs.len(), to_decide = todo.len(), properties = props.len(), "短语对齐开始");
 
     // 没有属性可绑：每条都是「没有」；属性出现后指纹变了，它们会再交回来
@@ -437,6 +559,8 @@ async fn align_phrases_locked(
                     votes: &serde_json::json!({ "reason": "no_properties" }),
                     decided_by: "agent",
                     basis: Some(&considered[&s.key()].1),
+                    marks: None,
+                    marks_asked: false,
                 },
             )
             .await?;
@@ -454,21 +578,48 @@ async fn align_phrases_locked(
     let mut failed = 0usize;
     // 问了、模型也答了、却没答到的签名：两票缺一票就不下结论
     let mut unanswered = 0usize;
+    // marks：补问写下了值的；问过却没得到两票同一个值、列进对齐队列的
+    let (mut marked, mut unsettled) = (0usize, 0usize);
     // 批与批并行（[`PARALLEL_BATCHES`] 个在飞，模型闸门再限一次）：一批两票串行要等模型
     // 想两回，串着跑 22 批就是半小时，其中一次卡住的调用能把整轮拖住 18 分钟（bench README，
     // 2026-09-24）。每批各记各的数，回来再加
     {
         use futures_util::StreamExt;
         // 只把引用搬进各批的 future
-        let (considered, full, closure, class_key, by_key) =
-            (&considered, &full, &closure, &class_key, &by_key);
+        let (considered, full, closure, class_key, by_key, marks_only) = (
+            &considered,
+            &full,
+            &closure,
+            &class_key,
+            &by_key,
+            &marks_only,
+        );
         // 先把每批的 future 造出来再排队：直接在 map 里返回 async 块会让借用的生命周期
         // 满足不了 tokio::spawn 要的 Send
-        let futures: Vec<_> = todo
-            .chunks(BATCH)
+        // 候选相近的签名排进同一批（见 `batch_by_candidates`）：属性表一批只写一遍，同批的
+        // 签名候选重叠得越多，这张表越短
+        let sets: Vec<Vec<Uuid>> = todo
+            .iter()
+            .map(|s| {
+                let fitting = &considered[&s.key()].0;
+                if fitting.len() > CANDIDATE_LIMIT {
+                    Vec::new()
+                } else {
+                    fitting.iter().map(|p| p.id).collect()
+                }
+            })
+            .collect();
+        let batches: Vec<Vec<&PhraseSignature>> = batch_by_candidates(&sets, BATCH)
+            .into_iter()
+            .map(|group| group.into_iter().map(|i| todo[i]).collect())
+            .collect();
+        let futures: Vec<_> = batches
+            .iter()
+            .map(|batch| batch.as_slice())
             .map(|batch| async move {
                 let (mut bound, mut none, mut undecided, mut skipped, mut failed, mut unanswered) =
                     (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+                let (mut marked, mut unsettled) = (0usize, 0usize);
         // 候选超过上限的不问模型：记成 undecided 交给人，指纹照记——属性少下去指纹就变，
         // 到时再问。从前超限和无候选一样静默跳过，签名永远排着又永远不可执行（#807）
         let cands: Vec<Vec<&RelationTypeView>> = batch
@@ -484,11 +635,14 @@ async fn align_phrases_locked(
             .collect();
         let mut votes: Vec<(Vote, Vote)> = vec![(None, None); batch.len()];
         let mut answered = vec![(false, false); batch.len()];
+        // 读得出回复的遍数：补问 marks 时，两遍的回复都回来了才算问过
+        let mut replied = 0usize;
         for pass in 0..2 {
             let items: Vec<PhraseItem<'_>> = batch
                 .iter()
                 .enumerate()
                 .filter(|(i, _)| !cands[*i].is_empty())
+                .filter(|(i, s)| pass == 0 || second_vote_is_due(&votes[*i].0, answered[*i].0, marks_only.contains_key(&s.key())))
                 .map(|(i, s)| {
                     let mut list: Vec<&RelationTypeView> = cands[i].clone();
                     if pass == 1 {
@@ -510,6 +664,7 @@ async fn align_phrases_locked(
                                 label: &p.label,
                                 description: &p.description,
                                 kind: &p.kind,
+                                temporal: &p.temporal,
                                 domains: keys_of(&p.domains),
                                 ranges: keys_of(&p.ranges),
                                 via: fits(p, s, closure)
@@ -580,6 +735,7 @@ async fn align_phrases_locked(
                 failed += 1;
                 continue;
             }
+            replied += 1;
             if malformed > 0 {
                 // 坏票长什么样得看得见：第一次真跑里一半签名被判坏票，查了一天才知道模型答的是标签
                 tracing::info!(%kb_id, malformed, reply = %snippet(&reply.text), "短语对齐的回复里有坏票");
@@ -589,11 +745,12 @@ async fn align_phrases_locked(
                     continue;
                 };
                 if let Some(slot) = votes.get_mut(i) {
+                    let vote = c.property.map(|(key, direction)| (key, direction, c.marks));
                     if pass == 0 {
-                        slot.0 = c.property;
+                        slot.0 = vote;
                         answered[i].0 = true;
                     } else {
-                        slot.1 = c.property;
+                        slot.1 = vote;
                         answered[i].1 = true;
                     }
                 }
@@ -601,6 +758,36 @@ async fn align_phrases_locked(
         }
         for (i, s) in batch.iter().enumerate() {
             let basis = considered[&s.key()].1.as_str();
+            if let Some(asked) = marks_only.get(&s.key()) {
+                // 补问 marks（0053 修订 2026-09-27）：两票都认这条绑定的属性与方向、又说了同一个
+                // 值，写下它；别的答案——没选属性、选了别的、没说或说得不一样——都让绑定原样。
+                // 两种都记下问过：不再问，没有值的列进对齐队列等人。回复没回来不算问过，
+                // 下次再问（同没答到的签名）；问不了的（候选超限）直接交给人
+                if !cands[i].is_empty() && replied < 2 {
+                    unanswered += 1;
+                    continue;
+                }
+                // 这一票认的是这条绑定，又说了值：认了就是它说的值
+                let value_of = |v: &Vote| match v {
+                    Some((k, d, m)) => m.filter(|_| {
+                        by_key.get(k.as_str()).map(|p| p.id) == asked.relation_type_id
+                            && asked.direction.as_deref() == Some(d.as_str())
+                    }),
+                    None => None,
+                };
+                let (a, b) = &votes[i];
+                let value = value_of(a).filter(|m| value_of(b) == Some(*m));
+                if phrase_bindings::record_marks(pool, kb_id, asked, value.map(Marks::as_str))
+                    .await?
+                {
+                    if value.is_some() {
+                        marked += 1;
+                    } else {
+                        unsettled += 1;
+                    }
+                }
+                continue;
+            }
             if cands[i].is_empty() {
                 let fitting = considered[&s.key()].0.len();
                 // 两种「没问模型」各自落库，投影才退得掉、队列才收得住：
@@ -626,6 +813,8 @@ async fn align_phrases_locked(
                         votes: &votes,
                         decided_by: "agent",
                         basis: Some(basis),
+                        marks: None,
+                        marks_asked: false,
                     },
                 )
                 .await?
@@ -641,18 +830,33 @@ async fn align_phrases_locked(
             }
             let (a, b) = &votes[i];
             let (ans_a, ans_b) = answered[i];
-            if !ans_a || !ans_b {
+            // 第一票说没有的不投第二票（见 `second_vote_is_due`）：结论就是没有
+            let asked_twice = second_vote_is_due(a, ans_a, false);
+            if !ans_a || (asked_twice && !ans_b) {
                 // 有一票没答到：不下结论，下次再问
                 unanswered += 1;
                 continue;
             }
             let show = |v: &Vote| {
                 v.as_ref()
-                    .map(|(k, d)| serde_json::json!({ "property": k, "direction": d.as_str() }))
+                    .map(|(k, d, m)| {
+                        serde_json::json!({ "property": k, "direction": d.as_str(),
+                                            "marks": m.map(Marks::as_str) })
+                    })
                     .unwrap_or(serde_json::Value::Null)
             };
-            let record = serde_json::json!({ "first": show(a), "second": show(b) });
-            if a != b {
+            let record = if asked_twice {
+                serde_json::json!({ "first": show(a), "second": show(b) })
+            } else {
+                serde_json::json!({ "first": null, "reason": "first_vote_none" })
+            };
+            // 两票选的属性与方向（或都说没有）是否一致
+            let agree = match (a, b) {
+                (Some((ka, da, _)), Some((kb, db, _))) => ka == kb && da == db,
+                (None, None) => true,
+                _ => false,
+            };
+            if !agree {
                 phrase_bindings::decide(
                     pool,
                     kb_id,
@@ -664,15 +868,29 @@ async fn align_phrases_locked(
                         votes: &record,
                         decided_by: "agent",
                         basis: Some(basis),
+                        marks: None,
+                        marks_asked: false,
                     },
                 )
                 .await?;
                 undecided += 1;
                 continue;
             }
+            // 属性是状态时，两票还说一刻标哪一端（#966）：说了同一个值才写下它。没说、或说得
+            // 不一样，绑定照绑、这一格空着，记下问过——不再问，列进对齐队列等人（0053 修订
+            // 2026-09-27）。从前没说的算没答到，模型一直只答三格时每轮重问、永远绑不上。
+            // 事件与恒常不问这一格
+            let state = a
+                .as_ref()
+                .and_then(|(k, _, _)| by_key.get(k.as_str()))
+                .is_some_and(|p| p.temporal == "state");
+            let marks = match (a, b) {
+                (Some((_, _, ma)), Some((_, _, mb))) if state && ma == mb => *ma,
+                _ => None,
+            };
             match a
                 .as_ref()
-                .and_then(|(k, d)| by_key.get(k.as_str()).map(|p| (p, *d)))
+                .and_then(|(k, d, _)| by_key.get(k.as_str()).map(|p| (p, *d)))
             {
                 Some((p, d)) => {
                     if phrase_bindings::decide(
@@ -686,11 +904,16 @@ async fn align_phrases_locked(
                             votes: &record,
                             decided_by: "agent",
                             basis: Some(basis),
+                            marks: marks.map(Marks::as_str),
+                            marks_asked: state,
                         },
                     )
                     .await?
                     {
                         bound += 1;
+                        if state && marks.is_none() {
+                            unsettled += 1;
+                        }
                     }
                 }
                 None => {
@@ -705,6 +928,8 @@ async fn align_phrases_locked(
                             votes: &record,
                             decided_by: "agent",
                             basis: Some(basis),
+                            marks: None,
+                            marks_asked: false,
                         },
                     )
                     .await?
@@ -715,21 +940,26 @@ async fn align_phrases_locked(
             }
         }
 
-                Ok::<_, anyhow::Error>((bound, none, undecided, skipped, failed, unanswered))
+                Ok::<_, anyhow::Error>((
+                    (bound, none, undecided, skipped, failed, unanswered),
+                    (marked, unsettled),
+                ))
             })
             .collect();
         let mut results = futures_util::stream::iter(futures).buffer_unordered(PARALLEL_BATCHES);
         while let Some(r) = results.next().await {
-            let (b, n, u, sk, f, un) = r?;
+            let ((b, n, u, sk, f, un), (m, us)) = r?;
             bound += b;
             none += n;
             undecided += u;
             skipped += sk;
             failed += f;
             unanswered += un;
+            marked += m;
+            unsettled += us;
         }
     }
-    tracing::info!(%kb_id, bound, none, undecided, skipped, failed, unanswered, "短语对齐完成");
+    tracing::info!(%kb_id, bound, none, undecided, skipped, failed, unanswered, marked, unsettled, "短语对齐完成");
     if unanswered > 0 {
         tracing::warn!(%kb_id, unanswered, "短语对齐有签名模型没答到，这些签名这轮没有结论");
     }
@@ -751,6 +981,10 @@ async fn align_phrases_locked(
             .collect();
         let mut asks: Vec<crate::implication::RuleAsk<'_>> = Vec::new();
         for s in &todo {
+            // 只补问了 marks 的没有重判：指纹没变，它的规则上一轮问过
+            if marks_only.contains_key(&s.key()) {
+                continue;
+            }
             let Some(b) = decided_now.get(&s.key()) else {
                 continue;
             };
@@ -795,11 +1029,11 @@ async fn align_phrases_locked(
         // 类别词的候选也开短名单：词加例名嵌入后取最近的属性；没有向量时看全部
         let fresh: Vec<&utopia_store::type_bindings::KindWordSignature> = kind_words
             .iter()
-            .filter(|k| !asked_kind.contains(k.kind_word.as_str()))
+            .filter(|k| !asked_kind.contains(k.kind_word.as_str()) && has_modifier(&k.kind_word))
             .collect();
         let kind_short = shortlist_kind_words(state, settings, kb_id, &fresh).await?;
         for (k, basis) in kind_words.iter().zip(kind_basis.iter()) {
-            if asked_kind.contains(k.kind_word.as_str()) {
+            if asked_kind.contains(k.kind_word.as_str()) || !has_modifier(&k.kind_word) {
                 continue;
             }
             let mut candidates: Vec<&RelationTypeView> = props
@@ -873,6 +1107,24 @@ async fn align_phrases_locked(
     // 漏答的签名就只能等下一篇文档来排——最后一篇之后没有下一篇，它们就永远没有结论；
     // 而漏答不写任何行，审核队列也看不见（同类别词对齐）
     let unfinished = failed > 0 || unanswered > 0;
+    // 对齐收尾：没绑上的形状够多，叫本体代理来看（0061 决定 2）。代理自己跳过提过的，
+    // 所以这里只数不筛；一分钟的去抖让连着几篇文档只叫一次
+    if !changed && !unfinished {
+        let unbound = phrase_bindings::bindings(pool, kb_id)
+            .await?
+            .iter()
+            .filter(|b| matches!(b.status.as_str(), "none" | "undecided"))
+            .count();
+        if unbound >= crate::ontology_agent::TRIGGER_UNBOUND {
+            utopia_store::jobs::enqueue_unless_pending(
+                pool,
+                "propose_ontology",
+                serde_json::json!({ "kb_id": kb_id }),
+                std::time::Duration::from_secs(60),
+            )
+            .await?;
+        }
+    }
     if changed {
         utopia_store::jobs::enqueue_unless_queued(
             pool,
@@ -902,6 +1154,54 @@ mod lifecycle_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_kind_word_that_is_only_a_head_word_has_nothing_to_read() {
+        for bare in ["state", "ship", " settlement "] {
+            assert!(!has_modifier(bare), "{bare}");
+        }
+        for readable in [
+            "british film",
+            "1968",
+            "british-governed",
+            "英国电影",
+            "wine area",
+        ] {
+            assert!(has_modifier(readable), "{readable}");
+        }
+    }
+
+    #[test]
+    fn signatures_with_the_same_candidates_share_a_batch() {
+        // 六条签名、三种候选集，交错着来；每批两条
+        let sets: Vec<Vec<u32>> = vec![
+            vec![1, 2],
+            vec![7, 8],
+            vec![],
+            vec![2, 1],
+            vec![8, 9],
+            vec![1, 2, 3],
+        ];
+        let batches = batch_by_candidates(&sets, 2);
+        // 每条签名恰好出现一次
+        let mut all: Vec<usize> = batches.iter().flatten().copied().collect();
+        all.sort_unstable();
+        assert_eq!(all, vec![0, 1, 2, 3, 4, 5]);
+        // 候选一样的排在一起，没有候选的在最后
+        assert_eq!(batches, vec![vec![0, 3], vec![1, 4], vec![5], vec![2]]);
+        // 同样的输入排成同样的批
+        assert_eq!(batch_by_candidates(&sets, 2), batches);
+        // 一批的候选并集比按次序切的小
+        let union = |b: &Vec<usize>| {
+            b.iter()
+                .flat_map(|i| sets[*i].iter())
+                .collect::<HashSet<_>>()
+                .len()
+        };
+        let in_order: usize = [vec![0, 1], vec![2, 3], vec![4, 5]].iter().map(union).sum();
+        let grouped: usize = batches.iter().map(union).sum();
+        assert!(grouped < in_order, "{grouped} < {in_order}");
+    }
+
     #[test]
     fn a_shortlist_keeps_label_matches_and_fills_by_distance_within_the_fitting_set() {
         let ids: Vec<Uuid> = (0..6).map(|_| Uuid::now_v7()).collect();

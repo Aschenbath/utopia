@@ -31,7 +31,9 @@ pub fn world(t: DateTime<Utc>, precision: Option<&str>) -> String {
     }
 }
 
-/// 一条事实的两端：原文说的（`valid_*` 与精度）和读出来的（`holds_*`，0022）。
+/// 一条事实的两端：原文说的（`valid_*` 与精度）和读出来的（`holds_*`，0022），以及日期
+/// 从哪来（#970）：终点是时间线推出来的、区间是人改过的，这两样都不在那一行 `[n]` 打开的
+/// 原句里。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Span<'a> {
     pub valid_from: Option<DateTime<Utc>>,
@@ -40,6 +42,35 @@ pub struct Span<'a> {
     pub to_precision: Option<&'a str>,
     pub holds_from: Option<DateTime<Utc>>,
     pub holds_to: Option<DateTime<Utc>>,
+    /// 终点是后一条事实开始时时间线关上的（`facts.end_derived`）
+    pub end_derived: bool,
+    /// 人改过哪一端：`start` / `end` / `both`（`facts.corrected_ends`）；None 是没改过
+    pub corrected: Option<&'a str>,
+    /// 关上它的那一行（#970 第二步）：接任的那一端，和它证据的号（对话里是 ` [n]`，MCP 里空）
+    pub closed_by: Option<(&'a str, &'a str)>,
+    /// 人改区间时写下的备注
+    pub correction_note: Option<&'a str>,
+}
+
+/// 备注在行上最多这么多字：再长就是一段话，不是一个说明
+const NOTE_CHARS: usize = 120;
+
+/// 备注折成一行、去掉两端空白，过长截断。空的就是没写
+fn note_text(note: &str) -> Option<String> {
+    // 方括号换掉：备注是人写的话，里面一个 `[2]` 落在行上就成了一个像引用的号
+    let flat = note
+        .replace('[', "(")
+        .replace(']', ")")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if flat.is_empty() {
+        return None;
+    }
+    if flat.chars().count() > NOTE_CHARS {
+        return Some(flat.chars().take(NOTE_CHARS).collect::<String>() + "…");
+    }
+    Some(flat)
 }
 
 /// `from → to`，给模型看。
@@ -48,6 +79,13 @@ pub struct Span<'a> {
 /// 只是从那份证据起有据可查。终点：原文给了按精度写；结束了不知哪天写
 /// `ended by <锚点>`（没有锚点时写 `ended, date unknown`）；否则 `now`。
 /// 两端都无可写时返回空串，调用方据此决定不带括号。
+///
+/// 日期不是原文说的就跟在后面说出来（#970）：人改过的那一端写 `start corrected` 或
+/// `end corrected`，两端都改过写 `corrected`——没改的那一端仍是原文说的；写了备注就带上
+/// 备注（`start corrected: …`，人的话不是原文段落，不带号）；时间线推出来的终点写
+/// `superseded by X [m]`——`[m]` 打开的是接任那条事实读出来的原句，那里写着这个
+/// 日期——找不到接任的那一行时写 `end derived`。这两样只在有终点时说。行尾的 `[n]` 仍是
+/// 这条事实自己读出来的原句
 pub fn span(s: Span<'_>) -> String {
     let from = match (s.valid_from, s.holds_from) {
         (Some(t), _) => Some(world(t, s.from_precision)),
@@ -66,11 +104,35 @@ pub fn span(s: Span<'_>) -> String {
         (None, true, None) => Some("ended, date unknown".to_string()),
         (None, false, _) => None,
     };
-    match (from, to) {
+    let derived = s.end_derived && to.is_some();
+    let range = match (from, to) {
         (None, None) => String::new(),
         (Some(f), None) => format!("{f} → now"),
         (None, Some(t)) => format!("→ {t}"),
         (Some(f), Some(t)) => format!("{f} → {t}"),
+    };
+    let mut marks: Vec<String> = Vec::new();
+    if let Some(ends) = s.corrected {
+        let what = match ends {
+            "start" => "start corrected",
+            "end" => "end corrected",
+            _ => "corrected",
+        };
+        marks.push(match s.correction_note.and_then(note_text) {
+            Some(note) => format!("{what}: {note}"),
+            None => what.to_string(),
+        });
+    }
+    if derived {
+        marks.push(match s.closed_by {
+            Some((who, mark)) => format!("superseded by {who}{mark}"),
+            None => "end derived".to_string(),
+        });
+    }
+    match (range.is_empty(), marks.is_empty()) {
+        (_, true) => range,
+        (true, false) => marks.join(", "),
+        (false, false) => format!("{range}, {}", marks.join(", ")),
     }
 }
 
@@ -128,6 +190,7 @@ mod tests {
                 to_precision: Some("month"),
                 holds_from: day("2023-01-01T00:00:00Z"),
                 holds_to: day("2024-07-01T00:00:00Z"),
+                ..Span::default()
             }),
             "2023 → 2024-07"
         );
@@ -148,6 +211,7 @@ mod tests {
                 to_precision: Some("unknown"),
                 holds_from: day("2023-06-01T00:00:00Z"),
                 holds_to: day("2025-10-15T00:00:00Z"),
+                ..Span::default()
             }),
             "2023-06-01 → ended, date unknown"
         );
@@ -160,5 +224,180 @@ mod tests {
             "→ ended, date unknown"
         );
         assert_eq!(span(Span::default()), "");
+    }
+
+    /// 日期不是原文说的，就在区间后面说出来（#970）：时间线关上的终点、人改过的区间。
+    /// 没有终点就没有「推出来的终点」；区间为空却改过，只说改过
+    #[test]
+    fn a_span_says_when_a_date_is_not_the_passages() {
+        let day = |s: &str| Some(t(s));
+        let closed = Span {
+            valid_from: day("2024-07-05T00:00:00Z"),
+            from_precision: Some("day"),
+            valid_to: day("2025-09-01T00:00:00Z"),
+            to_precision: Some("day"),
+            ..Span::default()
+        };
+        assert_eq!(
+            span(Span {
+                end_derived: true,
+                ..closed
+            }),
+            "2024-07-05 → 2025-09-01, end derived"
+        );
+        assert_eq!(
+            span(Span {
+                corrected: Some("both"),
+                ..closed
+            }),
+            "2024-07-05 → 2025-09-01, corrected"
+        );
+        assert_eq!(
+            span(Span {
+                corrected: Some("both"),
+                end_derived: true,
+                ..closed
+            }),
+            "2024-07-05 → 2025-09-01, corrected, end derived"
+        );
+        // 时间线关在一个没说起点的后任上：结束了不知哪天，也是推出来的
+        assert_eq!(
+            span(Span {
+                valid_to: None,
+                to_precision: Some("unknown"),
+                end_derived: true,
+                ..closed
+            }),
+            "2024-07-05 → ended, date unknown, end derived"
+        );
+        // 开着的行没有终点可推
+        assert_eq!(
+            span(Span {
+                valid_to: None,
+                to_precision: None,
+                end_derived: true,
+                ..closed
+            }),
+            "2024-07-05 → now"
+        );
+        assert_eq!(
+            span(Span {
+                corrected: Some("both"),
+                ..Span::default()
+            }),
+            "corrected"
+        );
+    }
+    /// 找得到关上它的那一行时，推出来的终点说出谁接任、带上那一行的号（#970 第二步）；
+    /// MCP 没有号。人改过的区间带着备注：折成一行，过长截断，空的等于没写
+    #[test]
+    fn a_derived_end_names_what_closed_it_and_a_correction_its_note() {
+        let day = |s: &str| Some(t(s));
+        let closed = Span {
+            valid_from: day("2024-07-05T00:00:00Z"),
+            from_precision: Some("day"),
+            valid_to: day("2025-09-01T00:00:00Z"),
+            to_precision: Some("day"),
+            end_derived: true,
+            ..Span::default()
+        };
+        assert_eq!(
+            span(Span {
+                closed_by: Some(("Zhou Qi", " [3]")),
+                ..closed
+            }),
+            "2024-07-05 → 2025-09-01, superseded by Zhou Qi [3]"
+        );
+        assert_eq!(
+            span(Span {
+                closed_by: Some(("Zhou Qi", "")),
+                ..closed
+            }),
+            "2024-07-05 → 2025-09-01, superseded by Zhou Qi"
+        );
+        // 开着的行没有终点，也就没有谁接任
+        assert_eq!(
+            span(Span {
+                valid_to: None,
+                to_precision: None,
+                closed_by: Some(("Zhou Qi", " [3]")),
+                ..closed
+            }),
+            "2024-07-05 → now"
+        );
+        let corrected = Span {
+            corrected: Some("both"),
+            end_derived: false,
+            ..closed
+        };
+        assert_eq!(
+            span(Span {
+                correction_note: Some("  The charter date\n was the approval date "),
+                ..corrected
+            }),
+            "2024-07-05 → 2025-09-01, corrected: The charter date was the approval date"
+        );
+        assert_eq!(
+            span(Span {
+                correction_note: Some("   "),
+                ..corrected
+            }),
+            "2024-07-05 → 2025-09-01, corrected"
+        );
+        let long = "x".repeat(200);
+        assert_eq!(
+            span(Span {
+                correction_note: Some(&long),
+                ..corrected
+            }),
+            format!("2024-07-05 → 2025-09-01, corrected: {}…", "x".repeat(120))
+        );
+        assert_eq!(
+            span(Span {
+                corrected: Some("both"),
+                correction_note: Some("approval date"),
+                closed_by: Some(("Zhou Qi", " [3]")),
+                ..closed
+            }),
+            "2024-07-05 → 2025-09-01, corrected: approval date, superseded by Zhou Qi [3]"
+        );
+    }
+
+    /// 人只改了一端就只说那一端（#976 的评审）：没改的那一端仍是原文说的，终点仍可以是
+    /// 时间线推出来的
+    #[test]
+    fn a_correction_names_the_end_a_person_changed() {
+        let day = |s: &str| Some(t(s));
+        let row = Span {
+            valid_from: day("2023-02-01T00:00:00Z"),
+            from_precision: Some("day"),
+            valid_to: day("2024-07-05T00:00:00Z"),
+            to_precision: Some("day"),
+            ..Span::default()
+        };
+        assert_eq!(
+            span(Span {
+                corrected: Some("start"),
+                correction_note: Some("The charter date was the approval date"),
+                ..row
+            }),
+            "2023-02-01 → 2024-07-05, start corrected: The charter date was the approval date"
+        );
+        assert_eq!(
+            span(Span {
+                corrected: Some("end"),
+                ..row
+            }),
+            "2023-02-01 → 2024-07-05, end corrected"
+        );
+        assert_eq!(
+            span(Span {
+                corrected: Some("start"),
+                end_derived: true,
+                closed_by: Some(("Li Si", " [2]")),
+                ..row
+            }),
+            "2023-02-01 → 2024-07-05, start corrected, superseded by Li Si [2]"
+        );
     }
 }

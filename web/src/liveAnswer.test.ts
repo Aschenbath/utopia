@@ -1,5 +1,10 @@
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import Markdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { describe, expect, it } from "vitest";
 import type { Source } from "./api";
+import { rehypeCitations } from "./citations";
 import { answeredWithoutSources, citedSources, type Turn } from "./liveAnswer";
 
 const answer = (over: Partial<Turn> = {}): Turn => ({
@@ -32,6 +37,44 @@ describe("citedSources", () => {
   });
 });
 
+/** 正文渲染出来的角标：与 Chat 页同一组插件 */
+function marks(text: string): number[] {
+  const html = renderToStaticMarkup(
+    createElement(Markdown, { remarkPlugins: [remarkGfm], rehypePlugins: [rehypeCitations] }, text),
+  );
+  const out = new Set<number>();
+  for (const m of html.matchAll(/href="#cite-([\d,]+)"/g)) {
+    for (const n of m[1].split(",")) out.add(Number(n));
+  }
+  return [...out].sort((a, b) => a - b);
+}
+
+describe("citedSources lists what the answer shows as a citation mark", () => {
+  const at = (content: string) => citedSources(answer({ content, sources: six })).map((s) => s.n);
+
+  it("skips numbers in code blocks, inline code and link text", () => {
+    expect(at("```json\n[4, 5]\n```\nThe figure is in [1].")).toEqual([1]);
+    expect(at("Inline `rows[2]` and `[3]` are code; [6] is a mark.")).toEqual([6]);
+    expect(at("A link [4](https://example.com) is not a mark; [5] is.")).toEqual([5]);
+  });
+
+  it("counts an escaped bracket, which renders as a mark", () => {
+    expect(at("An escaped \\[2\\] still reads as a mark.")).toEqual([2]);
+  });
+
+  it.each([
+    "Revenue grew [1]; see also [2, 3].",
+    "```json\n[4, 5]\n```\nThe figure is in [1].",
+    "Inline `rows[2]` and `[3]` are code; [6] is a mark.",
+    "A link [4](https://example.com) is not a mark; [5] is.",
+    "An escaped \\[2\\] still reads as a mark.",
+    "| metric | source |\n|---|---|\n| revenue | [3] |",
+    "> quoted [1]\n\n- item [2]\n- item [4]",
+  ])("agrees with the marks the answer renders: %j", (content) => {
+    expect(at(content)).toEqual(marks(content));
+  });
+});
+
 describe("answeredWithoutSources (#547)", () => {
   it("marks a finished answer with no sources", () => {
     expect(answeredWithoutSources(answer({ sources: [] }), false)).toBe(true);
@@ -59,5 +102,6 @@ describe("answeredWithoutSources (#547)", () => {
     expect(answeredWithoutSources({ role: "user", content: "hi" }, false)).toBe(false);
     expect(answeredWithoutSources(answer({ content: "", error: "boom" }), false)).toBe(false);
     expect(answeredWithoutSources(answer({ error: "stopped" }), false)).toBe(true);
+    expect(answeredWithoutSources(answer({ content: "", stopped: true }), false)).toBe(false);
   });
 });

@@ -136,3 +136,54 @@ export async function until(fn, everyMs, stallMs) {
     await sleep(everyMs);
   }
 }
+
+/// 一轮问答，按人在界面里问的方式走 chat 接口。SSE 帧是 `event: X\ndata: {...}\n\n`。
+/// ask.mjs 里有一份同样的；competency.mjs 也要，所以搬到这里
+export async function askChat(kb, message) {
+  const res = await fetch(`${BASE}/api/v1/kbs/${kb}/chat`, {
+    method: "POST",
+    headers: { "content-type": "application/json", cookie: cookieHeader() },
+    body: JSON.stringify({ message }),
+  });
+  if (!res.ok) throw new Error(`chat -> ${res.status} ${(await res.text()).slice(0, 200)}`);
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "", text = "", conversation = null, error = null;
+  const steps = [];
+  for (;;) {
+    const { done, value: chunk } = await reader.read();
+    if (done) break;
+    buf += dec.decode(chunk, { stream: true });
+    let i;
+    while ((i = buf.indexOf("\n\n")) >= 0) {
+      const frame = buf.slice(0, i);
+      buf = buf.slice(i + 2);
+      const ev = /^event: ?(.*)$/m.exec(frame)?.[1];
+      const data = frame.split("\n").filter((l) => l.startsWith("data:")).map((l) => l.slice(5).replace(/^ /, "")).join("\n");
+      try {
+        if (ev === "conversation") conversation = JSON.parse(data).id;
+        else if (ev === "delta") text += JSON.parse(data).text ?? "";
+        else if (ev === "step") steps.push(JSON.parse(data));
+        else if (ev === "error") error = data;
+      } catch {
+        /* 半帧或非 JSON：下一帧再说 */
+      }
+    }
+  }
+  return { conversation, text, steps, error };
+}
+
+/// 服务端日志里的用量按调用的种类归并（`llm usage … call=<系统消息的头一句>`）。
+/// 返回 [{ call, calls, prompt, completion }]，按总量从大到小
+export function usageByCall(logText) {
+  const by = new Map();
+  // eslint-disable-next-line no-control-regex
+  const text = logText.replace(/\x1b\[[0-9;]*m/g, "");
+  for (const m of text.matchAll(/llm usage .*?prompt=(\d+) completion=(\d+)(?:.*?call=(\S+))?/g)) {
+    const call = m[3] ?? "(unlabelled)";
+    const a = by.get(call) ?? { call, calls: 0, prompt: 0, completion: 0 };
+    a.calls += 1; a.prompt += Number(m[1]); a.completion += Number(m[2]);
+    by.set(call, a);
+  }
+  return [...by.values()].sort((a, b) => b.prompt + b.completion - (a.prompt + a.completion));
+}

@@ -337,11 +337,12 @@ async function main() {
       if (only && !only.has(r.id)) continue;
       let reply;
       let steps;
+      let sources;
       try {
         // `{wave-N}` 填成那一波灌完的时间戳："as of the second ingest" 是卷子内部的
         // 说法，模型无从知道它是哪一刻，只会反问；给它戳，量的才是工具那条路
         const ask = r.ask.replace(/\{(wave-\d+)\}/g, (_, w) => stamps[w] ?? w);
-        ({ answer: reply, steps } = await askChat(kb, ask));
+        ({ answer: reply, steps, sources } = await askChat(kb, ask));
       } catch (e) {
         // 接口本身失败不算答错，单独记 error——否则一个 500 会被记成
         // 「对话答不出来」，而它答都没答
@@ -357,6 +358,10 @@ async function main() {
         // 工具轨迹：模型有没有带 `at` / `as_of`、带的是哪个时刻，从 step 的 detail
         // 上一眼能看出来（"5 facts at 2024-08-01, as recorded by 2026-09-05"）
         steps,
+        // 回答里的 [n] 哪些点得开（#935）：来源列表里有这个号，界面上它就是一个能
+        // 打开原句的链接；没有的号是模型编的，界面上只是方括号
+        sources: sources.map(({ n, filename }) => ({ n, filename })),
+        cites: citations(reply, sources),
       };
     }
   }
@@ -395,6 +400,13 @@ async function main() {
           const gaps = answered.filter((r) => r.known_gap);
           const pass = rows.filter((r) => r.chat.outcome === "pass").length;
           const errors = results.filter((r) => r.chat?.outcome === "error").length;
+          // 引用不分对错、不分缺口：问的是回答能不能点开原句，每个拿到回复的题都算。
+          // 走过图谱的单独一栏——#935 要变的正是它们
+          const cited = (rows) => ({
+            answers: rows.length,
+            cited: rows.filter((r) => r.chat.cites.resolved.length).length,
+            dangling: rows.filter((r) => r.chat.cites.dangling.length).length,
+          });
           return {
             asked: rows.length,
             pass,
@@ -403,6 +415,10 @@ async function main() {
             known_gaps: {
               asked: gaps.length,
               pass: gaps.filter((r) => r.chat.outcome === "pass").length,
+            },
+            citations: {
+              all: cited(answered),
+              graph: cited(answered.filter((r) => r.chat.steps.some(readsGraph))),
             },
           };
         })()
@@ -418,6 +434,11 @@ async function main() {
         ? `　已知缺口 ${report.ledger.known_gaps.pass}/${report.ledger.known_gaps.asked} 通过`
         : "") +
       (report.chat ? `　对话：${report.chat.pass}/${report.chat.asked}` : "") +
+      (report.chat
+        ? `\n引用：${report.chat.citations.all.cited}/${report.chat.citations.all.answers} 个回答点得开原句` +
+          `（走过图谱的 ${report.chat.citations.graph.cited}/${report.chat.citations.graph.answers}），` +
+          `${report.chat.citations.all.dangling} 个带了点不开的号`
+        : "") +
       `\n`,
   );
 }
@@ -509,6 +530,8 @@ async function askChat(kb, question) {
   let answer = "";
   let error = null;
   const steps = [];
+  // 每个 `sources` 帧都是到那一刻为止的整张列表，留最后一个
+  let sources = [];
   for (const frame of text.split("\n\n")) {
     let event = "message";
     let data = "";
@@ -529,24 +552,61 @@ async function askChat(kb, question) {
       } catch {
         /* 同上 */
       }
+    } else if (event === "sources" && data) {
+      try {
+        sources = JSON.parse(data);
+      } catch {
+        /* 同上 */
+      }
     } else if (event === "error") {
       error = data;
     }
   }
   if (error && !answer) throw new Error(`chat error frame: ${error.slice(0, 200)}`);
-  return { answer, steps };
+  return { answer, steps, sources };
+}
+
+/// 回答里写到的 [n]，按来源列表分成点得开的与点不开的。认的写法与界面画链接的
+/// 那一条一致（`web/src/citations.ts` 的 `citeRe`）：`[1][3]`、`[1, 3]`、`[1，3]`
+function citations(reply, sources) {
+  const known = new Set(sources.map((s) => s.n));
+  const cited = new Set();
+  for (const [, inner] of reply.matchAll(/\[(\d+(?:\s*[,，]\s*\d+)*)\]/g)) {
+    for (const n of inner.split(/[,，]/)) cited.add(Number(n));
+  }
+  const all = [...cited].sort((a, b) => a - b);
+  return { resolved: all.filter((n) => known.has(n)), dangling: all.filter((n) => !known.has(n)) };
+}
+
+/// 这一步读的是图谱：四个图谱工具的 step（`tools_graph.rs`）。轨迹里每步是
+/// "kind · label · detail"
+function readsGraph(step) {
+  return ["facts", "neighbors", "timeline", "path"].includes(step.split(" · ")[0]);
 }
 
 /// 对话判分：子串匹配，只做一件归一——千位分隔符。模型写 "28,000 CNY"，题上写
 /// 28000，那是同一个数，不是另一个答案；第一版没归一，六道薪资题里答对的也记了错。
-/// 否定句里出现 `not` 的名字仍记错（"没有证据表明王五曾经…"）——这是自然语言
-/// 判分的已知弱点，README 里单独有数，不在这里用一串否定词去猜
+///
+/// 有 `expect` 的题看题目问的那个名字：它得出现，而且 `not` 里的哪一个都不在它前面。
+/// 对的回答常顺带说出前任、后任或后来改成的值（"Li Si led Project Aurora … until
+/// 2025-09-01, when Zhou Qi took over"）；从前一出现就记错，量的是回答提没提别的
+/// 名字，不是答对没有（#986 的评审）。同一处起头的两个取长的那个。先说对了名字、
+/// 后面又说错了别的，照样记对——子串判分分不出来。
+///
+/// `expect: null` 的题没有「谁在前」可比，照旧：`not` 里的名字一出现就记错，否定句
+/// 也一样（"没有证据表明王五曾经…"）——自然语言判分的已知弱点，README 里单独有数，
+/// 不在这里用一串否定词去猜
 function chatVerdict(q, reply) {
   const text = reply.replace(/(?<=\d),(?=\d)/g, "");
-  const ok =
-    (q.expect === null || text.includes(q.expect)) &&
-    !(q.not || []).some((bad) => text.includes(bad));
-  return ok ? "pass" : "fail";
+  const not = q.not || [];
+  if (q.expect === null) return not.some((bad) => text.includes(bad)) ? "fail" : "pass";
+  const at = text.indexOf(q.expect);
+  if (at === -1) return "fail";
+  const before = not.some((bad) => {
+    const i = text.indexOf(bad);
+    return i !== -1 && (i < at || (i === at && bad.length > q.expect.length));
+  });
+  return before ? "fail" : "pass";
 }
 
 main().catch((e) => {

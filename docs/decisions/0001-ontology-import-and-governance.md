@@ -1,14 +1,6 @@
 # 0001 · Ontology import and governance
 
-- **Status**: In progress. P0, P1, P2 and P2c built. P3's budget switch built
-  (`deployment_settings.ontology_prompt_budget`, default 24,000 characters; over budget the ontology
-  is retrieved per chunk, [0006](0006-ontology-scale-and-the-prompt.md)). P3a built but runs only by
-  hand. P3b built in a different shape: the surface predicate lands on
-  `fact_evidence.proposed_predicate`, and mapping back is `predicate_match` plus the adoption loop of
-  [0003](0003-ontology-growth-loop.md). P4a built (`entities.type_source`, #114); P4b and P4c pending.
-  P5 delivered by [0002](0002-reasoning-engine.md). The "argument order" half of criterion 2
-  overturned by [0012](0012-the-ontology-is-a-contract-not-a-suggestion.md). Checked against the code
-  2026-09-02.
+- **Status**: In progress · P0–P2c, the P3 budget and P4a built; P5 delivered by 0002 · open: P3a runs by hand only, P4b, P4c
 - **Written**: 2026-08-27 / 28 · condensed into English 2026-09-03
 - **Related**: [0002](0002-reasoning-engine.md) replaces P5's schedule;
   [0003](0003-ontology-growth-loop.md) is what P3b and P4 became;
@@ -98,7 +90,10 @@ since moved to `scripts/bench/` (0012); these numbers are real but no longer com
     `label` (`@en` / `@zh` preferred); `rdfs:comment` → `description`, load-bearing because it enters
     the extraction prompt and is what P3's retrieval matches on; `owl:ObjectProperty` → relation and
     `owl:DatatypeProperty` → attribute (`relation_types.kind`); `rdfs:domain` / `rdfs:range` →
-    `relation_type_domains` / `relation_type_ranges`, stored as signals, never as gates;
+    `relation_type_domains` / `relation_type_ranges`, stored as signals, never as gates; where a
+    property declares neither, schema.org's `domainIncludes` / `rangeIncludes` and SHACL shapes
+    supply them (the class a node shape targets → domain, `sh:class` / `sh:datatype` on its
+    `sh:property` shape → range);
     `owl:FunctionalProperty` / `InverseFunctionalProperty` → the two flags; the IRI → `iri` column,
     `UNIQUE (kb_id, iri) WHERE iri IS NOT NULL`. Every other axiom stays in the original and is
     reported as not yet projected (P5 has the current list).
@@ -129,9 +124,10 @@ since moved to `scripts/bench/` (0012); these numbers are real but no longer com
 20. **Attributes** (`create_attribute_with_iri`): `rdfs:range` → `datatype` three ways. A mappable XSD
     type gets its datatype; no range → `text`, listed in the preview; a type we cannot express
     (`time`, `gMonth`, `duration`, several ranges, unknown IRIs) → `text` and reported; a type the
-    extractor could never read out of prose (`base64Binary`, `hexBinary`, `XMLLiteral`, `QName`,
-    `ID`, `IDREF`, `ENTITY`) is skipped and reported. The dividing line is "can this value appear in a
-    sentence": skipping protects the prompt, where every attribute is a line paid per chunk. A domain
+    extractor could never read out of prose (`base64Binary`, `XMLLiteral`, `QName`, `ID`, `IDREF`,
+    `ENTITY`) is skipped and reported. The dividing line is "can this value appear in a sentence":
+    skipping protects the prompt, where every attribute is a line paid per chunk. `hexBinary` → `text`:
+    it is written as hex digits, and what it carries in prose is a hash, an address or a flag. A domain
     pointing at a class that was not imported is skipped and counted.
 21. **Multiple inheritance is real.** FOAF's `Person` is both `foaf:Agent` and `geo:SpatialThing`;
     keeping one parent makes attributes on the other branch fail their domain check.
@@ -251,6 +247,13 @@ since moved to `scripts/bench/` (0012); these numbers are real but no longer com
 - 2026-09-02: assumed `type_id` was NOT NULL and the coarse type always the first type; 0009 made it
   nullable, and "no type" may be a person's decision.
 - 2026-09-02: assumed argument order was guidance like everything else; 0012 made it enforced.
+- 2026-09-28: assumed a signature is written as `rdfs:domain` / `rdfs:range`. Vocabularies that
+  state their constraints as SHACL shapes (UCO, #923) declare almost none, so every attribute
+  without a domain was skipped at import; decision 13 now reads the shapes where a property
+  declares neither.
+- 2026-09-29: counted `hexBinary` among the values that never appear in prose. It is written as hex
+  digits, and forensic reports state hashes, addresses and flags in sentences (UCO has 12 such
+  properties, #1001); decision 20 now maps it to `text`. `base64Binary` stays skipped.
 
 ## Open questions
 
@@ -263,3 +266,9 @@ since moved to `scripts/bench/` (0012); these numbers are real but no longer com
 - `disjointWith` pruning of merge candidates on the resolution side is not done.
 - The `active` flag has only a governance use left (retired classes take no new entities); whether
   it is worth building waits for a real large ontology.
+
+## Status history
+
+The status line as it stood on 2026-09-27, before status lines were cut to one line:
+
+> In progress. P0, P1, P2 and P2c built. P3's budget switch built (`deployment_settings.ontology_prompt_budget`, default 24,000 characters; over budget the ontology is retrieved per chunk, [0006](0006-ontology-scale-and-the-prompt.md)). P3a built but runs only by hand. P3b built in a different shape: the surface predicate lands on `fact_evidence.proposed_predicate`, and mapping back is `predicate_match` plus the adoption loop of [0003](0003-ontology-growth-loop.md). P4a built (`entities.type_source`, #114); P4b and P4c pending. P5 delivered by [0002](0002-reasoning-engine.md). The "argument order" half of criterion 2 overturned by [0012](0012-the-ontology-is-a-contract-not-a-suggestion.md). Checked against the code 2026-09-02.

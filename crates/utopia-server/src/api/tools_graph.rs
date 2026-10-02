@@ -12,8 +12,8 @@
 //! 写在结果最上面，模型不同意就拿 id 再来一次。
 
 use super::tools::{
-    entity_facts_detail, fact_line, just_before, literal_text, parse_when, ToolCtx, ToolResult,
-    ToolSink,
+    entity_facts_detail, fact_line, just_before, literal_text, parse_when, Step, ToolCtx,
+    ToolResult, ToolSink,
 };
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -80,9 +80,15 @@ fn node_line(n: &GraphNode) -> String {
     )
 }
 
+/// 记下这一轮认下的实体。下一轮会被告知「直接用这些 id，别再按名字查」，所以这里
+/// 只能是真的读过、或者搜索明确指向的那个——同一轮先按名字认、再按 id 读，只记一次
 fn remember(sink: &mut ToolSink, n: &GraphNode) {
+    let id = n.id.to_string();
+    if sink.resolved.iter().any(|e| e["id"] == id.as_str()) {
+        return;
+    }
     sink.resolved.push(json!({
-        "id": n.id.to_string(), "name": n.name, "type": n.type_label
+        "id": id, "name": n.name, "type": n.type_label
     }));
 }
 
@@ -91,6 +97,8 @@ struct Resolved {
     id: Uuid,
     name: String,
     note: Option<String>,
+    /// 参数本来就是一个 id：没在库里查过，`name` 也只是那串 id
+    by_id: bool,
 }
 
 enum ResolveError {
@@ -114,13 +122,14 @@ async fn resolve(
             id,
             name: raw.to_string(),
             note: None,
+            by_id: true,
         });
     }
-    let hits = lookup(ctx, raw).await.map_err(|e| {
+    let (hits, _) = lookup(ctx, raw).await.map_err(|e| {
         tracing::warn!(error = %e, "Entity lookup failed");
         ResolveError::ReadFailed
     })?;
-    let (ranked, by_question) = rank_by_question(ctx, rank(hits, raw), raw).await;
+    let (ranked, by_question) = rank_by_question(ctx, sink, rank(hits, raw), raw).await;
     let Some(first) = ranked.first() else {
         return Err(ResolveError::Unresolved(format!(
             "no entity named \"{raw}\" in this base"
@@ -160,6 +169,7 @@ async fn resolve(
         id: first.id,
         name: first.name.clone(),
         note: Some(note),
+        by_id: false,
     })
 }
 
@@ -193,25 +203,99 @@ fn contains_ci(haystack: Option<&str>, needle: &str) -> bool {
     haystack.is_some_and(|h| h.to_lowercase().contains(&needle.to_lowercase()))
 }
 
+// ---- evidence marks (#935) -------------------------------------------------------
+
+/// 这一次显示出来的事实各自的第一条有效证据（#935）。
+///
+/// 事实行上印它的 `[n]`，证据块登进这一轮的来源清单，界面上点开就是那句原话；从前
+/// 图谱答出来的回答一个号也没有，界面只能说「未引用任何来源」。印哪一行时才登记，
+/// 所以号码按出现的顺序排，与检索结果共用一套号（同一块只有一个号）。
+///
+/// 没有来源清单（MCP）、或证据读不出来时是空的：事实行照旧，不带号。
+///
+/// 每条事实还带着那条证据的引文（#968 的后续）：号打开的是那一块，条目里的 `quotes`
+/// 是块里说出它的那一句，界面据此把那句话标出来
+struct Evidence(HashMap<Uuid, (utopia_core::models::ChunkView, Option<String>)>);
+
+impl Evidence {
+    /// 事实 id 收成自有的 `Vec` 再传进来：借着显示列表的迭代器跨 await 持有，工具的
+    /// future 就不再对所有生命周期都是 `Send`（对话的钩子与 MCP 路由都要求它）
+    async fn load(
+        ctx: &ToolCtx<'_>,
+        fact_ids: Vec<Uuid>,
+        as_of: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Self {
+        if !ctx.has_source_list() {
+            return Self(HashMap::new());
+        }
+        match utopia_store::graph::first_live_evidence(&ctx.state.pool, ctx.kb_id, &fact_ids, as_of)
+            .await
+        {
+            Ok(rows) => Self(
+                rows.into_iter()
+                    .map(|(fact, chunk, quote)| (fact, (chunk, quote)))
+                    .collect(),
+            ),
+            Err(e) => {
+                tracing::warn!(error = %e, "Evidence lookup for citation marks failed");
+                Self(HashMap::new())
+            }
+        }
+    }
+
+    /// 关上这一行的那一行的号（#970 第二步）：推出来的终点在那条事实的原句里写着
+    fn closer_mark(&self, sink: &mut ToolSink, f: &EntityFact) -> String {
+        f.closed_by_id
+            .map(|id| self.mark(sink, id))
+            .unwrap_or_default()
+    }
+
+    /// ` [n]`：这条事实的证据登进清单后的号。没有有效证据的事实（派生事实也是）不带号
+    fn mark(&self, sink: &mut ToolSink, fact_id: Uuid) -> String {
+        match self.0.get(&fact_id) {
+            Some((chunk, quote)) => {
+                let n = super::tools::cite(sink, chunk.id.to_string(), |n| {
+                    super::tools::source_json(n, chunk)
+                });
+                if let Some(quote) = quote {
+                    super::tools::add_quote(sink, n, quote);
+                }
+                format!(" [{n}]")
+            }
+            None => String::new(),
+        }
+    }
+}
+
+/// 显示的事实加上关上它们的那几行（#970 第二步）：一次证据查询把两边的块都读回来
+fn with_closers<'f>(facts: impl IntoIterator<Item = &'f EntityFact>) -> Vec<Uuid> {
+    facts
+        .into_iter()
+        .flat_map(|f| std::iter::once(f.id).chain(f.closed_by_id))
+        .collect()
+}
+
 // ---- find_entities ---------------------------------------------------------------
 
 pub async fn find_entities(ctx: &ToolCtx<'_>, sink: &mut ToolSink, args: &Value) -> ToolResult {
     let name = args["name"].as_str().unwrap_or("").to_string();
-    let hits = match lookup(ctx, &name).await {
-        Ok(hits) => hits,
+    let (hits, total) = match lookup(ctx, &name).await {
+        Ok(found) => found,
         Err(e) => {
             tracing::warn!(error = %e, "Entity lookup failed");
             return ToolResult::new(
                 "Could not look up entities.".into(),
-                json!({"kind": "entity", "label": name, "detail": "failed"}),
+                Step::new("entity", name, "failed").status("failed").json(),
             )
             .error();
         }
     };
-    let (ranked, by_question) = rank_by_question(ctx, rank(hits, &name), &name).await;
-    let text = if ranked.is_empty() {
+    let read = hits.len();
+    let (ranked, by_question) = rank_by_question(ctx, sink, rank(hits, &name), &name).await;
+    let clear = by_question || dominant(&ranked, &name);
+    let mut text = if ranked.is_empty() {
         "No matching entities.".to_string()
-    } else if by_question || dominant(&ranked, &name) {
+    } else if clear {
         let mut lines = vec![format!("Best match: {}", node_line(&ranked[0]))];
         if ranked.len() > 1 {
             lines.push("Other matches:".to_string());
@@ -225,14 +309,27 @@ pub async fn find_entities(ctx: &ToolCtx<'_>, sink: &mut ToolSink, args: &Value)
         lines.extend(ranked.iter().map(node_line));
         lines.join("\n")
     };
-    for n in &ranked {
-        remember(sink, n);
+    // 截断要说出来（与 `rule_matches` 同一条）：只读了前几个，模型会把它们当成这个
+    // 名字的全部，然后告诉人「库里只有这几个」
+    if let Some(total) = total.filter(|t| *t > read as i64) {
+        text.push_str(&format!(
+            "\n({total} entities have a name containing \"{name}\"; only the first {read} were \
+             read. A longer or more exact name narrows the search.)"
+        ));
     }
-    ToolResult::new(
-        text,
-        json!({ "kind": "entity", "label": name, "detail": format!("{} matches", ranked.len()) }),
-    )
-    .structured(json!({
+    // 同名歧义时候选只是搜索结果，不是认下的实体。从前这里全记，下一轮就收到一串
+    // 同名的 id 和一句「直接用这些」，没选的那个还常常排在前面。选中的那个在它被
+    // 读的时候记（entity_facts / neighbors / timeline）；上一轮的候选另有工具往返
+    // 的回放可查
+    if let Some(best) = ranked.first().filter(|_| clear) {
+        remember(sink, best);
+    }
+    let mut step =
+        Step::new("entity", name.as_str(), format!("{} matches", ranked.len())).count(ranked.len());
+    if let Some(total) = total.filter(|t| *t > read as i64) {
+        step = step.total(total as usize);
+    }
+    ToolResult::new(text, step.json()).structured(json!({
         "kb_id": ctx.kb_id,
         "entities": ranked.iter().map(|n| json!({
             "id": n.id, "name": n.name, "type_key": n.type_key,
@@ -291,7 +388,10 @@ fn other_text(f: &EntityFact) -> String {
         .to_string()
 }
 
-fn range_text(f: &EntityFact) -> String {
+/// `closer_mark` 是关上它的那一行证据的号（#970 第二步；MCP 与没有证据时为空）
+fn range_text(f: &EntityFact, closer_mark: &str) -> String {
+    let successor =
+        super::tools::successor_text(f.closed_by.as_deref(), f.closed_by_value.as_ref());
     let range = crate::time_text::span(crate::time_text::Span {
         valid_from: f.valid_from,
         from_precision: f.valid_from_precision.as_deref(),
@@ -299,6 +399,10 @@ fn range_text(f: &EntityFact) -> String {
         to_precision: f.valid_to_precision.as_deref(),
         holds_from: f.holds_from,
         holds_to: f.holds_to,
+        end_derived: f.end_derived,
+        corrected: f.corrected_ends.as_deref(),
+        closed_by: successor.as_deref().map(|who| (who, closer_mark)),
+        correction_note: f.correction_note.as_deref(),
     });
     if range.is_empty() {
         range
@@ -352,18 +456,24 @@ pub(super) fn predicates_of(facts: &[EntityFact]) -> String {
 /// 子串找不到时按词找：每个词各去库里捞一把，名字里含的词数达到「全部减一、至少两个」
 /// 的候选算命中（"OpenAI board members" → "OpenAI's board of directors"）。
 /// 模型给的名字常带一个库里没有的词（members、公司、这个），全词命中会把它们全漏掉
-async fn lookup(ctx: &ToolCtx<'_>, raw: &str) -> utopia_core::AppResult<Vec<GraphNode>> {
+///
+/// 回的是查到的实体，以及这个名字一共命中几个。只读前八个，总数用来告诉模型这不是
+/// 全部；按词拼凑的那一路没有总数
+async fn lookup(
+    ctx: &ToolCtx<'_>,
+    raw: &str,
+) -> utopia_core::AppResult<(Vec<GraphNode>, Option<i64>)> {
     // 工具调用来自聊天 / MCP：当下的问题，不在回放里。传 None 让 `degree` 按
     // 现在算——和现状一致，回放图上的搜索框另走 `/kbs/{id}/entities` 自己挂
     // 时刻
-    let (hits, _) =
+    let (hits, total) =
         utopia_store::graph::search_entities(&ctx.state.pool, ctx.kb_id, raw, 8, 0, None).await?;
     if !hits.is_empty() {
-        return Ok(hits);
+        return Ok((hits, Some(total)));
     }
     let words: Vec<&str> = raw.split_whitespace().filter(|w| w.len() >= 2).collect();
     if words.len() < 2 {
-        return Ok(hits);
+        return Ok((hits, Some(total)));
     }
     let mut pool: Vec<GraphNode> = Vec::new();
     for w in &words {
@@ -383,7 +493,7 @@ async fn lookup(ctx: &ToolCtx<'_>, raw: &str) -> utopia_core::AppResult<Vec<Grap
         .filter(|(s, _)| *s >= need)
         .collect();
     scored.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.degree.cmp(&a.1.degree)));
-    Ok(scored.into_iter().map(|(_, n)| n).take(8).collect())
+    Ok((scored.into_iter().map(|(_, n)| n).take(8).collect(), None))
 }
 
 /// 名字里含了几个词（大小写不敏感）
@@ -395,11 +505,13 @@ pub(super) fn word_score(name: &str, words: &[&str]) -> usize {
         .count()
 }
 
-/// 同名候选按问题排：用户的问题嵌一次，与候选的上下文画像比，近的在前。
+/// 同名候选按问题排：用户的问题嵌成向量，与候选的上下文画像比，近的在前。问题一轮
+/// 只嵌一次（`embed_once`）：这一轮里每按名字查一次实体都会走到这里，句子却是同一句。
 /// 精确命中仍在前（问 OpenAI 就先给叫 OpenAI 的），画像只在同一档里排序。
 /// 没有问题（MCP）、没有嵌入模型、只有一个候选：原样返回，第二个值说明有没有用上
 async fn rank_by_question(
     ctx: &ToolCtx<'_>,
+    sink: &mut ToolSink,
     ranked: Vec<GraphNode>,
     query: &str,
 ) -> (Vec<GraphNode>, bool) {
@@ -409,7 +521,7 @@ async fn rank_by_question(
     let Some(question) = ctx.question else {
         return (ranked, false);
     };
-    let Some(vec) = ctx.embed(question).await else {
+    let Some(vec) = ctx.embed_once(sink, question).await else {
         return (ranked, false);
     };
     let ids: Vec<Uuid> = ranked.iter().map(|n| n.id).collect();
@@ -449,8 +561,8 @@ pub(super) fn reorder_by_distance(
 const PREDICATE_DISTANCE: f32 = 0.45;
 const PREDICATE_CANDIDATES: i64 = 5;
 
-async fn aligned_predicates(ctx: &ToolCtx<'_>, word: &str) -> Vec<String> {
-    let Some(vec) = ctx.embed(word).await else {
+async fn aligned_predicates(ctx: &ToolCtx<'_>, sink: &mut ToolSink, word: &str) -> Vec<String> {
+    let Some(vec) = ctx.embed_once(sink, word).await else {
         return Vec::new();
     };
     let near = utopia_store::ontology::nearest_relation_types(
@@ -474,6 +586,7 @@ async fn aligned_predicates(ctx: &ToolCtx<'_>, word: &str) -> Vec<String> {
 /// 过滤；谓词按子串对不上时向量对齐一次，回一句说明给结果开头
 async fn filtered<'f>(
     ctx: &ToolCtx<'_>,
+    sink: &mut ToolSink,
     facts: &'f [EntityFact],
     filter: &FactFilter<'_>,
 ) -> (Vec<&'f EntityFact>, Option<String>) {
@@ -484,7 +597,10 @@ async fn filtered<'f>(
     if !kept.is_empty() || facts.is_empty() {
         return (kept, None);
     }
-    let keys: HashSet<String> = aligned_predicates(ctx, word).await.into_iter().collect();
+    let keys: HashSet<String> = aligned_predicates(ctx, sink, word)
+        .await
+        .into_iter()
+        .collect();
     if keys.is_empty() {
         return (kept, None);
     }
@@ -569,7 +685,7 @@ pub async fn entity_facts(ctx: &ToolCtx<'_>, sink: &mut ToolSink, args: &Value) 
         Err(ResolveError::ReadFailed) => {
             return ToolResult::new(
                 "Could not look up entities.".into(),
-                json!({ "kind": "facts", "label": "?", "detail": "failed" }),
+                Step::new("facts", "?", "failed").status("failed").json(),
             )
             .error();
         }
@@ -578,7 +694,9 @@ pub async fn entity_facts(ctx: &ToolCtx<'_>, sink: &mut ToolSink, args: &Value) 
                 format!(
                     "Invalid entity: {e} (expected a name, or the uuid returned by find_entities)."
                 ),
-                json!({ "kind": "facts", "label": "?", "detail": "invalid id" }),
+                Step::new("facts", "?", "invalid id")
+                    .status("not_found")
+                    .json(),
             )
             .error()
         }
@@ -600,11 +718,14 @@ pub async fn entity_facts(ctx: &ToolCtx<'_>, sink: &mut ToolSink, args: &Value) 
                 };
                 return ToolResult::new(
                     text.into(),
-                    json!({"kind": "facts", "label": "?", "detail": "failed"}),
+                    Step::new("facts", "?", "failed").status("failed").json(),
                 )
                 .error();
             }
         };
+    // 按 id 读的也是认下：模型常常先搜到一串同名的，再按 id 读其中一个，读的这个
+    // 才是这一轮说的那个（按名字认下的 `resolve` 已记过，这里不会重复）
+    remember(sink, &node);
     // 规则的结论也是这个实体的一部分（0021）。**不给的话模型会拿那些读数自己再判
     // 一遍**——而阈值写在规则里，它看不见，于是两处判断迟早不一致
     let derived = match
@@ -621,7 +742,7 @@ pub async fn entity_facts(ctx: &ToolCtx<'_>, sink: &mut ToolSink, args: &Value) 
             Err(e) => {
                 tracing::warn!(error = %e, "Derived facts lookup failed");
                 return ToolResult::new("Could not read the derived facts.".into(),
-                    json!({"kind": "facts", "label": node.name, "detail": "failed"})).error();
+                    Step::new("facts", node.name, "failed").status("failed").json()).error();
             }
         };
     let derived_lines: Vec<String> = derived
@@ -644,7 +765,7 @@ pub async fn entity_facts(ctx: &ToolCtx<'_>, sink: &mut ToolSink, args: &Value) 
             tracing::warn!(error = %e, "Entity names lookup failed");
             Vec::new()
         });
-    let (kept, aligned) = filtered(ctx, &facts, &filter).await;
+    let (kept, aligned) = filtered(ctx, sink, &facts, &filter).await;
     let shown: Vec<&EntityFact> = kept.iter().copied().take(limit).collect();
     let mut lines: Vec<String> = Vec::new();
     if let Some(note) = &who.note {
@@ -690,25 +811,33 @@ pub async fn entity_facts(ctx: &ToolCtx<'_>, sink: &mut ToolSink, args: &Value) 
             ));
         }
         lines.push(head);
+        let ids = with_closers(shown.iter().copied());
+        let evidence = Evidence::load(ctx, ids, m.as_of).await;
         let shown_owned: Vec<EntityFact> = shown.iter().map(|f| (*f).clone()).collect();
         for (key, group) in grouped(&shown_owned) {
             lines.push(format!("## {key} ({})", group.len()));
             for f in group {
+                let closer = evidence.closer_mark(sink, f);
                 lines.push(format!(
-                    "{}{}{} {}",
+                    "{}{}{} {}{}",
                     other_text(f),
                     qualifiers_text(f),
-                    range_text(f),
-                    confidence_text(f)
+                    range_text(f, &closer),
+                    confidence_text(f),
+                    evidence.mark(sink, f.id)
                 ));
             }
         }
+        // 派生事实自己不带号：它是规则算出来的，出处在它的前提上，前提各带各的
         lines.extend(derived_lines);
     }
     let detail = entity_facts_detail(shown.len(), m.at, m.as_of, m.before);
     ToolResult::new(
         lines.join("\n"),
-        json!({ "kind": "facts", "label": node.name, "detail": detail }),
+        Step::new("facts", node.name.as_str(), detail)
+            .count(shown.len())
+            .moments(m.at, m.as_of, m.before)
+            .json(),
     )
     .structured(json!({
         "kb_id": ctx.kb_id,
@@ -766,14 +895,18 @@ pub async fn neighbors(ctx: &ToolCtx<'_>, sink: &mut ToolSink, args: &Value) -> 
         Err(ResolveError::ReadFailed) => {
             return ToolResult::new(
                 "Could not look up entities.".into(),
-                json!({ "kind": "neighbors", "label": "?", "detail": "failed" }),
+                Step::new("neighbors", "?", "failed")
+                    .status("failed")
+                    .json(),
             )
             .error();
         }
         Err(ResolveError::Unresolved(e)) => {
             return ToolResult::new(
                 format!("Unknown entity: {e}."),
-                json!({ "kind": "neighbors", "label": "?", "detail": "unknown entity" }),
+                Step::new("neighbors", "?", "unknown entity")
+                    .status("not_found")
+                    .json(),
             )
         }
     };
@@ -788,20 +921,25 @@ pub async fn neighbors(ctx: &ToolCtx<'_>, sink: &mut ToolSink, args: &Value) -> 
             Err(utopia_core::AppError::NotFound) => {
                 return ToolResult::new(
                     "Entity not found.".to_string(),
-                    json!({ "kind": "neighbors", "label": "?", "detail": "not found" }),
+                    Step::new("neighbors", "?", "not found")
+                        .status("not_found")
+                        .json(),
                 );
             }
             Err(e) => {
                 tracing::warn!(error = %e, "Entity neighbors lookup failed");
                 return ToolResult::new(
                     "Could not read the entity facts.".into(),
-                    json!({ "kind": "neighbors", "label": "?", "detail": "failed" }),
+                    Step::new("neighbors", "?", "failed")
+                        .status("failed")
+                        .json(),
                 )
                 .error();
             }
         };
+    remember(sink, &node);
     // 邻居是对端**实体**；属性值不算邻居，entity_facts 里有
-    let (matched, aligned) = filtered(ctx, &facts, &filter).await;
+    let (matched, aligned) = filtered(ctx, sink, &facts, &filter).await;
     let linked: Vec<&EntityFact> = matched
         .into_iter()
         .filter(|f| f.other_id.is_some())
@@ -836,6 +974,8 @@ pub async fn neighbors(ctx: &ToolCtx<'_>, sink: &mut ToolSink, args: &Value) -> 
             }
         ));
     } else {
+        let ids = with_closers(shown.iter());
+        let evidence = Evidence::load(ctx, ids, m.as_of).await;
         let groups = grouped(&shown);
         // 数的是对端实体，不是事实：同一条边常是两条事实（一条带日期一条不带）
         let entities: HashSet<Uuid> = linked.iter().filter_map(|f| f.other_id).collect();
@@ -861,12 +1001,14 @@ pub async fn neighbors(ctx: &ToolCtx<'_>, sink: &mut ToolSink, args: &Value) -> 
                         .as_deref()
                         .map(|t| format!(" [{t}]"))
                         .unwrap_or_default();
+                    let closer = evidence.closer_mark(sink, f);
                     format!(
-                        "{}{}{} {}",
+                        "{}{}{} {}{}",
                         other_text(f),
                         ty,
-                        range_text(f),
-                        confidence_text(f)
+                        range_text(f, &closer),
+                        confidence_text(f),
+                        evidence.mark(sink, f.id)
                     )
                 })
                 .collect();
@@ -876,7 +1018,10 @@ pub async fn neighbors(ctx: &ToolCtx<'_>, sink: &mut ToolSink, args: &Value) -> 
     let detail = format!("{} of {} linked", shown.len(), linked.len());
     ToolResult::new(
         lines.join("\n"),
-        json!({ "kind": "neighbors", "label": node.name, "detail": detail }),
+        Step::new("neighbors", node.name, detail)
+            .count(shown.len())
+            .total(linked.len())
+            .json(),
     )
 }
 
@@ -892,14 +1037,16 @@ pub async fn timeline(ctx: &ToolCtx<'_>, sink: &mut ToolSink, args: &Value) -> T
         Err(ResolveError::ReadFailed) => {
             return ToolResult::new(
                 "Could not look up entities.".into(),
-                json!({ "kind": "timeline", "label": "?", "detail": "failed" }),
+                Step::new("timeline", "?", "failed").status("failed").json(),
             )
             .error();
         }
         Err(ResolveError::Unresolved(e)) => {
             return ToolResult::new(
                 format!("Unknown entity: {e}."),
-                json!({ "kind": "timeline", "label": "?", "detail": "unknown entity" }),
+                Step::new("timeline", "?", "unknown entity")
+                    .status("not_found")
+                    .json(),
             )
         }
     };
@@ -914,21 +1061,24 @@ pub async fn timeline(ctx: &ToolCtx<'_>, sink: &mut ToolSink, args: &Value) -> T
             Err(utopia_core::AppError::NotFound) => {
                 return ToolResult::new(
                     "Entity not found.".to_string(),
-                    json!({ "kind": "timeline", "label": "?", "detail": "not found" }),
+                    Step::new("timeline", "?", "not found")
+                        .status("not_found")
+                        .json(),
                 );
             }
             Err(e) => {
                 tracing::warn!(error = %e, "Entity timeline lookup failed");
                 return ToolResult::new(
                     "Could not read the entity facts.".into(),
-                    json!({ "kind": "timeline", "label": "?", "detail": "failed" }),
+                    Step::new("timeline", "?", "failed").status("failed").json(),
                 )
                 .error();
             }
         };
+    remember(sink, &node);
     // 只要**说出了世界时间**的事实。没日期的那些起点是摄取时刻，排进时间线只会
     // 把一篇文章的日期当成事件的日期
-    let (matched, aligned) = filtered(ctx, &facts, &filter).await;
+    let (matched, aligned) = filtered(ctx, sink, &facts, &filter).await;
     let mut dated: Vec<&EntityFact> = matched
         .into_iter()
         .filter(|f| f.valid_from.is_some())
@@ -971,26 +1121,38 @@ pub async fn timeline(ctx: &ToolCtx<'_>, sink: &mut ToolSink, args: &Value) -> T
             ));
         }
         lines.push(head);
+        let ids = with_closers(shown.iter().copied());
+        let evidence = Evidence::load(ctx, ids, m.as_of).await;
         for f in &shown {
             let stamp = crate::time_text::world(
                 f.valid_from.expect("dated"),
                 f.valid_from_precision.as_deref(),
             );
-            lines.push(format!("{stamp}  {}", fact_line(f)));
+            let closer = evidence.closer_mark(sink, f);
+            lines.push(format!(
+                "{stamp}  {}{}",
+                fact_line(f, &closer),
+                evidence.mark(sink, f.id)
+            ));
         }
     }
     let detail = format!("{} of {} dated", shown.len(), dated.len());
     ToolResult::new(
         lines.join("\n"),
-        json!({ "kind": "timeline", "label": node.name, "detail": detail }),
+        Step::new("timeline", node.name, detail)
+            .count(shown.len())
+            .total(dated.len())
+            .json(),
     )
 }
 
 // ---- paths_between ---------------------------------------------------------------
 
 /// 一条边在链上的写法：顺着走 `A —pred→ B`，逆着走 `A ←pred— B`
-pub(super) fn edge_text(prev: Uuid, e: &PathEdge) -> String {
+pub(super) fn edge_text(prev: Uuid, e: &PathEdge, closer_mark: &str) -> String {
     let pred = e.predicate.as_deref().unwrap_or("?");
+    let successor =
+        super::tools::successor_text(e.closed_by.as_deref(), e.closed_by_value.as_ref());
     let range = crate::time_text::span(crate::time_text::Span {
         valid_from: e.valid_from,
         from_precision: e.valid_from_precision.as_deref(),
@@ -998,6 +1160,10 @@ pub(super) fn edge_text(prev: Uuid, e: &PathEdge) -> String {
         to_precision: e.valid_to_precision.as_deref(),
         holds_from: e.holds_from,
         holds_to: e.holds_to,
+        end_derived: e.end_derived,
+        corrected: e.corrected_ends.as_deref(),
+        closed_by: successor.as_deref().map(|who| (who, closer_mark)),
+        correction_note: e.correction_note.as_deref(),
     });
     let range = if range.is_empty() {
         range
@@ -1018,12 +1184,34 @@ pub(super) fn edge_text(prev: Uuid, e: &PathEdge) -> String {
     }
 }
 
+#[cfg(test)]
 pub(super) fn path_text(p: &Path) -> String {
+    path_text_marked(p, |_| String::new())
+}
+
+/// 一条路径，每一跳后面跟着 `mark` 给那条事实的东西（对话里是它证据的 `[n]`，#935）；
+/// 时间线关上的那一跳，关它的那一行也由 `mark` 给号（#970 第二步）
+fn path_text_marked(p: &Path, mut mark: impl FnMut(Uuid) -> String) -> String {
     let mut parts = Vec::new();
     for (i, e) in p.edges.iter().enumerate() {
-        parts.push(edge_text(p.nodes[i], e));
+        let closer = e.closed_by_id.map(&mut mark).unwrap_or_default();
+        let own = mark(e.fact_id);
+        parts.push(format!("{}{own}", edge_text(p.nodes[i], e, &closer)));
     }
     parts.join("; ")
+}
+
+/// 一个端点在这条路径上的名字：路径两头的边写着它
+fn name_on_path(p: &Path, id: Uuid) -> Option<&str> {
+    p.edges.iter().find_map(|e| {
+        if e.subject_id == id {
+            Some(e.subject_name.as_str())
+        } else if e.object_id == id {
+            Some(e.object_name.as_str())
+        } else {
+            None
+        }
+    })
 }
 
 pub async fn paths_between(ctx: &ToolCtx<'_>, sink: &mut ToolSink, args: &Value) -> ToolResult {
@@ -1040,19 +1228,20 @@ pub async fn paths_between(ctx: &ToolCtx<'_>, sink: &mut ToolSink, args: &Value)
             Err(ResolveError::ReadFailed) => {
                 return ToolResult::new(
                     "Could not look up entities.".into(),
-                    json!({ "kind": "path", "label": "?", "detail": "failed" }),
+                    Step::new("path", "?", "failed").status("failed").json(),
                 )
                 .error();
             }
             Err(ResolveError::Unresolved(e)) => {
                 return ToolResult::new(
                     format!("Unknown `{key}`: {e}."),
-                    json!({ "kind": "path", "label": "?", "detail": "unknown entity" }),
+                    Step::new("path", "?", "unknown entity")
+                        .status("not_found")
+                        .json(),
                 )
             }
         }
     }
-    let (from, to) = (&ends[0], &ends[1]);
     let m = moments(args);
     let max_hops = args["max_hops"]
         .as_u64()
@@ -1066,8 +1255,8 @@ pub async fn paths_between(ctx: &ToolCtx<'_>, sink: &mut ToolSink, args: &Value)
     let paths = match utopia_store::paths::paths_between(
         &ctx.state.pool,
         ctx.kb_id,
-        from.id,
-        to.id,
+        ends[0].id,
+        ends[1].id,
         m.at,
         m.as_of,
         limits,
@@ -1079,11 +1268,48 @@ pub async fn paths_between(ctx: &ToolCtx<'_>, sink: &mut ToolSink, args: &Value)
             tracing::warn!(error = %e, "Path search failed");
             return ToolResult::new(
                 "Could not search paths.".into(),
-                json!({ "kind": "path", "label": "?", "detail": "failed" }),
+                Step::new("path", "?", "failed").status("failed").json(),
             )
             .error();
         }
     };
+    // 以 id 给出的一端没在库里查过。找到了路径，它就在路上，名字写在边上；没找到，
+    // 可能只是这个 id 不在这个库（抄错的、别的库的）——那时「两者之间没有路径」
+    // 读起来像一个关于图的事实，所以先认一遍，认不出就照实说
+    for (key, end) in ["from", "to"].into_iter().zip(ends.iter_mut()) {
+        if !end.by_id {
+            continue;
+        }
+        if let Some(p) = paths.first() {
+            if let Some(name) = name_on_path(p, end.id) {
+                end.name = name.to_string();
+            }
+            continue;
+        }
+        match utopia_store::graph::entity_node(&ctx.state.pool, ctx.kb_id, end.id, m.as_of).await {
+            Ok(Some(node)) => end.name = node.name,
+            Ok(None) => {
+                return ToolResult::new(
+                    format!(
+                        "Unknown `{key}`: no entity with id {} in this base.",
+                        end.id
+                    ),
+                    Step::new("path", "?", "unknown entity")
+                        .status("not_found")
+                        .json(),
+                )
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Entity lookup failed");
+                return ToolResult::new(
+                    "Could not look up entities.".into(),
+                    Step::new("path", "?", "failed").status("failed").json(),
+                )
+                .error();
+            }
+        }
+    }
+    let (from, to) = (&ends[0], &ends[1]);
     let label = format!("{} ↔ {}", from.name, to.name);
     let when = match (m.at, m.before, m.as_of) {
         (Some(t), _, _) => format!(" at {}", crate::time_text::world(t, Some("day"))),
@@ -1102,7 +1328,7 @@ pub async fn paths_between(ctx: &ToolCtx<'_>, sink: &mut ToolSink, args: &Value)
         ));
         return ToolResult::new(
             lines.join("\n"),
-            json!({ "kind": "path", "label": label, "detail": "no path" }),
+            Step::new("path", label, "no path").count(0).json(),
         );
     }
     let shortest = paths[0].hops();
@@ -1113,8 +1339,25 @@ pub async fn paths_between(ctx: &ToolCtx<'_>, sink: &mut ToolSink, args: &Value)
         from.name,
         to.name
     ));
+    // 每一跳是一条事实，各带各的号；时间线关上的那一跳，关它的那一行也要号
+    let hops: Vec<Uuid> = paths
+        .iter()
+        .flat_map(|p| {
+            p.edges
+                .iter()
+                .flat_map(|e| std::iter::once(e.fact_id).chain(e.closed_by_id))
+        })
+        .collect();
+    let evidence = Evidence::load(ctx, hops, m.as_of).await;
     for (i, p) in paths.iter().enumerate() {
-        lines.push(format!("{}. {}", i + 1, path_text(p)));
+        let text = path_text_marked(p, |fact| evidence.mark(sink, fact));
+        lines.push(format!("{}. {}", i + 1, text));
+    }
+    if paths.len() >= limits.max_paths {
+        lines.push(format!(
+            "(Only the first {} paths, shortest first, are listed; there may be more.)",
+            limits.max_paths
+        ));
     }
     let detail = format!(
         "{} path{}, shortest {shortest} hop{}",
@@ -1124,7 +1367,11 @@ pub async fn paths_between(ctx: &ToolCtx<'_>, sink: &mut ToolSink, args: &Value)
     );
     ToolResult::new(
         lines.join("\n"),
-        json!({ "kind": "path", "label": label, "detail": detail }),
+        Step::new("path", label, detail)
+            .count(paths.len())
+            .more(paths.len() >= limits.max_paths)
+            .field("hops", shortest)
+            .json(),
     )
 }
 
@@ -1247,10 +1494,18 @@ mod tests {
             valid_to_precision: None,
             holds_from: Some("2021-01-01T00:00:00Z".parse().unwrap()),
             holds_to: None,
+            attested_by: None,
             confidence: 0.9,
             evidence_count: 1,
             stale: false,
             corrected: false,
+            end_derived: false,
+            time_corrected: false,
+            corrected_ends: None,
+            closed_by_id: None,
+            closed_by: None,
+            closed_by_value: None,
+            correction_note: None,
             last_evidence_time: None,
             contested: None,
         }
@@ -1378,6 +1633,13 @@ mod tests {
             holds_from: Some("2021-01-01T00:00:00Z".parse().unwrap()),
             holds_to: None,
             confidence: 0.9,
+            end_derived: false,
+            time_corrected: false,
+            corrected_ends: None,
+            closed_by_id: None,
+            closed_by: None,
+            closed_by_value: None,
+            correction_note: None,
         };
         let p = Path {
             nodes: vec![a, x, b],

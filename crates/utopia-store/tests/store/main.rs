@@ -18,6 +18,10 @@
 //! - `the_engine_redraws_only_what_it_drew`：把迁移 0057 的回填语句原样跑一遍，那条
 //!   `UPDATE facts` 不按 kb 过滤，锁住全库的行，和正在重算时间线的测试互相等死——
 //!   合并二进制的实验里 30% 的运行栽在这里。
+//! - `a_rewritten_row_gets_its_statements_back`：把迁移 0096 原样跑一遍，它同样不按 kb
+//!   过滤——修正行、重复行都按全库找，会改到别的测试正在物化、改写的行。
+//! - `a_row_a_rule_implied_follows_its_statements`：把迁移 0101 原样跑一遍，同样不按 kb
+//!   过滤——它按来源重算全库类型化行的见证，会改到别的测试正在物化的行。
 //!
 //! 新加测试默认放这个目录；只有碰上面那类全局状态时才放顶层，并在这里补一行为什么。
 mod a_batch_decides_like_a_person;
@@ -26,6 +30,7 @@ mod a_bound_statement_becomes_a_typed_fact;
 mod a_chunk_says_where_its_words_came_from;
 mod a_clash_needs_both_at_once;
 mod a_contradiction_points_upstream;
+mod a_corrected_time_keeps_its_statements;
 mod a_cycle_holds_at_one_moment;
 mod a_cycle_is_keyed_by_all_its_facts;
 mod a_cycle_search_that_stops_says_so;
@@ -42,6 +47,7 @@ mod a_dirty_ledger_stops_the_migration;
 mod a_disambiguator_follows_the_ontology;
 mod a_document_opening_is_its_first_live_chunk;
 mod a_fact_awaits_a_nod;
+mod a_fact_says_where_its_dates_came_from;
 mod a_failed_job_finds_its_way_back;
 mod a_forward_reference_is_judged_at_commit;
 mod a_governor_reads_the_ledger;
@@ -51,6 +57,7 @@ mod a_late_value_takes_its_place_in_history;
 mod a_mapping_is_not_a_fact;
 mod a_merge_rewinds_with_the_second_clock;
 mod a_merged_target_stays_out_of_the_export;
+mod a_moment_marks_its_state;
 mod a_name_created_twice_at_once_is_one_entity;
 mod a_name_is_a_fact;
 mod a_namesake_tie_goes_to_review_not_a_coin_flip;
@@ -64,6 +71,7 @@ mod a_purge_is_final;
 mod a_purge_judges_its_blobs_once;
 mod a_qualifier_is_not_the_edges_identity;
 mod a_question_picks_its_definitions;
+mod a_reader_keeps_its_key_for_its_provider;
 mod a_relation_points_only_inside_its_own_kb;
 mod a_remembered_episode_strips_nul;
 mod a_retired_account;
@@ -73,11 +81,14 @@ mod a_rule_computes_what_it_concludes;
 mod a_rule_concludes_a_type;
 mod a_rule_reads_what_a_rule_concluded;
 mod a_schema_document_is_searched_not_extracted;
+mod a_search_puts_the_exact_name_first;
 mod a_search_reads_the_base_as_it_was;
 mod a_secret_is_sealed_at_rest;
 mod a_signature_holds_on_every_path;
 mod a_source_kind_is_listed_once;
 mod a_source_reaches_only_where_it_was_granted;
+mod a_statement_is_attested_by_what_its_document_says;
+mod a_stopped_chat_is_replayed_as_incomplete;
 mod a_time_mention_is_resolved_against_its_document;
 mod a_time_mention_is_words_not_a_date;
 mod a_timeline_holds_whatever_the_order;
@@ -91,6 +102,7 @@ mod adopting_an_iri_adopts_the_shape;
 mod an_agent_can_record;
 mod an_amount_outlives_adoption;
 mod an_automatic_merge_is_gated_by_what_it_can_undo;
+mod an_axiom_that_moved_closes_its_findings;
 mod an_earlier_mention_keeps_the_stated_end;
 mod an_end_date_closes_the_open_span;
 mod an_event_holds_at_the_moment_it_names;

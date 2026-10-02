@@ -330,8 +330,35 @@ pub(crate) fn render_grid(
     rows: &[Vec<(String, usize, u32)>],
     first_is_header: bool,
 ) -> Option<String> {
-    let rows: Vec<Row> = rows
-        .iter()
+    let rows = grid_rows(rows);
+    let forced = first_is_header
+        .then(|| {
+            rows.iter()
+                .position(|r| r.cells.iter().filter(|c| !c.text.is_empty()).count() >= 2)
+        })
+        .flatten()
+        .map(|row| row..row + 1);
+    render_rows(rows, &[], forced).map(|(md, _)| md)
+}
+
+/// 电子表格的 merged cells 可以给出不止一行的表头。调用方已经把行投影成网格，
+/// 这里只负责把明确的表头区间按表头处理。
+pub(crate) fn render_grid_with_headers(
+    rows: &[Vec<(String, usize, u32)>],
+    headers: Option<std::ops::Range<usize>>,
+) -> Option<String> {
+    let rows = grid_rows(rows);
+    let forced = headers
+        .map(|mut range| {
+            range.end = range.end.min(rows.len());
+            range
+        })
+        .filter(|range| !range.is_empty());
+    render_rows(rows, &[], forced).map(|(md, _)| md)
+}
+
+fn grid_rows(rows: &[Vec<(String, usize, u32)>]) -> Vec<Row> {
+    rows.iter()
         .map(|cells| {
             let mut col = 0usize;
             let mut out = Vec::with_capacity(cells.len());
@@ -350,20 +377,13 @@ pub(crate) fn render_grid(
                 width: col,
             }
         })
-        .collect();
-    let forced = first_is_header
-        .then(|| {
-            rows.iter()
-                .position(|r| r.cells.iter().filter(|c| !c.text.is_empty()).count() >= 2)
-        })
-        .flatten();
-    render_rows(rows, &[], forced).map(|(md, _)| md)
+        .collect()
 }
 
 fn render_rows(
     mut rows: Vec<Row>,
     inherited: &[String],
-    forced_header: Option<usize>,
+    forced_header: Option<std::ops::Range<usize>>,
 ) -> Option<(String, Vec<String>)> {
     let width = rows.iter().map(|r| r.width).max().unwrap_or(0);
     if width == 0 {
@@ -382,12 +402,12 @@ fn render_rows(
     let (mut headers_seen, mut data_seen) = (false, false);
     for (i, row) in rows.iter_mut().enumerate() {
         let filled = row.cells.iter().filter(|c| !c.text.is_empty()).count();
-        let k = match forced_header {
-            Some(h) if i == h => Kind::Header,
+        let k = match forced_header.as_ref() {
+            Some(header) if header.contains(&i) => Kind::Header,
             // 列头之后的行是记录，哪怕一格数字都没有；只填了一个数字的行（序号列）也是记录，
             // 只填了一个词的行才按小节算
-            Some(h)
-                if i > h
+            Some(header)
+                if i >= header.end
                     && (filled >= 2
                         || row
                             .cells

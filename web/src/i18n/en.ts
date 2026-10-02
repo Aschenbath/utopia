@@ -55,6 +55,32 @@ export const en = {
       "Sign-up is closed on this deployment — ask an administrator for an account.",
     no_chat_model:
       "No chat model configured yet. Set one under Administration → Models.",
+    // 对话流里没答成的那一轮：`error` 帧带的 code（服务端的英文原句只给日志）
+    answer_empty: "The model returned an empty answer. Ask again.",
+    answer_tool_text: "The model wrote a tool call as text instead of answering. Ask again.",
+    answer_tool_call: "The model kept calling tools after its lookups ran out. Ask again.",
+    answer_too_long: "The answer went past the size limit and was not kept.",
+    answer_failed: "The answer could not be completed. Ask again.",
+    answer_not_saved: "The answer could not be saved. Try again later.",
+    search_failed: "The documents could not be searched.",
+    mapping_search_failed: "Relevant data mappings could not be retrieved.",
+    stream_ended:
+      "The answer stream ended unexpectedly. Reopen the conversation to check its status.",
+    stream_lagged: "This page fell behind the answer stream. Reopen the conversation.",
+    model_out_of_credit:
+      "The model account cannot pay for this request. Top it up, or pick another endpoint under Administration → Models.",
+    model_rate_limited: "The model endpoint is rate limiting. Wait a moment and ask again.",
+    model_unavailable: "The model endpoint is unavailable right now. Try again shortly.",
+    model_unreachable:
+      "The model endpoint gave no usable answer. Check its address under Administration → Models.",
+    context_too_long: "This conversation is too long for the model. Start a new conversation.",
+    model_rejected:
+      "The model endpoint refused the request. Check the model settings under Administration → Models.",
+    // 重答（#936）被拒。生成中又来一个新问题（#961）也是 409；两边用同一个 code
+    answer_running: "An answer is still being written in this conversation. Wait for it to finish.",
+    retry_answered: "That question already has an answer, or the conversation went on after it.",
+    retry_not_question: "Only a question can be answered again.",
+    retry_needs_conversation: "A retry needs the conversation its question is in.",
     bad_upload: "That upload could not be read.",
     upload_read_failed: "The file could not be read to the end.",
     no_files: "No file was attached.",
@@ -113,6 +139,11 @@ export const en = {
     inference_off:
       "Materialized inference is off for this knowledge base. Turn it on in Settings.",
     bad_resolution: "That is not a valid decision.",
+    empty_state_span:
+      "A state that ends where it starts holds at no moment. Give an end after the start, or leave it open.",
+    unknown_marks: "A single date marks the start, the end, or neither.",
+    marks_needs_state:
+      "Only a state property says what a single date marks. Events and timeless properties don't.",
   },
   /** 机器给的补充（cron 解析器的原话之类）缀在措辞后面 */
   errDetail: (msg: string, detail: string) => `${msg} (${detail})`,
@@ -121,6 +152,8 @@ export const en = {
     created: "Created",
     deleted: "Deleted",
     added: "Added to the ontology",
+    // 哪一处复制不成都说这一句：页面没有剪贴板 API，浏览器也不让用老办法复制
+    copyFailed: "Could not copy. Select the text and copy it by hand.",
   },
   account: {
     /* 账户区字标：Persona——你在这座城里的身份面具 */
@@ -248,6 +281,10 @@ export const en = {
     noMatch: "Nothing matches",
     andMore: (n: number) => `and ${n} more`,
     system: "System",
+    partialRows: (sheet: string, read: number, total: number) =>
+      `${sheet}: read ${read} of ${total} rows`,
+    partialRecords: (read: number, total: number) =>
+      `read ${read} of ${total} records`,
     // kind → 一句说清出了什么事。第二句说该做什么——这才是告警比日志多出来的东西。
     // **一条告警就是一次故障**，所以标题里没有数量
     kinds: {
@@ -278,6 +315,10 @@ export const en = {
       "document.needs_reader": {
         title: "A file needs a model to be read",
         hint: "Scans and images need a document-reading service, and recordings need a transcription model that labels speakers. Each line says what was missing. The file is kept and nothing was read from it yet; it is read as soon as the reader is saved under Administration → Models.",
+      },
+      "document.contents_truncated": {
+        title: "A file was only partly read",
+        hint: "A parser safety cap was reached. The line says which sheet or record range was left out; search and answers do not contain the omitted part.",
       },
       "governance.tripped": {
         title: "The agent stopped deciding on its own",
@@ -769,9 +810,12 @@ export const en = {
   },
   ask: {
     streamInterrupted: "The answer stream was interrupted. Reopen the conversation to check its status.",
-    noActiveAnswer: "No active answer was found. You can send a new message.",
+    /* 重开会话时，最后一问没有回答、也没有在写的回答（多半是答到一半失败了） */
+    noActiveAnswer: "The last question has no answer. Retry it, or send a new message.",
     historyLoadFailed: "Could not load this conversation.",
     retryHistory: "Retry",
+    // 重答最后那个没有回答的问题（#936）
+    retryQuestion: "Retry",
     loadingHistory: "Loading conversation…",
     loadEarlierConversations: "Load earlier conversations",
     conversationsLoadFailed: "Could not load conversations.",
@@ -786,7 +830,56 @@ export const en = {
     scopeLabel: "Knowledge base",
     send: "Send",
     stop: "Stop",
+    stopping: "Stopping…",
+    stopped: "Stopped",
     thinking: "Thinking…",
+    /* 轨迹上每一步的话（#942）。服务端只给字段：状态、数、时刻，怎么说在这里定。
+       查询、实体名、来源名、问数的目的、记下的那句话是数据，原样显示；
+       没有这些字段的旧消息仍显示当时存下的英文 */
+    step: {
+      failed: "failed",
+      documentNotFound: "document not found",
+      entityNotFound: "entity not found",
+      sourceNotFound: "no such data source",
+      unknownTool: "unknown tool",
+      /* 参数整个解析不出来：多半是模型的输出撞上上限，在半路断了 */
+      unparsed: "incomplete arguments",
+      missing: (param: string) => `missing ${param}`,
+      invalid: (param: string) => `invalid ${param}`,
+      sources: (n: number) => `${n} source${n === 1 ? "" : "s"}`,
+      sections: (n: number) => `${n} section${n === 1 ? "" : "s"}`,
+      matches: (n: number, total?: number) =>
+        total === undefined
+          ? `${n} match${n === 1 ? "" : "es"}`
+          : `${n} of ${total} matches`,
+      /* `at` 是世界时间（那时成立的），`recorded` 是下面两句之一（那时记下的） */
+      facts: (n: number, at: string | null, recorded: string | null) =>
+        `${n} fact${n === 1 ? "" : "s"}${at ? ` at ${at}` : ""}${recorded ? `, ${recorded}` : ""}`,
+      recordedBy: (t: string) => `as recorded by ${t}`,
+      recordedBefore: (t: string) => `as recorded before ${t}`,
+      linked: (n: number, total: number) =>
+        n === total ? `${n} linked` : `${n} of ${total} linked`,
+      dated: (n: number, total: number) =>
+        n === total
+          ? `${n} dated fact${n === 1 ? "" : "s"}`
+          : `${n} of ${total} dated facts`,
+      /* `more`：列到上限就停了，后面可能还有 */
+      paths: (n: number, more: boolean, hops: number) =>
+        n === 0
+          ? "no path"
+          : `${n}${more ? "+" : ""} path${n === 1 && !more ? "" : "s"}, shortest ${hops} hop${hops === 1 ? "" : "s"}`,
+      changes: (n: number, more: boolean) =>
+        n === 0 ? "no changes" : `${n}${more ? "+" : ""} change${n === 1 && !more ? "" : "s"}`,
+      /* 没给 until 的窗口开到现在：「2026-09-01 → now」 */
+      now: "now",
+      rows: (n: number, more: boolean) =>
+        `${n}${more ? "+" : ""} row${n === 1 && !more ? "" : "s"}`,
+      rules: (n: number) => (n === 0 ? "none" : `${n} rule${n === 1 ? "" : "s"}`),
+      /* rule_matches：这条规则此刻标出了几处 */
+      marked: (n: number) => `${n} marked`,
+      /* 问数那一步可以展开看它跑的 SQL（#936） */
+      sql: "SQL",
+    },
     newChat: "New chat",
     recent: "Recent",
     untitled: "Untitled",
@@ -802,9 +895,13 @@ export const en = {
     deleteBtn: "Delete",
     cancel: "Cancel",
     // 这条回答背后一条来源都没有（#547）。是事实陈述，所以每条都挂，不猜哪条该挂
-    noSources: "No sources consulted",
+    noSources: "No sources cited",
     // 预览浮窗右上角那条出路：看完这一段还想看整篇的人走这里
     openOriginal: "Open original",
+    // 复制（#936）：回答整段一个，代码块各一个
+    copyAnswer: "Copy answer",
+    copyCode: "Copy code",
+    copied: "Copied",
   },
   graph: {
     // 还没判出类型的实体（0009）。不是一个类，是"这一格还空着"
@@ -958,6 +1055,9 @@ export const en = {
     historicalNote: (n: number) =>
       `${n} past fact${n === 1 ? "" : "s"} not shown — see Timeline →`,
     undated: "Undated",
+    /* 0064：句子没写时间，文档说了自己是哪天的。是「截至」，不是「自…起」 */
+    asOf: (date: string, by: string | null) =>
+      by ? `as of ${date} · ${by}` : `as of ${date}`,
     /* 实体面板的 Relations：两节的标题、组尾的折、行上的证据开关 */
     fromEntity: (name: string) => `From ${name}`,
     toEntity: (name: string) => `To ${name}`,
@@ -1054,6 +1154,10 @@ export const en = {
     loading: "Loading…",
     extracted: "Extracted",
     ongoing: "now",
+    /** `#610`：`doc_time` 是从文件里读出来的日期；与上传时刻是两件事 */
+    docDate: "Document date",
+    docDateFromContent: "Detected from the filename or first line",
+    uploadedAt: "Uploaded",
   },
   settings: {
     title: "Administration",
@@ -1224,12 +1328,16 @@ export const en = {
     ocrService: "Document reading (OCR)",
     ocrHint:
       "A MinerU service (mineru-api). It reads each page's layout first, so every passage keeps its page and position.",
+    ocrHintArk:
+      "A Volcengine Ark vision model reads each page and returns only the written text. Passages keep their page; there are no positions. Every page is a paid model call.",
+    readerProvider: "Provider",
+    arkProvider: "Volcengine Ark",
     serviceUrl: "Service URL",
     backend: "Backend (optional)",
     transcribeModel: "Transcription",
     transcribeHint:
       "An OpenAI-compatible endpoint that labels speakers (diarized_json), such as gpt-4o-transcribe-diarize. A transcript that cannot say who spoke is not used.",
-    okVersion: (version: string) => `Reachable (MinerU ${version})`,
+    okVersion: (version: string) => `Reachable (${version})`,
     okReachable: "Reachable and authenticated",
     savedRequeued: (n: number) =>
       `Saved. ${n} waiting ${n === 1 ? "file is" : "files are"} being read.`,
@@ -1665,6 +1773,56 @@ export const en = {
       `Some could not be added: ${keys.join(", ")} — the rest went through.`,
     proposals: "AI proposals",
     keyHint: "lowercase_snake_case",
+    /* ---- 0061: the ontology agent and its questions ---- */
+    askAgent: "Ask the agent",
+    askAgentHint:
+      "Proposes classes and properties from phrases and kind words the ontology does not cover yet, judged against the competency questions.",
+    agentQueued: "The agent is looking — proposals appear here when it is done.",
+    agentWaiting: "Agent working…",
+    agentChip: "agent",
+    servesQuestions: (n: number) =>
+      n === 1 ? "serves 1 question" : `serves ${n} questions`,
+    bindsShapes: (n: number) =>
+      n === 1 ? "binds 1 phrase shape" : `binds ${n} phrase shapes`,
+    bindsKindWords: (n: number) =>
+      n === 1 ? "1 kind word" : `${n} kind words`,
+    closestExisting: (key: string, label: string) => `closest: ${key} ${label}`,
+    rejectProposal: "Reject",
+    rejectReasonPrompt:
+      "Why not? (optional — the agent reads it before proposing again)",
+    rejectedProposal: "Rejected",
+    questions: "Competency questions",
+    questionsHint:
+      "What this knowledge base should be able to answer. The agent proposes classes and properties that serve these; they are the ontology's acceptance test.",
+    questionPlaceholder: "e.g. Which companies did each founder start, and when?",
+    addQuestion: "Add",
+    noQuestions:
+      "No questions yet. Without them the agent judges proposals only by the phrases documents use.",
+    retireQuestion: "Retire",
+    deleteQuestion: "Delete",
+    questionAdded: "Question added",
+    questionRetired: "Question retired",
+    askQuestions: "Ask the agent for questions",
+    askQuestionsHint:
+      "Proposes questions from what the documents say most. They wait here until you accept them.",
+    questionsQueued: "The agent is writing questions — they appear here when it is done.",
+    acceptQuestion: "Accept",
+    questionAnswered: "answered",
+    questionUnanswered: "not answered",
+    /* 回答从哪里来的（competency.mjs 记的 via） */
+    questionVia: { graph: "from the graph", text: "from text", both: "graph and text" } as Record<string, string>,
+    questionsScore: (answered: number, checked: number) =>
+      `${answered} of ${checked} answered`,
+    questionsScoreHint:
+      "Accepted questions the competency bench asked over the graph, and how many it answered.",
+    viaGraph: (withGraph: number, graphOnly: number) =>
+      `${withGraph} with graph facts · ${graphOnly} graph only`,
+    viaGraphHint:
+      "Of the answered questions, how many were answered after fetching facts from the graph, and how many without reading document text at all. An answer read from text alone did not need the ontology.",
+    proposalsChanged: (changed: number, decided: number) =>
+      `${changed} of ${decided} proposals changed`,
+    proposalsChangedHint:
+      "Of the agent's proposals people decided on, how many were rejected or edited before adoption.",
     /* ---- Schema diagram ---- */
     schemaDiagram: "Schema diagram",
     /* 从前这句把「先加个类或导入 OWL 文件」说成了开始的前提，而本体本来就
@@ -1981,6 +2139,18 @@ export const en = {
     alignmentStatements: (n: number) => (n === 1 ? "1 statement" : `${n} statements`),
     alignmentEntities: (n: number) => (n === 1 ? "1 thing" : `${n} things`),
     alignmentVotes: (first: string, second: string) => `Votes: ${first} · ${second}`,
+    // 状态属性下，单个日期标的是什么（#966）
+    alignmentMarks: "A single date",
+    alignmentMarksStart: "starts it",
+    alignmentMarksEnd: "ends it",
+    alignmentMarksNone: "neither",
+    alignmentMarksStartHint: "joined, was appointed, took over: it holds from that date",
+    alignmentMarksEndHint: "left, resigned from, stepped down as: it ends on that date",
+    alignmentMarksNoneHint:
+      "only seen to hold then: statements with a single date stay in the open graph",
+    alignmentMarksRequired: "Say what a single date marks first.",
+    alignmentAwaitsMarks: (property: string) =>
+      `Bound to ${property}, but what a single date marks is not settled. Until you say, statements with a single date stay in the open graph.`,
     alignmentRuleImplies: (property: string) => `also implies ${property}`,
     alignmentRuleObjectIsStatement: "object: the statement's own object",
     alignmentRuleReading: (reading: string) => `object: read from the words as ${reading.replace(/_/g, " ")}`,

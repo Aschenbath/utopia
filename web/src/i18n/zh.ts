@@ -55,6 +55,27 @@ export const zh: Strings = {
     wrong_password: "当前密码不对。",
     registration_closed: "本部署已关闭自助注册——请找管理员开通账户。",
     no_chat_model: "还没有配置对话模型。到「管理 → 模型」里配一个。",
+    // 对话流里没答成的那一轮：`error` 帧带的 code（服务端的英文原句只给日志）
+    answer_empty: "模型没有给出回答，请再问一次。",
+    answer_tool_text: "模型把工具调用写成了正文，没有作答，请再问一次。",
+    answer_tool_call: "查证次数用完后模型仍在调用工具，请再问一次。",
+    answer_too_long: "回答超出了长度上限，没有保留。",
+    answer_failed: "这次没能答完，请再问一次。",
+    answer_not_saved: "回答没能保存，请稍后再试。",
+    search_failed: "没能检索文档。",
+    mapping_search_failed: "没能检索相关数据映射。",
+    stream_ended: "回答的连接意外中断了。重新打开这个对话，看看结果如何。",
+    stream_lagged: "这个页面跟不上回答的速度，请重新打开这个对话。",
+    model_out_of_credit: "模型账号付不起这次请求。去给账号充值，或者在「管理 → 模型」里换一个能用的端点。",
+    model_rate_limited: "模型端点在限流，稍等一会儿再问。",
+    model_unavailable: "模型端点暂时不可用，请稍后再试。",
+    model_unreachable: "模型端点没有给出可用的回答。去「管理 → 模型」里检查端点地址。",
+    context_too_long: "这场对话超出了模型的上下文长度。请新建一场对话。",
+    model_rejected: "模型端点拒绝了这次请求。去「管理 → 模型」里检查模型设置。",
+    answer_running: "这个对话里还有一个回答正在生成，等它写完再试。",
+    retry_answered: "这个问题已经有回答了，或者后面已经接着问了别的。",
+    retry_not_question: "只有问题可以重答。",
+    retry_needs_conversation: "重答要指明问题所在的对话。",
     bad_upload: "这次上传读不出来。",
     upload_read_failed: "文件没能读完。",
     no_files: "没有附带文件。",
@@ -105,6 +126,9 @@ export const zh: Strings = {
     concurrency_range: "填一个 1 到 256 之间的数。",
     inference_off: "这个库没有打开物化推理。到设置里开。",
     bad_resolution: "这不是一个有效的裁决。",
+    empty_state_span: "起止相同的状态任何时刻都不成立。给一个晚于起点的终点，或者让它开着。",
+    unknown_marks: "单个日期标的是开始、结束，或者都不是。",
+    marks_needs_state: "只有状态属性才说单个日期标的是什么，事件与恒常属性不说。",
   },
   errDetail: (msg: string, detail: string) => `${msg}（${detail}）`,
   toast: {
@@ -112,6 +136,7 @@ export const zh: Strings = {
     created: "已创建",
     deleted: "已删除",
     added: "已加入本体",
+    copyFailed: "无法复制，请选中文字后手动复制。",
   },
   account: {
     brand: "Utopia Persona",
@@ -226,6 +251,10 @@ export const zh: Strings = {
     noMatch: "没有匹配的",
     andMore: (n: number) => `还有 ${n} 条`,
     system: "系统",
+    partialRows: (sheet: string, read: number, total: number) =>
+      `${sheet}：只读了 ${read}/${total} 行`,
+    partialRecords: (read: number, total: number) =>
+      `只读了 ${read}/${total} 条记录`,
     kinds: {
       "source.sync_failed": {
         title: "来源同步失败",
@@ -242,6 +271,10 @@ export const zh: Strings = {
       "document.needs_reader": {
         title: "有文件要靠模型才读得出来",
         hint: "扫描件和图片要配文档识别服务，录音要配能分出说话人的转写模型；每一行写着缺的是什么。文件已经留着，还没读出任何内容；到「管理 > 模型」存好读取模型，就会自动读。",
+      },
+      "document.contents_truncated": {
+        title: "文件只读了一部分",
+        hint: "解析器到了安全上限。提示行会写明漏掉的是哪个工作表或记录范围；检索和回答不包含被省略的部分。",
       },
       "governance.tripped": {
         title: "agent 停止自动裁决了",
@@ -710,9 +743,10 @@ export const zh: Strings = {
   },
   ask: {
     streamInterrupted: "回答连接已中断，请重新打开会话查看状态。",
-    noActiveAnswer: "未发现正在生成的回答，你可以发送新消息。",
+    noActiveAnswer: "最后一个问题没有回答。可以重试，或发送新消息。",
     historyLoadFailed: "无法读取此会话。",
     retryHistory: "重试",
+    retryQuestion: "重试",
     loadingHistory: "正在读取会话…",
     loadEarlierConversations: "加载更早的会话",
     conversationsLoadFailed: "无法读取会话列表。",
@@ -726,7 +760,40 @@ export const zh: Strings = {
     scopeLabel: "知识库",
     send: "发送",
     stop: "停止",
+    stopping: "正在停止…",
+    stopped: "已停止",
     thinking: "思考中…",
+    step: {
+      failed: "失败",
+      documentNotFound: "未找到文档",
+      entityNotFound: "未找到实体",
+      sourceNotFound: "没有这个数据源",
+      unknownTool: "未知工具",
+      unparsed: "参数不完整",
+      missing: (param: string) => `缺少 ${param}`,
+      invalid: (param: string) => `${param} 无效`,
+      sources: (n: number) => `${n} 个来源`,
+      sections: (n: number) => `${n} 段`,
+      matches: (n: number, total?: number) =>
+        total === undefined ? `${n} 个匹配` : `${n} 个匹配（共 ${total} 个）`,
+      facts: (n: number, at: string | null, recorded: string | null) =>
+        `${at ? `${at} 时的 ` : ""}${n} 条事实${recorded ? `，${recorded}` : ""}`,
+      recordedBy: (t: string) => `按 ${t} 时的记录`,
+      recordedBefore: (t: string) => `按 ${t} 之前的记录`,
+      linked: (n: number, total: number) =>
+        n === total ? `关联 ${n} 个` : `关联 ${total} 个，列出 ${n} 个`,
+      dated: (n: number, total: number) =>
+        n === total ? `${n} 条有日期的事实` : `${total} 条有日期的事实，列出 ${n} 条`,
+      paths: (n: number, more: boolean, hops: number) =>
+        n === 0 ? "没有路径" : `${n}${more ? "+" : ""} 条路径，最短 ${hops} 跳`,
+      changes: (n: number, more: boolean) =>
+        n === 0 ? "没有变更" : `${n}${more ? "+" : ""} 处变更`,
+      now: "现在",
+      rows: (n: number, more: boolean) => `${n}${more ? "+" : ""} 行`,
+      rules: (n: number) => (n === 0 ? "无" : `${n} 条规则`),
+      marked: (n: number) => `标出 ${n} 处`,
+      sql: "SQL",
+    },
     newChat: "新对话",
     recent: "最近",
     untitled: "未命名",
@@ -742,6 +809,9 @@ export const zh: Strings = {
     cancel: "取消",
     noSources: "未引用任何来源",
     openOriginal: "打开原文",
+    copyAnswer: "复制回答",
+    copyCode: "复制代码",
+    copied: "已复制",
   },
   graph: {
     untyped: "未分类",
@@ -867,6 +937,8 @@ export const zh: Strings = {
     historyOngoing: "未闭合",
     historicalNote: (n: number) => `另有 ${n} 条历史事实未显示——见时间线 →`,
     undated: "无日期",
+    asOf: (date: string, by: string | null) =>
+      by ? `截至 ${date}（${by}）` : `截至 ${date}`,
     fromEntity: (name) => `从 ${name} 出发`,
     toEntity: (name) => `指向 ${name}`,
     openEntity: (name) => `打开 ${name}`,
@@ -948,6 +1020,10 @@ export const zh: Strings = {
     loading: "加载中…",
     extracted: "已抽取",
     ongoing: "至今",
+    /** `#610`：`doc_time` 是从文件里读出来的日期；与上传时刻是两件事 */
+    docDate: "文档日期",
+    docDateFromContent: "从文件名或正文首行认出来的",
+    uploadedAt: "上传于",
   },
   settings: {
     title: "管理",
@@ -1101,12 +1177,15 @@ export const zh: Strings = {
       "扫描件、图片和录音没有可以直接解析的文字，各要一个读取模型。它们和对话模型分开配置，敏感文件可以留在自己的服务器上。读取模型配好之前传上来的文件会先等着，消息中心会提示；存好之后自动读。",
     ocrService: "文档识别（OCR）",
     ocrHint: "MinerU 服务（mineru-api）。先识别每页版面再认字，每段文字都记着所在的页和位置。",
+    ocrHintArk: "火山方舟的视觉模型逐页读，只返回页上写着的字。每段文字记着所在的页，没有位置。每一页都是一次付费的模型调用。",
+    readerProvider: "供应商",
+    arkProvider: "火山方舟",
     serviceUrl: "服务地址",
     backend: "后端（可选）",
     transcribeModel: "录音转写",
     transcribeHint:
       "会标注说话人的 OpenAI 兼容转写接口（diarized_json），例如 gpt-4o-transcribe-diarize。分不出谁说的转写不会采用。",
-    okVersion: (version: string) => `已连通（MinerU ${version}）`,
+    okVersion: (version: string) => `已连通（${version}）`,
     okReachable: "已连通，认证通过",
     savedRequeued: (n: number) => `已保存。${n} 个等待中的文件开始读取。`,
   },
@@ -1463,6 +1542,47 @@ export const zh: Strings = {
       `有几个没能加入：${keys.join("、")}——其余的已经成功。`,
     proposals: "AI 提案",
     keyHint: "小写下划线命名",
+    /* ---- 0061：本体代理与能力问题 ---- */
+    askAgent: "请代理提案",
+    askAgentHint:
+      "从本体还没覆盖的短语和类别词里提出该建的类与属性，对着能力问题判断。",
+    agentQueued: "代理在看——看完了提案会出现在这里。",
+    agentWaiting: "代理在看…",
+    agentChip: "代理",
+    servesQuestions: (n: number) => `服务 ${n} 个问题`,
+    bindsShapes: (n: number) => `会绑 ${n} 种短语形状`,
+    bindsKindWords: (n: number) => `${n} 个类别词`,
+    closestExisting: (key: string, label: string) => `最近的已有：${key} ${label}`,
+    rejectProposal: "拒绝",
+    rejectReasonPrompt: "为什么不要？（可不填——代理下次提案前会读）",
+    rejectedProposal: "已拒绝",
+    questions: "能力问题",
+    questionsHint:
+      "这个知识库应该答得上来的问题。代理提的类与属性要服务它们；它们就是本体的验收标准。",
+    questionPlaceholder: "例：每位创始人创办了哪些公司、什么时候？",
+    addQuestion: "添加",
+    noQuestions: "还没有问题。没有它们，代理只能按文档里的说法判断提案。",
+    retireQuestion: "退役",
+    deleteQuestion: "删除",
+    questionAdded: "已添加问题",
+    questionRetired: "问题已退役",
+    askQuestions: "请代理提问题",
+    askQuestionsHint: "从文档说得最多的东西里提问题，等你接受了才算数。",
+    questionsQueued: "代理在写问题——写完了会出现在这里。",
+    acceptQuestion: "接受",
+    questionAnswered: "答上了",
+    questionUnanswered: "没答上",
+    questionVia: { graph: "来自图谱", text: "来自正文", both: "图谱与正文" },
+    questionsScore: (answered: number, checked: number) =>
+      `${checked} 条问过，${answered} 条答上`,
+    questionsScoreHint: "competency bench 对图谱问过的已接受问题，答上了几条。",
+    viaGraph: (withGraph: number, graphOnly: number) =>
+      `${withGraph} 条经过图谱 · ${graphOnly} 条只靠图谱`,
+    viaGraphHint:
+      "答上的问题里，几条途中从图谱拿到过事实，几条根本没读正文。只靠正文答上的不需要本体。",
+    proposalsChanged: (changed: number, decided: number) =>
+      `${decided} 条提案表过态，${changed} 条被改或被拒`,
+    proposalsChangedHint: "代理的提案里人表过态的，有几条被拒或改过再采纳。",
     /* ---- 模式图 ---- */
     schemaDiagram: "模式图",
     schemaEmpty: "还没有类。文档进来时会自动补上。",
@@ -1738,6 +1858,17 @@ export const zh: Strings = {
     alignmentStatements: (n: number) => `${n} 条陈述`,
     alignmentEntities: (n: number) => `${n} 样东西`,
     alignmentVotes: (first: string, second: string) => `两票：${first} · ${second}`,
+    // 状态属性下，单个日期标的是什么（#966）
+    alignmentMarks: "单个日期",
+    alignmentMarksStart: "是开始",
+    alignmentMarksEnd: "是结束",
+    alignmentMarksNone: "都不是",
+    alignmentMarksStartHint: "加入、被任命、接手：从那天起成立",
+    alignmentMarksEndHint: "离开、辞去、卸任：到那天为止",
+    alignmentMarksNoneHint: "只是那时看到它成立：只带一个日期的陈述留在开放图谱",
+    alignmentMarksRequired: "先说单个日期标的是什么。",
+    alignmentAwaitsMarks: (property: string) =>
+      `已绑到 ${property}，单个日期标的是什么还没定。你说之前，只带一个日期的陈述留在开放图谱。`,
     alignmentRuleImplies: (property: string) => `同时蕴含 ${property}`,
     alignmentRuleObjectIsStatement: "宾语：陈述自己的宾语",
     alignmentRuleReading: (reading: string) => `宾语：按「${reading.replace(/_/g, " ")}」从字里读出`,

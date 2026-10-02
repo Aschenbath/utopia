@@ -35,7 +35,13 @@ table travels with its caption and header and a continuation repeats both; a cap
 every table that follows it; a row is never split; headings become a breadcrumb prefix and
 `chunks.heading`; a thematic break is not a boundary and a table it split is joined back; no
 overlap; chunk text is verbatim slices so a quote is found by offset; a document is re-chunked on
-its next reprocess [0039].
+its next reprocess [0039]. A Word paragraph outside a table ends a Markdown paragraph, so the
+caption and packing rules see the same boundaries as Markdown and HTML: a blank line follows it, a
+`w:br` inside it stays a single newline, a paragraph inside a table cell stays a space, and empty
+paragraphs disappear [#1024]. A DOCX paragraph outside a table is a heading when it has an outline
+level: its own `w:outlineLvl`, else its style's, else a style named `heading N`, else the style it
+is based on (style ids differ by the language of Word, the names do not); so a Word file's
+sections reach the chunks and the section dates of 0064.
 
 **Tables** [#744, #750, prior-work item 26]. An HTML table is rendered from the DOM before the Markdown
 converter sees it, by structure alone: cells hidden by style are skipped, spanning cells are laid on
@@ -54,8 +60,9 @@ path with the first row promoted to header. Measured on the NVDA earnings releas
 became 32, none of them a table without its header. DOCX tables, spreadsheets and CSV files are laid on the same grid by their parsers (#750): a DOCX
 cell keeps its column span and the indent of its first paragraph, a sheet's or a CSV file's first
 row with two or more cells is its header even when the headings are years, and a table with no
-figure in it is read as a header row followed by records; the text layer of a PDF carries no table
-structure.
+figure in it is read as a header row followed by records; a sheet's date cell is written as the
+date it shows (ISO, with its time of day, or an elapsed time as hours:minutes:seconds), not as
+Excel's day count; the text layer of a PDF carries no table structure.
 
 **Origin and anchor.** `chunks.origin` (stated, ocr, transcribed, described), `origin_model`, and an
 `anchor` whose shape is checked per origin (page and box; start, end and speakers; page and image or
@@ -63,8 +70,11 @@ part); the packer never mixes origins in one chunk; a described block is its own
 breadcrumb and caption. Images and recordings are recognised by header or extension and a PDF with
 an empty text layer is a scan; without the reader the document fails once with `reader_needed` and
 a `document.needs_reader` alert, and saving the setting queues it again [0040]. Scans and images go
-to a workspace's MinerU service (`llm_settings.ocr_*`), one segment per page, the job waiting with
-`Deferred` on the remote task recorded on the document; recordings go to a diarizing transcription
+to the workspace's chosen OCR provider (`llm_settings.ocr_*`), one segment per page. MinerU waits with
+`Deferred` on the remote task recorded on the document; Ark reads the whole file in one pass, sending
+images whole and rendering PDF pages with Poppler, with bounded page retries and no persistent
+progress [0065]. Ark transcribes only written text, records the model and real page numbers, and
+adds no guessed boxes; recordings go to a diarizing transcription
 model (`transcribe_*`) and a transcript without speaker labels is refused; speakers are written into
 the text as turns [0040 cuts 2 and 3]. Facts from a described chunk enter below the auto-close
 threshold [0040 d4].

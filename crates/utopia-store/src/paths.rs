@@ -71,6 +71,15 @@ pub struct PathEdge {
     pub holds_from: Option<DateTime<Utc>>,
     pub holds_to: Option<DateTime<Utc>>,
     pub confidence: f32,
+    /// 终点是时间线推出来的；区间是人改过的、改的是哪一端（#970，同 `EntityFact`）
+    pub end_derived: bool,
+    pub time_corrected: bool,
+    pub corrected_ends: Option<String>,
+    /// 时间线关上它时接的那一行、接任的那一端，与修正备注（#970 第二步，同 `EntityFact`）
+    pub closed_by_id: Option<Uuid>,
+    pub closed_by: Option<String>,
+    pub closed_by_value: Option<serde_json::Value>,
+    pub correction_note: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -385,19 +394,30 @@ async fn details(
     let subject = record_axis::owner_at("f", "subject_id", as_of.map(|_| 3), false);
     let object = record_axis::owner_at("f", "object_id", as_of.map(|_| 3), true);
     let rows: Vec<PathEdge> = sqlx::query_as(&format!(
-        "SELECT f.id AS fact_id,
+        "WITH {targets}
+         SELECT f.id AS fact_id,
                 {subject} AS subject_id, s.canonical_name AS subject_name,
                 {object} AS object_id, o.canonical_name AS object_name,
                 COALESCE(r.label, fact_surface_predicate(f.id)) AS predicate,
                 f.valid_from, f.valid_from_precision, f.valid_to, f.valid_to_precision,
-                {holds_from} AS holds_from, {holds_to} AS holds_to, f.confidence
+                {holds_from} AS holds_from, {holds_to} AS holds_to, f.confidence,
+                f.end_derived, {corrected_ends} AS corrected_ends,
+                {corrected_ends} IS NOT NULL AS time_corrected,
+                closer.closed_by_id, closer.closed_by, closer.closed_by_value,
+                CASE WHEN {corrected_ends} IS NOT NULL THEN {correction_note} END
+                    AS correction_note
            FROM facts f
            LEFT JOIN relation_types r ON r.id = f.predicate_id
            JOIN entities s ON s.id = {subject}
            JOIN entities o ON o.id = {object}
+           {closer}
           WHERE f.kb_id = $1 AND f.id = ANY($2)",
         holds_from = world_axis::facts_holds_from("f"),
         holds_to = world_axis::facts_holds_to("f"),
+        targets = crate::graph::TIME_CORRECTED_TARGETS,
+        corrected_ends = crate::graph::corrected_ends_sql("f"),
+        correction_note = crate::graph::correction_note_sql("f"),
+        closer = crate::graph::closed_by_join(&subject, &object, as_of.map(|_| 3)),
     ))
     .bind(kb_id)
     .bind(fact_ids)

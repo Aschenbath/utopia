@@ -54,6 +54,11 @@ const DESCRIBED: &str = "(EXISTS (SELECT 1 FROM fact_evidence fe
                                        JOIN chunks ch ON ch.id = fe.chunk_id
                                       WHERE ts.fact_id = f.id AND ch.origin = 'described'))";
 
+/// [`DESCRIBED`] 换成另一个别名：读的时候找关上一行的后任（#970），与引擎排除同样的行
+pub(crate) fn described_sql(alias: &str) -> String {
+    DESCRIBED.replace("= f.id", &format!("= {alias}.id"))
+}
+
 /// 唯一性方向：functional = 主语侧（张三同时只 reports_to 一人）；
 /// inverse functional = 宾语侧（一个项目同时只有一个 leads 它的人）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -954,8 +959,8 @@ async fn rewrite_end_tx(
     derived: bool,
     require_open: bool,
 ) -> AppResult<Option<Uuid>> {
-    let alive: Option<(Uuid,)> = sqlx::query_as(
-        "SELECT id FROM facts
+    let alive: Option<(Option<DateTime<Utc>>, Option<Uuid>)> = sqlx::query_as(
+        "SELECT valid_from, predicate_id FROM facts
          WHERE id = $1 AND invalidated_at IS NULL
            AND (NOT $2 OR (valid_to IS NULL AND valid_to_precision IS NULL))
          FOR UPDATE",
@@ -964,8 +969,20 @@ async fn rewrite_end_tx(
     .bind(require_open)
     .fetch_optional(&mut **tx)
     .await?;
-    if alive.is_none() {
+    let Some((from, predicate)) = alive else {
         return Ok(None);
+    };
+    // 声明成状态的行关在它自己的起点，就是一段任何时刻都不成立的状态（#966，与
+    // `Validity::under` 同一条不变量）。人关一条事实走这里；引擎只把一行关在严格更晚的
+    // 起点上，写入路径也不拿开放行自己的起点来关它
+    if let End::At(at, _) = end {
+        if predicate.is_some()
+            && from == Some(*at)
+            && crate::graph::predicate_temporal(&mut **tx, predicate).await?
+                == crate::graph::Temporal::State
+        {
+            return Err(crate::graph::empty_state_span());
+        }
     }
     let (valid_to, precision, anchor) = match end {
         End::Open => (None, None, None),
@@ -978,11 +995,15 @@ async fn rewrite_end_tx(
                             valid_from, valid_from_precision,
                             valid_to, valid_to_precision, confidence, supersedes,
                             attested_from, attested_to, end_derived,
-                            from_statement_id, implied)
+                            from_statement_id, implied, corrected_ends)
          SELECT $1, kb_id, subject_id, predicate_id, object_id, object_value,
                 valid_from, valid_from_precision, $3, $4, confidence, id,
                 attested_from, CASE WHEN $4::text = 'unknown' THEN COALESCE($5, now()) END, $6,
-                from_statement_id, implied
+                from_statement_id, implied,
+                -- 终点在这里被重新写下（文档说了终点，或时间线推了一个），人改过的终点就不在了；
+                -- 起点那一半照旧
+                CASE corrected_ends WHEN 'both' THEN 'start' WHEN 'end' THEN NULL
+                     ELSE corrected_ends END
          FROM facts WHERE id = $2",
     )
     .bind(corrected)
@@ -1057,11 +1078,11 @@ pub async fn rehome_tx(
                             valid_from, valid_from_precision, valid_to, valid_to_precision,
                             confidence, derived_by_rule, supersedes,
                             attested_from, attested_to, end_derived,
-                            from_statement_id, implied)
+                            from_statement_id, implied, corrected_ends)
          SELECT $1, kb_id, COALESCE($3, subject_id), predicate_id, COALESCE($4, object_id),
                 object_value, valid_from, valid_from_precision, valid_to, valid_to_precision,
                 confidence, derived_by_rule, id, attested_from, attested_to, end_derived,
-                from_statement_id, implied
+                from_statement_id, implied, corrected_ends
          FROM facts WHERE id = $2",
     )
     .bind(moved)
@@ -1164,6 +1185,16 @@ async fn copy_evidence(
 /// （0019）——改过之后，问三月与问九月应当得到不同的区间。这也是这个函数
 /// 与一条 `UPDATE facts SET valid_from = …` 的全部差别。
 ///
+/// 人改的是时间，不是出处：物化出来的行改完仍是那几条陈述算出来的，与时间线的
+/// 改写同一条规矩（[`copy_materialization_links`]）。不带过去的话，陈述不再被活着的
+/// 类型化行代表，画面上它按原话、原来的区间回来，下一轮物化还照它再算一行。
+///
+/// 改了哪一端记在修正行上（`corrected_ends`，#970）：值或精度变了的那一端，与旧行已有的
+/// 取并集，与修正同一个事务——事实行据此说「这个日期是人改的」，不再靠事后那条审计。
+/// 人交来的是整段区间，改完两端都是人的（`end_derived` 清掉，时间线不再重画它）：原来
+/// 是时间线推出来的终点，人没改它的值也是把它钉住了，一样算人的；原来就是原文说的那一端
+/// 没改，仍是原文的
+///
 /// 返回修正行 id；`None` 表示这条已被并发改写或作废，本次没有动手。
 pub async fn correct_interval(
     pool: &PgPool,
@@ -1176,20 +1207,44 @@ pub async fn correct_interval(
             .bind(fact_id)
             .fetch_optional(pool)
             .await?;
-    let temporal = crate::graph::predicate_temporal(pool, predicate.flatten()).await?;
-    let validity = validity.under(temporal).truncated();
+    let predicate = predicate.flatten();
+    let temporal = crate::graph::predicate_temporal(pool, predicate).await?;
+    // 两端相等的状态只对声明成状态的属性拒（#966）：开放陈述与空谓词的行按状态读只是
+    // 读法，「那天」照旧写成两端同值
+    let validity = match predicate {
+        Some(_) => validity.truncated().under(temporal)?,
+        None => validity.truncated(),
+    };
     let mut tx = pool.begin().await?;
     let corrected = Uuid::now_v7();
     let inserted: Option<(Uuid,)> = sqlx::query_as(
         "INSERT INTO facts (id, kb_id, subject_id, predicate_id, object_id, object_value,
                             valid_from, valid_from_precision,
                             valid_to, valid_to_precision, confidence, supersedes,
-                            attested_from, attested_to)
+                            attested_from, attested_to,
+                            from_statement_id, implied, corrected_ends)
          SELECT $1, kb_id, subject_id, predicate_id, object_id, object_value,
                 $3, $4, $5, $6, confidence, id,
                 attested_from,
-                CASE WHEN $6::text = 'unknown' THEN COALESCE(attested_to, now()) END
-         FROM facts WHERE id = $2 AND invalidated_at IS NULL
+                CASE WHEN $6::text = 'unknown' THEN COALESCE(attested_to, now()) END,
+                from_statement_id, implied,
+                CASE WHEN start_marked AND end_marked THEN 'both'
+                     WHEN start_marked THEN 'start'
+                     WHEN end_marked THEN 'end' END
+         FROM (SELECT f.*,
+                      c.start_changed OR COALESCE(f.corrected_ends IN ('start', 'both'), false)
+                          AS start_marked,
+                      c.end_changed OR f.end_derived
+                          OR COALESCE(f.corrected_ends IN ('end', 'both'), false)
+                          AS end_marked
+                 FROM facts f,
+                      LATERAL (SELECT f.valid_from IS DISTINCT FROM $3::timestamptz
+                                          OR f.valid_from_precision IS DISTINCT FROM $4::text
+                                          AS start_changed,
+                                      f.valid_to IS DISTINCT FROM $5::timestamptz
+                                          OR f.valid_to_precision IS DISTINCT FROM $6::text
+                                          AS end_changed) c
+                WHERE f.id = $2 AND f.invalidated_at IS NULL) old
          RETURNING id",
     )
     .bind(corrected)
@@ -1211,6 +1266,7 @@ pub async fn correct_interval(
         .await?;
     copy_evidence(&mut tx, fact_id, corrected).await?;
     copy_qualifiers(&mut tx, fact_id, corrected).await?;
+    copy_materialization_links(&mut tx, fact_id, corrected).await?;
     tx.commit().await?;
     Ok(Some(corrected))
 }
@@ -1819,6 +1875,14 @@ mod tests {
             ]
         );
         assert!(plan.held.is_empty(), "锚不到的一对没有什么可判的");
+    }
+
+    /// 读的时候找关上一行的后任，用的是引擎同一条「看图描述出来的」判据，只换了别名（#970）
+    #[test]
+    fn the_described_check_takes_another_alias() {
+        let n = described_sql("n");
+        assert!(!n.contains("= f.id"), "{n}");
+        assert_eq!(n.matches("= n.id").count(), 2, "{n}");
     }
 
     /// 看图描述出来的后任不许单独关上前任，这一对交给人（0040 决定 4）；

@@ -13,6 +13,36 @@ export class ApiError extends Error {
   }
 }
 
+/** 服务端拒绝时回的正文 */
+type Refusal = { error?: string; code?: string; detail?: string };
+
+/** 一次拒绝给人看的那句话。
+ *
+ *  有 code 就查 i18n，没有（或这一条还没进表）就退回服务端的英文原句——
+ *  服务端永远说英文，因为界面语言在客户端（docs/decisions/0004）。
+ *  **普通请求与对话流共用这一处**：对话流从前只读 `error`，于是明明有译文的
+ *  `no_chat_model` 在中文界面上也是一句英文 */
+function refusalMessage(body: Refusal, fallback: string): string {
+  let message = body.error || fallback;
+  // code 来自网络，不是字面量——这一处 cast 换来 err 表本身的全量类型检查
+  const worded = body.code
+    ? (S.err as Record<string, string | undefined>)[body.code]
+    : undefined;
+  if (worded) message = worded;
+  if (body.detail) message = S.errDetail(message, body.detail);
+  return message;
+}
+
+/** 对话流里的 `error` 帧：与请求被拒是同一个信封 `{error, code}`，用同一个函数读。
+ *  读不成 JSON 的是旧格式的一句英文，原样显示 */
+function streamFailure(data: string): string {
+  try {
+    const body: unknown = JSON.parse(data);
+    if (body && typeof body === "object") return refusalMessage(body as Refusal, data);
+  } catch { /* 旧格式：纯文本 */ }
+  return data;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
     credentials: "include",
@@ -23,25 +53,13 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     ...init,
   });
   if (!res.ok) {
-    // 措辞在这一个收口点定：22 个文件里的 toast.error(e.message) 一处都不用改。
-    // 有 code 就查 i18n，没有（或这一条还没进表）就退回服务端的英文原句——
-    // 服务端永远说英文，因为界面语言在客户端（docs/decisions/0004）
+    // 措辞在这一个收口点定：22 个文件里的 toast.error(e.message) 一处都不用改
     let message = res.statusText;
     let code: string | undefined;
     try {
-      const body = (await res.json()) as {
-        error?: string;
-        code?: string;
-        detail?: string;
-      };
-      if (body.error) message = body.error;
+      const body = (await res.json()) as Refusal;
       code = body.code;
-      // code 来自网络，不是字面量——这一处 cast 换来 err 表本身的全量类型检查
-      const worded = code
-        ? (S.err as Record<string, string | undefined>)[code]
-        : undefined;
-      if (worded) message = worded;
-      if (body.detail) message = S.errDetail(message, body.detail);
+      message = refusalMessage(body, message);
     } catch {
       // 非 JSON 响应体，保留 statusText
     }
@@ -179,6 +197,12 @@ export interface Doc {
   /** 这份文件的字要靠哪一种模型读、而那种模型没配（0040）：ocr / transcribe；文档此时是 failed */
   reader_needed: "ocr" | "transcribe" | null;
   created_at: string;
+  /** 文档日期——`#610`：从文件名或正文首行解析出来的「文件上写的日期」，
+   *  与 `created_at`（上传时刻）必须分开展示。`null` 表示没认出来（`#610` 决定 3） */
+  doc_time: string | null;
+  /** `doc_time` 是怎么来的：`"content"` = 文件名或正文，`"none"` = 没认出来。
+   *  上传时刻不在这里—— `created_at` 才是 */
+  doc_time_source: "content" | "none";
 }
 
 /** 一类抽取丢弃在一篇文档里的聚合：事实抽出来了，却没能落地。 */
@@ -265,8 +289,11 @@ export interface LlmSettingsView {
   embed_model?: string | null;
   embed_dim?: number | null;
   has_embed_key?: boolean;
+  /** mineru | ark（0065） */
+  ocr_provider?: string;
   ocr_base_url?: string | null;
   ocr_backend?: string | null;
+  ocr_model?: string | null;
   has_ocr_key?: boolean;
   transcribe_base_url?: string | null;
   transcribe_model?: string | null;
@@ -767,6 +794,10 @@ export type AlignmentItem =
         candidates?: number;
       } | null;
       decided_at: string;
+      /** 人绑过、还没说单个日期标哪一端的签名（#966）：现在绑到的属性与方向。
+       *  两票不一致的条目两个都是 null */
+      bound_to: string | null;
+      direction: "forward" | "reverse" | null;
     }
   | {
       kind: "kind_word";
@@ -815,7 +846,11 @@ export interface ErrataItem {
 export interface AlignmentVote {
   property: string;
   direction: "forward" | "reverse";
+  /** 状态属性下，只带一个日期的陈述那个日期标的是什么（#966）；事件与恒常没有 */
+  marks?: AlignmentMarks | null;
 }
+/** 单个日期在状态上标的是开始、结束，还是都不是（`phrase_bindings.marks`，#966） */
+export type AlignmentMarks = "start" | "end" | "none";
 
 export interface OntologyDefect {
   id: string;
@@ -1074,6 +1109,9 @@ export interface EntityFact {
   /** 读出来的区间（0022），与 GraphEdge 同义：「此刻成立」按它判 */
   holds_from: string | null;
   holds_to: string | null;
+  /** 见证从文档的哪条日期来，照文档的字（0064）：「提报日期 2026年9月4日」。没有起止的
+      事实，`holds_from` 就是见证的日期——它是「截至」，不是起点 */
+  attested_by?: string | null;
   valid_from_precision: string | null;
   /** year | month | day，外加 unknown = 原文说它结束了但没说哪天 */
   valid_to_precision: string | null;
@@ -1215,6 +1253,44 @@ export interface RelationTypeView {
   usage: number;
 }
 
+/** 一条能力问题（0061 决定 1）：本体该答得上来的问题，代理提本体时照着看 */
+export interface CompetencyQuestion {
+  id: string;
+  kb_id: string;
+  question: string;
+  expected_answer: string | null;
+  needs: unknown | null;
+  origin: "person" | "agent";
+  status: "accepted" | "proposed" | "rejected" | "retired";
+  created_at: string;
+  updated_at: string;
+  last_checked_at: string | null;
+  last_result: unknown | null;
+}
+
+/** 本体的两个数（0061 决定 5） */
+export interface QuestionReport {
+  questions: {
+    accepted: number;
+    proposed: number;
+    checked: number;
+    answered: number;
+    /** 答上了且途中从图谱拿到过事实 */
+    answered_with_graph: number;
+    /** 答上了且只走了图谱：本体本身答的 */
+    answered_graph_only: number;
+  };
+  proposals: {
+    open: number;
+    adopted: number;
+    adopted_edited: number;
+    rejected: number;
+    decided: number;
+    changed: number;
+    changed_share: number | null;
+  };
+}
+
 export interface OntologyMiss {
   kind: "entity_type" | "relation_type";
   key: string;
@@ -1256,14 +1332,42 @@ export interface UniquenessCandidate {
 /** `description` 与 `reason` 不是一回事：description 逐字进抽取提示词，是模型判断
     "什么算这个类"的唯一依据；reason 只是给人看的"为什么该加"。喂错了这个类会成为
     下一个倾倒场——实测 technology 就是这么来的。 */
+/** 代理提的一条多带的几格（0061）：谁提的、服务哪些问题、会绑上哪些形状。
+    Suggest 的一份没有这些，渲染照旧 */
+export interface AgentProposalFields {
+  proposed_by?: "suggest" | "agent";
+  /** 服务的能力问题 id */
+  serves?: string[];
+  /** 会归到这个类下的类别词 */
+  kind_words?: string[];
+  /** 原文里的几句，给人核对定义用 */
+  examples?: string[];
+  /** 本体里离这条提案最近的已有元素（按向量）：采纳前看它是不是其实已经有了 */
+  closest?: { key: string; label: string; distance: number }[];
+  domains?: string[];
+  ranges?: string[];
+  parents?: string[];
+  signatures?: {
+    phrases?: {
+      phrase: string;
+      subject: string | null;
+      object: string | null;
+      value: boolean;
+      /** map_to 的形状：读属性的方向 forward | reverse */
+      direction?: string;
+    }[];
+    kind_words?: string[];
+  };
+}
+
 export interface OntologyProposals {
-  entity_types: {
+  entity_types: (AgentProposalFields & {
     key: string;
     label: string;
     description?: string;
     reason?: string;
-  }[];
-  relation_types: {
+  })[];
+  relation_types: (AgentProposalFields & {
     key: string;
     label: string;
     temporal?: string;
@@ -1272,7 +1376,7 @@ export interface OntologyProposals {
     reason?: string;
     /** 这条关系归并了哪些表层说法。有它才谈得上把等待的事实改写过去 */
     forms?: string[];
-  }[];
+  })[];
   /**
    * 宾语是字面值的说法（"成立日期 = 2015"）。
    *
@@ -1280,7 +1384,7 @@ export interface OntologyProposals {
    * 而把它当关系建出来，那个值就会变成一个假实体。domain 不在这里——
    * 服务端从事实的主语类型里取，猜错会让整条被丢弃
    */
-  attribute_types?: {
+  attribute_types?: (AgentProposalFields & {
     key: string;
     label: string;
     datatype?: string;
@@ -1288,21 +1392,23 @@ export interface OntologyProposals {
     description?: string;
     reason?: string;
     forms?: string[];
-  }[];
+  })[];
   /**
    * 本体里**已经有**这个意思，只需把说法挂过去。
    *
    * 跟 relation_types 的区别是不建东西：同一个意思长出第二个 key，
    * 这批事实就永久分在两处，谁也认不出它们本是一回事。
    */
-  map_to?: {
+  map_to?: (AgentProposalFields & {
     key: string;
     /** 服务端标的：目标落在关系还是属性上。两条改写路径不一样，
-        而模型只答得出一个 key，看不出它在哪一档 */
+        而模型只答得出一个 key，看不出它在哪一档。代理提的还有 class */
     kind?: string;
+    /** 代理提的：目标的标签，人看键看不懂 */
+    label?: string;
     forms?: string[];
     reason?: string;
-  }[];
+  })[];
 }
 
 /** 原文说过、本体里没有、因而事实没有谓词的说法。 */
@@ -1382,12 +1488,15 @@ export interface Source {
   heading?: string;
   filename: string;
   excerpt: string;
+  /** 块里被引到的那几句（图谱事实的引文，#968 的后续）：界面在原文里把它们标出来 */
+  quotes?: string[];
 }
 
 /** Agentic 对话的行动轨迹（工具调用一步一条）。 */
 export interface ChatStep {
   kind:
     | "search"
+    | "document"
     | "docs"
     | "entity"
     | "facts"
@@ -1397,8 +1506,32 @@ export interface ChatStep {
     | "changes"
     | "query"
     | "tool";
+  /** 数据：查询、实体名、来源名、工具名。照原样显示 */
   label: string;
+  /** 服务端写的英文。**有 `status` 的步骤不读它**，界面按下面的字段自己说（#942）；
+   *  那之前存下的消息只有它。问数与 remember 的 detail 是数据（目的、记下的那句话） */
   detail: string;
+  status?: "ok" | "failed" | "not_found" | "invalid";
+  /** 列出了几个；`total` 是一共有几个（列出来的少于有的时候） */
+  count?: number;
+  total?: number;
+  /** 列到上限就停了，后面可能还有，总数不知道 */
+  more?: boolean;
+  /** 世界时间：问的是那时成立的事实。RFC 3339 */
+  valid_at?: string;
+  /** 记录时间：按那时（`as_of`）或那之前（`before`）记下的。RFC 3339 */
+  as_of?: string;
+  before?: string;
+  /** changes 的窗口，YYYY-MM-DD；没有 until 就是开到现在 */
+  since?: string;
+  until?: string;
+  /** paths_between：最短的那条几跳 */
+  hops?: number;
+  /** 参数不对时是哪一个；`missing` 分开没给与给错了 */
+  param?: string;
+  missing?: boolean;
+  /** 问数跑的那条 SQL（#936） */
+  sql?: string;
   /** `remember` 那一步带着它：那句记忆落成的 chunk。对话里的确认卡按它取
    *  待确认项（0015）；回放时也据此重画 */
   chunk_id?: string;
@@ -1424,6 +1557,7 @@ export interface ConversationMessage {
   content: string;
   steps: ChatStep[];
   sources: Source[];
+  stopped: boolean;
   created_at: string;
 }
 
@@ -1446,7 +1580,15 @@ export type AlertGroup = {
   /** 跟 latest_at 一起圈出这一组，标已读时原样发回去 */
   earliest_at: string;
   /** 明细，最多几条，新的在前 */
-  lines: { name?: string; error?: string; job?: string }[];
+  lines: {
+    name?: string;
+    error?: string;
+    job?: string;
+    warnings?: {
+      kind: string;
+      detail: Record<string, unknown>;
+    }[];
+  }[];
 };
 
 export const api = {
@@ -2151,11 +2293,74 @@ export const api = {
     section: string,
     key: string,
     status: "adopted" | "rejected",
+    /** 拒绝的理由（0061）：下一轮代理读得到 */
+    reason?: string,
   ) =>
     request<{ ok: boolean }>(`/api/v1/kbs/${kbId}/ontology/proposals`, {
       method: "POST",
-      body: JSON.stringify({ section, key, status }),
+      body: JSON.stringify({ section, key, status, reason }),
     }),
+  /** 叫本体代理来看一眼（0061 决定 2）：排一份任务，结果落在 storedProposals */
+  proposeOntology: (kbId: string) =>
+    request<{ queued: boolean }>(`/api/v1/kbs/${kbId}/ontology/propose`, {
+      method: "POST",
+      body: "{}",
+    }),
+  /** 采纳代理的一条提案（0061 决定 3）：服务端建元素、标记、排对齐 */
+  adoptProposal: (
+    kbId: string,
+    section: string,
+    key: string,
+    edits?: {
+      label?: string;
+      description?: string;
+      datatype?: string;
+      domains?: string[];
+      ranges?: string[];
+      parents?: string[];
+    },
+  ) =>
+    request<{ id: string }>(`/api/v1/kbs/${kbId}/ontology/proposals/adopt`, {
+      method: "POST",
+      body: JSON.stringify({ section, key, ...(edits ?? {}) }),
+    }),
+  /** 能力问题（0061 决定 1） */
+  listQuestions: (kbId: string) =>
+    request<CompetencyQuestion[]>(`/api/v1/kbs/${kbId}/questions`),
+  createQuestion: (
+    kbId: string,
+    body: { question: string; expected_answer?: string },
+  ) =>
+    request<{ id: string }>(`/api/v1/kbs/${kbId}/questions`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  updateQuestion: (
+    kbId: string,
+    qid: string,
+    body: {
+      question?: string;
+      expected_answer?: string;
+      status?: "accepted" | "rejected" | "retired";
+    },
+  ) =>
+    request<{ ok: boolean }>(`/api/v1/kbs/${kbId}/questions/${qid}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
+  deleteQuestion: (kbId: string, qid: string) =>
+    request<{ ok: boolean }>(`/api/v1/kbs/${kbId}/questions/${qid}`, {
+      method: "DELETE",
+    }),
+  /** 让代理给库提问题（0061 决定 1）：排任务，结果是 proposed 的问题 */
+  proposeQuestions: (kbId: string) =>
+    request<{ queued: boolean }>(`/api/v1/kbs/${kbId}/questions/propose`, {
+      method: "POST",
+      body: "{}",
+    }),
+  /** 两个数（0061 决定 5） */
+  questionReport: (kbId: string) =>
+    request<QuestionReport>(`/api/v1/kbs/${kbId}/questions/report`),
   dismissMiss: (kbId: string, kind: string, key: string) =>
     request<{ ok: boolean }>(`/api/v1/kbs/${kbId}/ontology/misses/dismiss`, {
       method: "POST",
@@ -2401,10 +2606,12 @@ export const api = {
     bindingId: string,
     property: string | null,
     direction: "forward" | "reverse",
+    /** 只在状态属性下给；null = 不说（只带一个日期的陈述留在开放图谱） */
+    marks: AlignmentMarks | null,
   ) =>
     request<{ ok: boolean; job_id: number; status: "accepted" }>(
       `/api/v1/kbs/${kbId}/review/alignment/phrases/${bindingId}`,
-      { method: "POST", body: JSON.stringify({ property, direction }) },
+      { method: "POST", body: JSON.stringify({ property, direction, marks }) },
     ),
   /** 人批或驳一条蕴含规则：答 202 和 job id，隐含事实在后台算（0044 决定 3 第五片） */
   decideAlignmentRule: (kbId: string, ruleId: string, approve: boolean) =>
@@ -2562,7 +2769,7 @@ export const api = {
    *  `requeued`：因为缺它而等着的文件，这一存重新排进了处理队列几份 */
   saveOcrSettings: (
     workspaceId: string,
-    body: { base_url: string; api_key: string; backend: string },
+    body: { provider: string; base_url: string; api_key: string; backend: string; model: string },
   ) =>
     request<{ ok: boolean; requeued: number }>(
       `/api/v1/workspaces/${workspaceId}/settings/ocr`,
@@ -2627,6 +2834,11 @@ export const conversationsApi = {
     request<{ messages: ConversationMessage[] }>(
       `/api/v1/kbs/${kbId}/conversations/${id}`,
     ),
+  stop: (kbId: string, id: string, generationId: string) =>
+    request<{ ok: boolean }>(`/api/v1/kbs/${kbId}/chat/${id}/stop`, {
+      method: "POST",
+      body: JSON.stringify({ generation_id: generationId }),
+    }),
   remove: (kbId: string, id: string) =>
     request<{ ok: boolean }>(`/api/v1/kbs/${kbId}/conversations/${id}`, {
       method: "DELETE",
@@ -2634,14 +2846,15 @@ export const conversationsApi = {
 };
 
 export interface ChatHandlers {
-  onConversation: (id: string) => void;
+  /** `messageId`：这一问存下的 id。答到一半失败了，凭它重答（#936）；老的服务端不发 */
+  onConversation: (id: string, messageId?: string, generationId?: string) => void;
   onSources: (s: Source[]) => void;
   onStep: (s: ChatStep) => void;
   onDelta: (text: string) => void;
-  onDone: () => void;
-  onError: (message: string) => void;
+  onDone: (stopped: boolean) => void;
+  onError: (message: string, error?: ApiError) => void;
   /** 接上一个已经在跑的回答：这是它此刻的样子，**覆盖，不是追加** */
-  onSnapshot?: (s: { content: string; steps: ChatStep[]; sources: Source[] }) => void;
+  onSnapshot?: (s: { generation_id: string; content: string; steps: ChatStep[]; sources: Source[] }) => void;
   /** 这个会话没有在跑的生成——最常见的答案，不是错误 */
   onIdle?: () => void;
 }
@@ -2667,7 +2880,8 @@ export function reattachChat(
 
 export function streamChat(
   kbId: string,
-  body: { conversation_id?: string; message: string },
+  /** `retry_message_id`：重答这场对话最后那个没有回答的问题（#936），不再存一遍 */
+  body: { conversation_id?: string; message: string; retry_message_id?: string },
   handlers: ChatHandlers,
 ): () => void {
   return consumeChatStream(
@@ -2692,10 +2906,10 @@ function consumeChatStream(
   const controller = new AbortController();
   let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
   let terminal = false;
-  const fail = (message: string) => {
+  const fail = (message: string, error?: ApiError) => {
     if (terminal || controller.signal.aborted) return;
     terminal = true;
-    handlers.onError(message);
+    handlers.onError(message, error);
   };
   (async () => {
     try {
@@ -2706,11 +2920,13 @@ function consumeChatStream(
       }
       if (!res.ok || !res.body) {
         let message = res.statusText;
+        let code: string | undefined;
         try {
-          const body = (await res.json()) as { error?: string };
-          if (body.error) message = body.error;
+          const body = (await res.json()) as Refusal;
+          code = body.code;
+          message = refusalMessage(body, message);
         } catch { /* keep the HTTP status */ }
-        fail(message);
+        fail(message, new ApiError(res.status, message, code));
         return;
       }
       reader = res.body.getReader();
@@ -2718,12 +2934,19 @@ function consumeChatStream(
       let trailingCr = false;
       const parser = createParser({ onEvent: ({ event, data: value }) => {
         if (terminal || controller.signal.aborted) return;
-        if (event === "done") { terminal = true; handlers.onDone(); }
-        else if (event === "error") fail(value);
+        if (event === "done") {
+          const stopped = JSON.parse(value).stopped === true;
+          terminal = true;
+          handlers.onDone(stopped);
+        }
+        else if (event === "error") fail(streamFailure(value));
         else if (event === "idle") {
           if (allowIdle) { terminal = true; handlers.onIdle?.(); }
           else fail(S.ask.streamInterrupted);
-        } else if (event === "conversation") handlers.onConversation(JSON.parse(value).id);
+        } else if (event === "conversation") {
+          const frame = JSON.parse(value);
+          handlers.onConversation(frame.id, frame.message_id, frame.generation_id);
+        }
         else if (event === "sources") handlers.onSources(JSON.parse(value));
         else if (event === "step") handlers.onStep(JSON.parse(value));
         else if (event === "delta") handlers.onDelta(JSON.parse(value).text);

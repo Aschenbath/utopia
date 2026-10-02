@@ -33,10 +33,13 @@ pub(super) enum Reply {
     Text(&'static str),
     SplitText(&'static [&'static str]),
     NarratedTool,
+    /// 一段正文，同一回合里还真的调了 find_entities
+    TextWithTool(&'static str),
     ParallelTools,
     OversizedText,
     Finished(&'static str, &'static str),
     Http(u16),
+    HttpError(u16, &'static str),
     /// 调一个工具：(名字, 参数 JSON)
     Tool(&'static str, &'static str),
 }
@@ -70,6 +73,9 @@ impl Respond for Scripted {
             seen.len()
         };
         let frame = match self.replies.get(n - 1).copied().unwrap_or(Reply::Empty) {
+            Reply::HttpError(status, body) => {
+                return ResponseTemplate::new(status).set_body_string(body)
+            }
             Reply::Http(status) => {
                 return ResponseTemplate::new(status).set_body_string("Evidence gathering complete")
             }
@@ -105,6 +111,12 @@ impl Respond for Scripted {
             }}]})),
             Reply::NarratedTool => Some(serde_json::json!({ "choices": [{ "delta": {
                 "content": "I will check the evidence.",
+                "tool_calls": [{ "index": 0, "id": format!("call_{n}"),
+                    "function": { "name": "find_entities", "arguments": "{\"name\":\"Acme\"}" }
+                }]
+            } }] })),
+            Reply::TextWithTool(text) => Some(serde_json::json!({ "choices": [{ "delta": {
+                "content": text,
                 "tool_calls": [{ "index": 0, "id": format!("call_{n}"),
                     "function": { "name": "find_entities", "arguments": "{\"name\":\"Acme\"}" }
                 }]
@@ -244,6 +256,7 @@ impl Fx {
             Json(ChatReq {
                 conversation_id: None,
                 message: message.into(),
+                retry_message_id: None,
             }),
         )
         .await
@@ -362,12 +375,34 @@ async fn a_reply_that_stays_empty_is_an_error_after_one_retry() -> anyhow::Resul
     f.cleanup().await
 }
 
+#[path = "chat_context_tests.rs"]
+mod context_tests;
+#[path = "chat_embed_once_tests.rs"]
+mod embed_once_tests;
+#[path = "chat_error_code_tests.rs"]
+mod error_code_tests;
 #[path = "chat_fallback_tests.rs"]
 mod fallback_tests;
+#[path = "chat_graph_citation_tests.rs"]
+mod graph_citation_tests;
+#[path = "chat_history_tests.rs"]
+mod history_tests;
+#[path = "chat_lookup_tests.rs"]
+mod lookup_tests;
+#[path = "chat_markup_tests.rs"]
+mod markup_tests;
 #[path = "chat_persistence_tests.rs"]
 mod persistence_tests;
 #[path = "chat_registry_tests.rs"]
 mod registry_tests;
+#[path = "chat_resolved_tests.rs"]
+mod resolved_tests;
+#[path = "chat_restated_tests.rs"]
+mod restated_tests;
+#[path = "chat_retrieval_failure_tests.rs"]
+mod retrieval_failure_tests;
+#[path = "chat_retry_tests.rs"]
+mod retry_tests;
 #[path = "chat_sources_tests.rs"]
 mod sources_tests;
 
@@ -540,6 +575,7 @@ async fn budget_finalization_survives_disconnect_and_reattach() -> anyhow::Resul
             Json(ChatReq {
                 conversation_id: Some(id),
                 message: "What changed at Acme?".into(),
+                retry_message_id: None,
             }),
         )
         .await

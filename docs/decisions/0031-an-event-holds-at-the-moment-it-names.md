@@ -1,15 +1,6 @@
 # 0031 · An event holds at the moment it names
 
-- **Status**: implemented (#486) · `Validity::under` normalises every write by the predicate's `temporal` — in `insert_fact_inner`, so extraction, the nod and a person's own fact all pass through it, and in `correct_interval` · `world_axis` reads an event as the bucket it names and an eternal fact as open at both ends, and the evaluator's `read_span` says the same · the prompt marks `[event]` and `[eternal]` relations and tells the model what to write, for a base that has any · the export carries `utopia:temporal` on a property that is not a state · no schema change, and a row written before this reads correctly · the panel still prints an event as `T ~ T` and the ontology page still does not say what the three values do — that is the UI cut · 2026-09-10: corpus-grown relations now take `temporal` from the
-  proposal instead of `state` for all (#593, on [0007](0007-who-decides-what-becomes-a-relation.md)) ·
-  the five packs were measured for the same gap and there is none to fill: of 946 schema.org
-  object properties, 60 in PROV-O, 32 in ORG and 73 in IOF-core, **no object property is an
-  event** — standard vocabularies reify an event as a class (`PublicationEvent`,
-  `prov:Generation`) and their object properties are states pointing at it, so
-  `create_relation_types_bulk` writing `state` is right by construction, not by omission;
-  IOF's `…AtAllTimes` family is the one `eternal` candidate and is left as `state` until a
-  base needs it; a person changes any of them on the ontology page and the read side picks
-  it up at once, since `world_axis` looks the predicate's `temporal` up at read time
+- **Status**: Implemented (#486, #593) · open: the UI cut
 - **Written**: 2026-09-08 (conventions in the [README](README.md))
 - **Related**: [0003](0003-ontology-growth-loop.md)'s graph migration gave a relation three temporal semantics and gave the engine one. [0022](0022-an-unknown-date-is-not-an-open-one.md) put the world-axis read in one place; this record adds two branches there and nowhere else. [0024](0024-the-world-axis-reaches-the-second.md)'s ladder is what "the bucket it names" is measured on. [0013](0013-a-source-should-hand-over-its-history.md) hands ticket events over at day precision; those were the first rows this rule was wrong for. From #486.
 
@@ -33,6 +24,8 @@ So choosing `event` was the same as choosing `state` without a uniqueness axiom,
 `Validity::under(temporal)` runs on every write, keyed on the predicate's declared semantics. For an event: the start if the text gave one, else the end (only an end means *that is when it happened*), and a span collapses to its start — an acquisition does not run until next year. Both ends get that value and that precision. No date means no dates; "ended, date unknown" means nothing for a moment and is dropped, so an event row never carries `'unknown'` and never gets an `attested_to`.
 
 The rule sits in `insert_fact_inner` and `correct_interval`, not in the writers. Extraction, the pending-facts nod (0015), a person's own fact from the API and a person's edit of an interval all pass through those two doors, and nothing outside the store has to know the rule exists.
+
+2026-09-27: under a property declared as a state, the same rule now refuses a row whose two ends are equal, and a single date bound to a state is read by what its binding says it marks. See [0053](0053-a-phrase-decision-records-the-inputs-it-considered.md)'s revision of that date (#966).
 
 Both ends carry the value because that is the one shape the row can explain on its own. A reader that does not consult the predicate — an old client, an export consumer, a hand-written query — sees a fact that held on one day. It cannot see *holds from that day on*, which is what an open end would have told it. The representation fails safe.
 
@@ -71,4 +64,10 @@ An event row from before this record has a start and an open end. `facts_holds_t
 - **A point on the panel.** `fmtInterval` prints an event as `2024-03-15 ~ 2024-03-15` and the timeline draws it as a bar of no length. The point rendering, and a line on the ontology page saying what the three values do, are the UI cut.
 - **The wording the tools give the model.** `time_text` phrases an event's interval the way it phrases a state's. Whether "on 2024-03-15" reads better than "from 2024-03-15 to 2024-03-15" for a timed answer is a prompt question, to be looked at with the tool traces.
 - **An attribute taken at a moment.** Attributes are created as `state` and the UI does not offer otherwise (0021's readings are states that a later reading closes). A reading that is a measurement *at* a time rather than a value *from* a time is not expressible today; nothing has asked for it.
-- **The end convention for states.** Noted above. "Until 2024-07" ends at the start of July under the current read; the bucket reading this record gives events would end it at the start of August. Left alone here.
+- **The end convention for states.** Noted above. "Until 2024-07" ends at the start of July under the current read; the bucket reading this record gives events would end it at the start of August. Left alone here. 2026-09-27: one case is settled in [0053](0053-a-phrase-decision-records-the-inputs-it-considered.md)'s revision of that date. An ending that closes an open row starting inside the period it names closes it at the period's end.
+
+## Status history
+
+The status line as it stood on 2026-09-27, before status lines were cut to one line:
+
+> implemented (#486) · `Validity::under` normalises every write by the predicate's `temporal` — in `insert_fact_inner`, so extraction, the nod and a person's own fact all pass through it, and in `correct_interval` · `world_axis` reads an event as the bucket it names and an eternal fact as open at both ends, and the evaluator's `read_span` says the same · the prompt marks `[event]` and `[eternal]` relations and tells the model what to write, for a base that has any · the export carries `utopia:temporal` on a property that is not a state · no schema change, and a row written before this reads correctly · the panel still prints an event as `T ~ T` and the ontology page still does not say what the three values do — that is the UI cut · 2026-09-10: corpus-grown relations now take `temporal` from the proposal instead of `state` for all (#593, on [0007](0007-who-decides-what-becomes-a-relation.md)) · the five packs were measured for the same gap and there is none to fill: of 946 schema.org object properties, 60 in PROV-O, 32 in ORG and 73 in IOF-core, **no object property is an event** — standard vocabularies reify an event as a class (`PublicationEvent`, `prov:Generation`) and their object properties are states pointing at it, so `create_relation_types_bulk` writing `state` is right by construction, not by omission; IOF's `…AtAllTimes` family is the one `eternal` candidate and is left as `state` until a base needs it; a person changes any of them on the ontology page and the read side picks it up at once, since `world_axis` looks the predicate's `temporal` up at read time

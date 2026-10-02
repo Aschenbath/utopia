@@ -19,6 +19,7 @@ import {
   History,
   Layers,
   MoreHorizontal,
+  RotateCcw,
   Search,
   Search as SearchIcon,
   Square,
@@ -39,7 +40,10 @@ import {
 } from "../api";
 import { S } from "../i18n";
 import { rehypeCitations } from "../citations";
+import { followsBottom } from "../chatScroll";
+import { copyAndSay } from "../clipboard";
 import { chatMarkdown, SourceList, SourcesProvider } from "./chatCitations";
+import { CopyButton } from "./chatCopy";
 import { toast } from "../toast";
 import {
   DropdownMenu,
@@ -55,6 +59,7 @@ import {
   DangerConfirm,
   IconButton,
   Input,
+  LinkButton,
   RAIL_CLS,
   REVEAL,
   Row,
@@ -69,6 +74,7 @@ import {
   type Turn,
 } from "../liveAnswer";
 import { NodCard } from "./PendingFacts";
+import { stepDetail, stepLabel } from "../steps";
 import { NextStep, nextStep, useReadiness } from "./NextStep";
 
 /* `Turn` 定义在 liveAnswer 里：进行中的那一次也是一串 Turn，
@@ -85,11 +91,27 @@ const NO_SOURCES: Source[] = [];
 type ViewRequest = { kbId: string; id: string | null };
 const historyTurns = (messages: ConversationMessage[]): Turn[] => messages.map((m) => ({
   role: m.role,
+  id: m.id,
   content: m.content,
   steps: m.steps.length ? m.steps : undefined,
   sources: m.sources.length ? m.sources : undefined,
+  stopped: m.stopped,
 }));
 const viewKey = (kbId: string, id: string | null) => `${kbId}/${id ?? ""}`;
+
+/** 能重答的那一问在屏上的位置（#936），没有就是 -1。只看最后一问：它后面要么什么
+ *  也没有（重开会话时的样子），要么只有一条出错的回答（刚答到一半失败）。
+ *  服务端同样只答会话的最后一条，答过的、后面又有人接着问的都不答 */
+function retryableQuestion(shown: Turn[]): number {
+  const last = shown.at(-1);
+  const at =
+    last?.role === "assistant" && last.error
+      ? shown.length - 2
+      : last?.role === "user"
+        ? shown.length - 1
+        : -1;
+  return at >= 0 && shown[at].role === "user" && shown[at].id ? at : -1;
+}
 
 export function Chat() {
   const kbId = useKbId();
@@ -116,6 +138,9 @@ export function Chat() {
   // 路由同步 effect 的判据：state 的提交时序晚于 navigate 触发的重渲染，
   // 用 ref 同步写入才能让"流式新建后仅换 URL"的守卫可靠命中
   const activeIdRef = useRef<string | null>(null);
+  // 读者是不是停在对话底部（见 chatScroll.ts）。换会话、发新消息都回到「跟着」：
+  // 那一刻人要看的就是底部
+  const following = useRef(true);
   // 已经结束的那些轮次，从库里读来。**进行中的那一次不在这里**——见下
   const [turns, setTurns] = useState<Turn[]>([]);
   const [loadedKey, setLoadedKey] = useState<string | null>(null);
@@ -141,6 +166,7 @@ export function Chat() {
     // loadConversation 必须先检查 liveAnswer.entry，直接认领，避免流中途读库覆盖。
     claimView(routeConvId ?? null);
     activeIdRef.current = null;
+    following.current = true;
     setActiveId(routeConvId ?? null);
     setTurns([]);
     setLoadedKey(null);
@@ -171,6 +197,7 @@ export function Chat() {
      一个正在别处生成的回答不该改变这里的任何东西 */
   const streaming = liveHere?.streaming ?? false;
   const shown = liveHere ? liveHere.turns : loadedKey === viewKey(kbId, currentId) ? turns : [];
+  const retryAt = retryableQuestion(shown);
   const [scopeOpen, setScopeOpen] = useState(false);
   const [pendingDelete, setPendingDelete] = useState<ConversationRow | null>(null);
   // 会话搜索。**搜标题也搜正文**——人记得住的往往是问过的那句话
@@ -219,6 +246,10 @@ export function Chat() {
       return last.conversations.length > 0 && loaded < last.total ? loaded : undefined;
     },
     enabled: !!kbId && kb?.id === kbId,
+    // 换搜索词时留着上一屏，别每敲一个字就清空再冒出来（Graph、Library 同理）。
+    // 换了库不留：另一个库的会话一刻也不该出现在这里
+    placeholderData: (prev, prevQuery) =>
+      prevQuery?.queryKey[1] === kbId ? prev : undefined,
   });
   // Updated conversations can move between offset pages. Deduplicate by identity;
   // invalidation refetches the loaded page range rather than appending stale offsets.
@@ -238,9 +269,10 @@ export function Chat() {
     onError: (e: Error) => toast.error(e.message),
   });
 
-  // 直落底部（instant）：平滑滚动在流式追加下会一路慢爬
+  // 直落底部（instant）：平滑滚动在流式追加下会一路慢爬。**只在人停在底部时落**：
+  // 生成期间 `shown` 每 33ms 变一次，翻上去读前文的人不该被每一批新字拽回来
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "instant" });
+    if (following.current) bottomRef.current?.scrollIntoView({ behavior: "instant" });
   }, [shown]);
 
   // 路由 → 会话装载；裸 /chat 还原本库上次会话（切页回来仍在原对话）
@@ -311,13 +343,14 @@ export function Chat() {
           ],
           abort,
         );
+        handle.identify(id, undefined, s.generation_id);
       },
       onSources: (sources) => handle?.patchLast((t) => ({ ...t, sources })),
       onStep: (step) =>
         handle?.patchLast((t) => ({ ...t, steps: [...(t.steps ?? []), step] })),
       onDelta: (text) => handle?.patchLast((t) => ({ ...t, content: t.content + text })),
-      onDone: () => {
-        handle?.finish();
+      onDone: (stopped) => {
+        handle?.finish(stopped);
         invalidateList();
       },
       onError: (message) => {
@@ -401,6 +434,7 @@ export function Chat() {
     // 同样不 abort：开一场新的不等于放弃上一场
     if (kb) sessionStorage.removeItem(lastKey(kb.id));
     activeIdRef.current = null;
+    following.current = true;
     setActiveId(null);
     setTurns([]);
     navigate({ to: "/kb/$kbId/chat", params: { kbId } });
@@ -409,7 +443,13 @@ export function Chat() {
 
   const removeConversation = async (id: string) => {
     const owner = viewRequest.current;
-    await conversationsApi.remove(kb!.id, id);
+    try {
+      await conversationsApi.remove(kb!.id, id);
+    } catch (e) {
+      // 确认框已经关了：删不掉不说出来的话，这一行只是安静地留在列表里
+      toast.error(e instanceof Error ? e.message : String(e));
+      return;
+    }
     // 记号跟着会话走，否则这个 id 会一直留在浏览器的那张表里
     convMarks.forget(id);
     if (sessionStorage.getItem(lastKey(kb!.id)) === id) {
@@ -421,60 +461,95 @@ export function Chat() {
 
   const send = () => {
     const q = input.trim();
-    if (!q || streaming || !kb || kb.id !== kbId || loadingHistory || historyError) return;
+    if (!q || !kb || kb.id !== kbId || loadingHistory || historyError) return;
+    if (liveAnswer.entry(kb.id, activeId)?.streaming) return;
     const owner = claimView(activeId);
+    following.current = true;
     setIdleHistoryKey(null);
     setInput("");
     sessionStorage.removeItem(DRAFT_KEY);
     if (inputRef.current) inputRef.current.style.height = "auto";
 
-    /* **结果留在 store 里，不交回组件状态。**
-       交回去要经过一个 `setTurns`，而流结束时这个组件可能早就卸载了——
-       那一下是空操作，内容就此消失（切回来一片空白，问题气泡都没有）。
-       留在 store 里，谁挂载谁认领。这一场从开场起就有名有姓：先建条目、
-       后开流，回调顺着句柄只写自己这一场 */
-    const handle = liveAnswer.begin(
+    answer(
+      owner,
       kb.id,
-      activeId,
       // 从屏上正在显示的那些轮续接，而不是组件 state——流结束后内容只落在
       // store 里，state 还是上次装 conversation 时的库内历史，用它会让
       // 上一条回答从画面里消失
       [...(liveHere?.turns ?? turns), { role: "user", content: q }, { role: "assistant", content: "" }],
-      () => {},
-    );
-    const abort = streamChat(
-      kb.id,
       { conversation_id: activeId ?? undefined, message: q },
-      {
-        onConversation: (id) => {
-          handle.identify(id);
-          invalidateList();
-          if (!ownsView(owner)) return;
-          // 先 identify 生成句柄再换 URL；layout effect 重置视图后，loadConversation 会认领该句柄。
-          activeIdRef.current = id;
-          setActiveId(id);
-          sessionStorage.setItem(lastKey(kb.id), id);
-          navigate({
-            to: "/kb/$kbId/chat/$conversationId",
-            params: { kbId, conversationId: id },
-            replace: true,
-          });
-        },
-        onSources: (sources) => handle.patchLast((t) => ({ ...t, sources })),
-        onStep: (step) =>
-          handle.patchLast((t) => ({ ...t, steps: [...(t.steps ?? []), step] })),
-        onDelta: (text) =>
-          handle.patchLast((t) => ({ ...t, content: t.content + text })),
-        onDone: () => {
-          handle.finish();
-          invalidateList();
-        },
-        onError: (message) => {
-          handle.patchLast((t) => ({ ...t, error: message }));
-          handle.finish();
-        },
-      },
     );
+  };
+
+  /** 重答最后那个没有回答的问题（#936）。问题已经在库里，不再存一遍：屏上它后面
+   *  若挂着一条出错的回答，换成一条空的，带着它存下的 id 重新开流 */
+  const retry = () => {
+    const at = retryableQuestion(shown);
+    if (at < 0 || !kb || kb.id !== kbId || !activeId || loadingHistory || historyError) return;
+    if (liveAnswer.entry(kb.id, activeId)?.streaming) return;
+    const question = shown[at];
+    const owner = claimView(activeId);
+    following.current = true;
+    setIdleHistoryKey(null);
+    answer(owner, kb.id, [...shown.slice(0, at + 1), { role: "assistant", content: "" }], {
+      conversation_id: activeId,
+      message: question.content,
+      retry_message_id: question.id,
+    });
+  };
+
+  /* **结果留在 store 里，不交回组件状态。**
+     交回去要经过一个 `setTurns`，而流结束时这个组件可能早就卸载了——
+     那一下是空操作，内容就此消失（切回来一片空白，问题气泡都没有）。
+     留在 store 里，谁挂载谁认领。这一场从开场起就有名有姓：先建条目、
+     后开流，回调顺着句柄只写自己这一场。新问题与重答走同一段 */
+  const answer = (
+    owner: ViewRequest,
+    kbNow: string,
+    start: Turn[],
+    body: Parameters<typeof streamChat>[1],
+  ) => {
+    const handle = liveAnswer.begin(kbNow, activeId, start, () => {});
+    const abort = streamChat(kbNow, body, {
+      onConversation: (id, questionId, generationId) => {
+        handle.identify(id, questionId, generationId);
+        invalidateList();
+        if (!ownsView(owner)) return;
+        // 先 identify 生成句柄再换 URL；layout effect 重置视图后，loadConversation 会认领该句柄。
+        activeIdRef.current = id;
+        setActiveId(id);
+        sessionStorage.setItem(lastKey(kbNow), id);
+        navigate({
+          to: "/kb/$kbId/chat/$conversationId",
+          params: { kbId, conversationId: id },
+          replace: true,
+        });
+      },
+      onSources: (sources) => handle.patchLast((t) => ({ ...t, sources })),
+      onStep: (step) =>
+        handle.patchLast((t) => ({ ...t, steps: [...(t.steps ?? []), step] })),
+      onDelta: (text) =>
+        handle.patchLast((t) => ({ ...t, content: t.content + text })),
+      onDone: (stopped) => {
+        handle.finish(stopped);
+        invalidateList();
+      },
+      onError: (message, error) => {
+        if (error?.status === 409 && error.code === "answer_running" && body.conversation_id) {
+          handle.discard();
+          if (!ownsView(owner)) return;
+          if (!body.retry_message_id) {
+            const draft = [body.message, inputRef.current?.value ?? sessionStorage.getItem(DRAFT_KEY)].filter(Boolean).join("\n");
+            sessionStorage.setItem(DRAFT_KEY, draft);
+            setInput(draft);
+          }
+          void loadConversation(body.conversation_id);
+          return;
+        }
+        handle.patchLast((t) => ({ ...t, error: message }));
+        handle.finish();
+      },
+    });
     // streamChat 的 abort 要等它返回才有；真 abort 到手前，句柄上先占着空操作
     handle.setAbort(abort);
   };
@@ -503,6 +578,9 @@ export function Chat() {
           }
         }}
       />
+      {liveHere?.stopError && (
+        <div role="alert" className="text-small text-danger">{liveHere.stopError}</div>
+      )}
       <div className="flex items-center justify-between gap-3 pt-1">
         <div className="flex items-center gap-3 min-w-0">
           {/* 作用域 chip：提问点位可见"在问哪个库"，切库沿用现有语义（开新会话） */}
@@ -565,7 +643,8 @@ export function Chat() {
               // 别场照常写它们自己的条目
               if (kb) liveAnswer.stop(kb.id, currentId);
             }}
-            label={S.ask.stop}
+            label={liveHere?.stopping ? S.ask.stopping : S.ask.stop}
+            disabled={liveHere?.stopping}
             variant="secondary"
             className="shrink-0"
           >
@@ -710,7 +789,7 @@ export function Chat() {
                       {S.ask.rename}
                     </DropdownMenuItem>
                     <DropdownMenuItem
-                      onSelect={() => navigator.clipboard?.writeText(c.title || "")}
+                      onSelect={() => copyAndSay(c.title || "", S.ask.copied)}
                     >
                       {S.ask.copyTitle}
                     </DropdownMenuItem>
@@ -753,7 +832,14 @@ export function Chat() {
           有消息后 composer 停靠底部 */}
       <div className="flex-1 min-w-0 flex flex-col">
         {idleHistoryKey === loadedKey && idleHistoryKey === viewKey(kbId, currentId) && !streaming && (
-          <p role="status" className="px-4 pt-4 text-body text-ink-2">{S.ask.noActiveAnswer}</p>
+          <div role="status" className="px-4 pt-4 flex flex-wrap items-center gap-2 text-body text-ink-2">
+            <span>{S.ask.noActiveAnswer}</span>
+            {retryAt === shown.length - 1 && (
+              <Button variant="secondary" size="sm" icon={<RotateCcw size={12} />} onClick={retry}>
+                {S.ask.retryQuestion}
+              </Button>
+            )}
+          </div>
         )}
         {historyError ? (
           <div role="alert" className="p-6 text-body">
@@ -784,10 +870,24 @@ export function Chat() {
           </div>
         ) : (
           <>
-            <div className="flex-1 overflow-y-auto u-scroll u-chat-fade px-4 pt-6 pb-12">
+            <div
+              className="flex-1 overflow-y-auto u-scroll u-chat-fade px-4 pt-6 pb-12"
+              onScroll={(e) => {
+                following.current = followsBottom(e.currentTarget);
+              }}
+            >
               <div className="max-w-3xl mx-auto space-y-4">
                 {shown.map((t, i) => (
-                  <TurnView key={i} turn={t} live={streaming && i === shown.length - 1} />
+                  <TurnView
+                    key={i}
+                    turn={t}
+                    live={streaming && i === shown.length - 1}
+                    onRetry={
+                      !streaming && i === shown.length - 1 && t.role === "assistant" && retryAt >= 0
+                        ? retry
+                        : undefined
+                    }
+                  />
                 ))}
                 <div ref={bottomRef} />
               </div>
@@ -869,6 +969,47 @@ function stepIcon(kind: ChatStep["kind"]) {
   return <Wrench size={11} />;
 }
 
+/** 轨迹上的一行。话按读者的语言说（`stepDetail`，#942）；没做成的那一步用危险色。
+ *
+ *  问数那一步可以展开它跑的 SQL（#936）：答案里的数是这条语句算出来的，
+ *  读的人该能自己核，而不只看到一句「查了一下」。 */
+function StepRow({ step, kbId }: { step: ChatStep; kbId: string }) {
+  const [sqlOpen, setSqlOpen] = useState(false);
+  return (
+    <div>
+      <div className="flex items-center gap-2 text-small">
+        <span className="text-ink-2">{stepIcon(step.kind)}</span>
+        <span className="text-ink-2 truncate">{stepLabel(step)}</span>
+        <span
+          className={cn(
+            "shrink-0",
+            step.status === "failed" ? "text-danger" : "text-ink-2",
+          )}
+        >
+          · {stepDetail(step)}
+        </span>
+        {step.sql && (
+          <LinkButton
+            className="shrink-0"
+            aria-expanded={sqlOpen}
+            onClick={() => setSqlOpen((open) => !open)}
+          >
+            {S.ask.step.sql}
+          </LinkButton>
+        )}
+      </div>
+      {sqlOpen && step.sql && (
+        <pre className="mt-1 rounded-panel bg-well px-3 py-2 font-mono text-small text-ink-2 whitespace-pre-wrap break-words">
+          {step.sql}
+        </pre>
+      )}
+      {/* remember 那一步后面跟着确认卡（0015）：这句话抽出的事实先等人点头。
+          抽取是异步的，卡片在任务完成时才长出来；回放时按同一个 chunk 重画 */}
+      {step.chunk_id && <NodCard kbId={kbId} chunkId={step.chunk_id} />}
+    </div>
+  );
+}
+
 /** 工具步骤 → 球体状态：思考球讲当前动作的语言 */
 /** 一段 markdown。**按文本记忆化**：一次生成里每来一个词元，整条消息都要重渲染，
  *  而 react-markdown 每次都把那一段从头解析一遍——答案越长每个词元越贵，读起来
@@ -904,12 +1045,21 @@ const Segment = memo(function Segment({ text }: { text: string }) {
 function Thinking({ step }: { step?: ChatStep }) {
   return (
     <span className="u-thinking text-small truncate">
-      {step ? `${step.label} · ${step.detail}` : S.ask.thinking}
+      {step ? `${stepLabel(step)} · ${stepDetail(step)}` : S.ask.thinking}
     </span>
   );
 }
 
-function TurnView({ turn, live }: { turn: Turn; live?: boolean }) {
+function TurnView({
+  turn,
+  live,
+  onRetry,
+}: {
+  turn: Turn;
+  live?: boolean;
+  /** 这是出错的最后一轮、它的问题存着 id 时才有：重答那一问（#936） */
+  onRetry?: () => void;
+}) {
   const kbId = useKbId();
   if (turn.role === "user") {
     return (
@@ -945,16 +1095,7 @@ function TurnView({ turn, live }: { turn: Turn; live?: boolean }) {
               className="my-3 space-y-1 border-l border-line-strong pl-3"
             >
               {seg.steps.map((s, j) => (
-                <div key={j}>
-                  <div className="flex items-center gap-2 text-small">
-                    <span className="text-ink-2">{stepIcon(s.kind)}</span>
-                    <span className="text-ink-2 truncate">{s.label}</span>
-                    <span className="text-ink-2 shrink-0">· {s.detail}</span>
-                  </div>
-                  {/* remember 那一步后面跟着确认卡（0015）：这句话抽出的事实先等人点头。
-                      抽取是异步的，卡片在任务完成时才长出来；回放时按同一个 chunk 重画 */}
-                  {s.chunk_id && <NodCard kbId={kbId} chunkId={s.chunk_id} />}
-                </div>
+                <StepRow key={j} step={s} kbId={kbId} />
               ))}
             </div>
           ) : (
@@ -969,6 +1110,7 @@ function TurnView({ turn, live }: { turn: Turn; live?: boolean }) {
           ),
         )}
         {thinking && <Thinking step={lastStep} />}
+        {turn.stopped && <div className="text-small text-ink-2">{S.ask.stopped}</div>}
         {turn.error && <div className="text-danger">{turn.error}</div>}
       </div>
       {/* **引用等答案说完再出。**
@@ -983,6 +1125,19 @@ function TurnView({ turn, live }: { turn: Turn; live?: boolean }) {
           缺席没人读得出来，得写出来。判据见 answeredWithoutSources */}
       {answeredWithoutSources(turn, !!live) && (
         <div className="mt-2 text-small text-ink-2">{S.ask.noSources}</div>
+      )}
+      {/* 回答上的动作（#936），同样等说完了才出。复制的是存下的 Markdown，
+          角标 `[n]` 照写——表格、代码块贴到别处还是原样。答到一半失败的那一轮
+          多一个重试：问题已经在库里，重答不再存一遍 */}
+      {!live && (turn.content || onRetry) && (
+        <div className="mt-2 flex items-center gap-2">
+          {turn.content && <CopyButton label={S.ask.copyAnswer} text={() => turn.content} />}
+          {onRetry && (
+            <Button variant="secondary" size="sm" icon={<RotateCcw size={12} />} onClick={onRetry}>
+              {S.ask.retryQuestion}
+            </Button>
+          )}
+        </div>
       )}
     </div>
     </SourcesProvider>

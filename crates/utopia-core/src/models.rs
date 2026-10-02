@@ -430,6 +430,7 @@ pub struct ConversationMessage {
     pub content: String,
     pub steps: serde_json::Value,
     pub sources: serde_json::Value,
+    pub stopped: bool,
     pub created_at: DateTime<Utc>,
 }
 
@@ -461,6 +462,11 @@ pub struct LlmSettings {
     #[serde(skip_serializing)]
     pub ocr_api_key: Option<String>,
     pub ocr_backend: Option<String>,
+    /// 读扫描件的服务是哪一种协议（0065）：`mineru` 交任务再问，`ark` 把每页送给视觉模型。
+    /// 已有的行默认 `mineru`
+    pub ocr_provider: String,
+    /// 方舟那一路的视觉模型名；MinerU 用不到
+    pub ocr_model: Option<String>,
     /// 会标说话人的转写模型（OpenAI `/audio/transcriptions` + `diarized_json`，0040）
     pub transcribe_base_url: Option<String>,
     #[serde(skip_serializing)]
@@ -478,8 +484,19 @@ impl LlmSettings {
     pub fn embed_ready(&self) -> bool {
         self.embed_base_url.is_some() && self.embed_model.is_some()
     }
+    /// MinerU 有地址就够；方舟还要模型名和密钥（它是收费的模型接口）
     pub fn ocr_ready(&self) -> bool {
         self.ocr_base_url.is_some()
+            && match self.ocr_provider.as_str() {
+                "mineru" => true,
+                "ark" => {
+                    self.ocr_model
+                        .as_deref()
+                        .is_some_and(|m| !m.trim().is_empty())
+                        && self.ocr_api_key.as_deref().is_some_and(|k| !k.is_empty())
+                }
+                _ => false,
+            }
     }
     pub fn transcribe_ready(&self) -> bool {
         self.transcribe_base_url.is_some() && self.transcribe_model.is_some()
@@ -832,12 +849,33 @@ pub struct EntityFact {
     /// 不再自己把 NULL 解释成开放
     pub holds_from: Option<DateTime<Utc>>,
     pub holds_to: Option<DateTime<Utc>>,
+    /// 见证从文档的哪条日期来，照文档的字（0064）：「提报日期 2026年9月4日」。没有起点的
+    /// 事实，`holds_from` 就是这个见证的日期——它是「截至」，不是起点
+    #[sqlx(default)]
+    pub attested_by: Option<String>,
     pub confidence: f32,
     pub evidence_count: i64,
     /// 证据全部停留在来源文档的旧版（未被现行内容确认；不代表事实失效）
     pub stale: bool,
     /// 修正行（supersedes 链上）：区间闭合来自引擎对账/人工裁决而非抽取原文
     pub corrected: bool,
+    /// 终点是时间线推出来的（`facts.end_derived`）：后一条事实开始时引擎把它关上，原文没说
+    /// 这一天（#970）
+    pub end_derived: bool,
+    /// 区间是人改过的（#970）：`corrected_ends` 有值。与 `corrected` 不同，那一位是任何一次
+    /// 改写：自动接续、审阅裁决、人手改
+    pub time_corrected: bool,
+    /// 人改过哪一端：`start` / `end` / `both`（`facts.corrected_ends`，随修正行写下）。终点后来
+    /// 是时间线推出来的，就不再算终点被人改过
+    pub corrected_ends: Option<String>,
+    /// 时间线把它关上时接的那一行（#970 第二步）：只在 `end_derived`、而且找得到时有
+    pub closed_by_id: Option<Uuid>,
+    /// 接的那一行变了的那一端：接任者，或新的宾语实体的名字
+    pub closed_by: Option<String>,
+    /// 接的那一行的新值（属性事实）
+    pub closed_by_value: Option<serde_json::Value>,
+    /// 人改区间时写下的备注：链上最近那一次修正的
+    pub correction_note: Option<String>,
     /// 证据集合里最新的文档时间——开放事实的"最后确认时间"（时效性透明化）
     pub last_evidence_time: Option<DateTime<Utc>>,
     /// 有争议（0017 §3）：`{ kind, ref_id, derived? }`——哪一种（违规的 kind，或
