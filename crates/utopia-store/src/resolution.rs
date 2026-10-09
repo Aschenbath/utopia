@@ -11,7 +11,7 @@
 use chrono::{DateTime, Utc};
 use pgvector::Vector;
 use sqlx::PgPool;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use utopia_core::models::{MergeLogView, ReviewBatchOutcome, ReviewItem, ReviewSide};
 use utopia_core::{AppError, AppResult};
 use uuid::Uuid;
@@ -1424,7 +1424,11 @@ pub(crate) struct ReviewRow {
     created_at: DateTime<Utc>,
 }
 
-async fn review_side(pool: &PgPool, kb_id: Uuid, entity_id: Uuid) -> AppResult<ReviewSide> {
+async fn review_sides(
+    pool: &PgPool,
+    kb_id: Uuid,
+    entity_ids: &[Uuid],
+) -> AppResult<HashMap<Uuid, ReviewSide>> {
     #[derive(sqlx::FromRow)]
     struct SideRow {
         id: Uuid,
@@ -1434,7 +1438,7 @@ async fn review_side(pool: &PgPool, kb_id: Uuid, entity_id: Uuid) -> AppResult<R
         disambiguator: Option<String>,
         degree: i64,
     }
-    let row: SideRow = sqlx::query_as(&format!(
+    let rows: Vec<SideRow> = sqlx::query_as(&format!(
         "SELECT e.id, e.canonical_name AS name, t.label AS type_label,
                 coalesce(t.color, '#94a3b8') AS color, e.disambiguator,
                 (SELECT count(*) FROM facts f
@@ -1443,24 +1447,31 @@ async fn review_side(pool: &PgPool, kb_id: Uuid, entity_id: Uuid) -> AppResult<R
          -- LEFT JOIN：没判出类型的实体照样要能进审核（0009）。
          -- 内连接会让它整条审核项取不出来，而漂移审核恰恰最常发生在它们身上
          FROM entities e LEFT JOIN entity_types t ON t.id = e.type_id
-         WHERE e.kb_id = $1 AND e.id = $2",
+         WHERE e.kb_id = $1 AND e.id = ANY($2)",
         not_name = crate::names::not_a_name("f"),
     ))
     .bind(kb_id)
-    .bind(entity_id)
-    .fetch_optional(pool)
-    .await?
-    .ok_or(AppError::NotFound)?;
-
-    Ok(ReviewSide {
-        id: row.id,
-        name: row.name,
-        type_label: row.type_label,
-        color: row.color,
-        disambiguator: row.disambiguator,
-        degree: row.degree,
-        top_facts: entity_fact_lines(pool, kb_id, entity_id, 4).await?,
-    })
+    .bind(entity_ids)
+    .fetch_all(pool)
+    .await?;
+    let mut lines = entity_fact_lines_many(pool, kb_id, entity_ids, 4).await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.id,
+                ReviewSide {
+                    id: row.id,
+                    name: row.name,
+                    type_label: row.type_label,
+                    color: row.color,
+                    disambiguator: row.disambiguator,
+                    degree: row.degree,
+                    top_facts: lines.remove(&row.id).unwrap_or_default(),
+                },
+            )
+        })
+        .collect())
 }
 
 /// 实体的事实摘要行："works at → 星云科技 (2023-01 → now)"，裁决 prompt 与审核 UI 共用。
@@ -1470,8 +1481,26 @@ pub async fn entity_fact_lines(
     entity_id: Uuid,
     limit: i64,
 ) -> AppResult<Vec<String>> {
+    Ok(entity_fact_lines_many(pool, kb_id, &[entity_id], limit)
+        .await?
+        .remove(&entity_id)
+        .unwrap_or_default())
+}
+
+/// The lateral limit applies to each entity, not to the whole page. Keep this
+/// path shared with the single-entity reader used by adjudication.
+async fn entity_fact_lines_many(
+    pool: &PgPool,
+    kb_id: Uuid,
+    entity_ids: &[Uuid],
+    limit: i64,
+) -> AppResult<HashMap<Uuid, Vec<String>>> {
+    if entity_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
     #[derive(sqlx::FromRow)]
     struct Line {
+        entity_id: Uuid,
         direction: String,
         predicate_label: String,
         other_name: Option<String>,
@@ -1483,24 +1512,29 @@ pub async fn entity_fact_lines(
     // 开放陈述（0044）按它照抄的短语读：`phrase` 在关系标签之后、证据众数之前——
     // 类型化行的 phrase 是 NULL，它们的显示一字不变
     let rows: Vec<Line> = sqlx::query_as(&format!(
-        "SELECT CASE WHEN f.subject_id = $2 THEN 'out' ELSE 'in' END AS direction,
+        "SELECT requested.id AS entity_id, line.*
+         FROM unnest($2::uuid[]) AS requested(id)
+         CROSS JOIN LATERAL (
+         SELECT CASE WHEN f.subject_id = requested.id THEN 'out' ELSE 'in' END AS direction,
                 COALESCE(r.label, f.phrase, fact_surface_predicate(f.id)) AS predicate_label,
                 o.canonical_name AS other_name,
-                f.valid_from, f.valid_to
+                f.valid_from, f.valid_to, f.confidence, f.recorded_at
          FROM facts f
          LEFT JOIN relation_types r ON r.id = f.predicate_id
          LEFT JOIN entities o
-           ON o.id = CASE WHEN f.subject_id = $2 THEN f.object_id ELSE f.subject_id END
+           ON o.id = CASE WHEN f.subject_id = requested.id THEN f.object_id ELSE f.subject_id END
          WHERE f.kb_id = $1 AND f.invalidated_at IS NULL
-           AND (f.subject_id = $2 OR f.object_id = $2)
+           AND (f.subject_id = requested.id OR f.object_id = requested.id)
            AND COALESCE(r.label, f.phrase, fact_surface_predicate(f.id)) IS NOT NULL
            AND {not_name}
          ORDER BY f.confidence DESC, f.recorded_at DESC
-         LIMIT $3",
+         LIMIT $3
+         ) line
+         ORDER BY requested.id, line.confidence DESC, line.recorded_at DESC",
         not_name = crate::names::not_a_name("f"),
     ))
     .bind(kb_id)
-    .bind(entity_id)
+    .bind(entity_ids)
     .bind(limit)
     .fetch_all(pool)
     .await?;
@@ -1508,28 +1542,28 @@ pub async fn entity_fact_lines(
     // 本名以外的名字单独打头一行（0041）：「海洋探测器1号」对「海探1」，裁决器要看得见
     // 前者也叫海探1，否则两边的事实各说各的，它只会判「不是同一个」。本名不列——
     // 两个张伟各有一条「known as 张伟」，摆出来像共同证据，其实什么也分不出
-    let also_known_as = crate::names::other_names(pool, entity_id).await?;
-    let head =
-        (!also_known_as.is_empty()).then(|| format!("also known as: {}", also_known_as.join(", ")));
-
-    Ok(head
+    let names = crate::names::other_names_many(pool, entity_ids).await?;
+    let mut lines: HashMap<Uuid, Vec<String>> = names
         .into_iter()
-        .chain(rows.into_iter().map(|l| {
-            let other = l.other_name.unwrap_or_else(|| "?".into());
-            let core = if l.direction == "out" {
-                format!("{} → {}", l.predicate_label, other)
-            } else {
-                format!("{} ← {}", l.predicate_label, other)
-            };
-            match (l.valid_from, l.valid_to) {
-                (Some(f), Some(t)) => {
-                    format!("{core} ({} → {})", f.format("%Y-%m"), t.format("%Y-%m"))
-                }
-                (Some(f), None) => format!("{core} ({} → now)", f.format("%Y-%m")),
-                _ => core,
+        .map(|(id, names)| (id, vec![format!("also known as: {}", names.join(", "))]))
+        .collect();
+    for l in rows {
+        let other = l.other_name.unwrap_or_else(|| "?".into());
+        let core = if l.direction == "out" {
+            format!("{} → {}", l.predicate_label, other)
+        } else {
+            format!("{} ← {}", l.predicate_label, other)
+        };
+        let text = match (l.valid_from, l.valid_to) {
+            (Some(f), Some(t)) => {
+                format!("{core} ({} → {})", f.format("%Y-%m"), t.format("%Y-%m"))
             }
-        }))
-        .collect())
+            (Some(f), None) => format!("{core} ({} → now)", f.format("%Y-%m")),
+            _ => core,
+        };
+        lines.entry(l.entity_id).or_default().push(text);
+    }
+    Ok(lines)
 }
 
 pub(crate) async fn assemble_reviews(
@@ -1537,9 +1571,18 @@ pub(crate) async fn assemble_reviews(
     kb_id: Uuid,
     rows: Vec<ReviewRow>,
 ) -> AppResult<Vec<ReviewItem>> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    // An entity can occur on either side of several pairs. Read it once for
+    // this page, then reuse its summary without changing the review order.
+    let mut entity_ids: Vec<Uuid> = rows.iter().flat_map(|r| [r.left_id, r.right_id]).collect();
+    entity_ids.sort_unstable();
+    entity_ids.dedup();
+    let sides = review_sides(pool, kb_id, &entity_ids).await?;
     // 这一页上开着的建议（0025）：一趟查完，按审核行挂上去
     let ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
-    let proposals: Vec<(Uuid, utopia_core::models::ReviewProposal)> =
+    let proposals: HashMap<Uuid, utopia_core::models::ReviewProposal> =
         sqlx::query_as::<_, (Uuid, Uuid, String, f32, Option<String>)>(
             "SELECT target_id, id, action, confidence, reason FROM agent_decisions
          WHERE target_kind = 'review' AND target_id = ANY($1) AND status = 'proposed'",
@@ -1562,18 +1605,15 @@ pub(crate) async fn assemble_reviews(
         .collect();
     let mut items = Vec::with_capacity(rows.len());
     for r in rows {
-        let proposal = proposals
-            .iter()
-            .find(|(t, _)| *t == r.id)
-            .map(|(_, p)| p.clone());
+        let proposal = proposals.get(&r.id).cloned();
         items.push(ReviewItem {
             id: r.id,
             score: r.score,
             reason: r.reason,
             stage: r.stage,
             created_at: r.created_at,
-            left: review_side(pool, kb_id, r.left_id).await?,
-            right: review_side(pool, kb_id, r.right_id).await?,
+            left: sides.get(&r.left_id).cloned().ok_or(AppError::NotFound)?,
+            right: sides.get(&r.right_id).cloned().ok_or(AppError::NotFound)?,
             proposal,
         });
     }
