@@ -15,6 +15,7 @@
 use crate::graph::{add_evidence, insert_value_fact, Validity};
 use crate::resolution::normalize_name;
 use sqlx::PgPool;
+use std::collections::HashMap;
 use utopia_core::models::{NameView, RelationType};
 use utopia_core::AppResult;
 use uuid::Uuid;
@@ -236,22 +237,41 @@ pub async fn pair_shared_name(
 
 /// 本名以外的现行名字，按首次记下的先后。给裁决器与审阅卡的「又名」那一行
 pub async fn other_names(pool: &PgPool, entity_id: Uuid) -> AppResult<Vec<String>> {
-    let rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT v FROM (
-           SELECT DISTINCT ON (lower(f.object_value->>'value'))
-                  f.object_value->>'value' AS v, f.recorded_at
-             FROM facts f
+    Ok(other_names_many(pool, &[entity_id])
+        .await?
+        .remove(&entity_id)
+        .unwrap_or_default())
+}
+
+/// Keep deduplication and first-seen ordering within each entity. The KB join
+/// lets the existing (kb_id, subject_id) indexes serve even a single-ID lookup.
+pub(crate) async fn other_names_many(
+    pool: &PgPool,
+    entity_ids: &[Uuid],
+) -> AppResult<HashMap<Uuid, Vec<String>>> {
+    if entity_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT entity_id, v FROM (
+           SELECT DISTINCT ON (f.subject_id, lower(f.object_value->>'value'))
+                  f.subject_id AS entity_id, f.object_value->>'value' AS v, f.recorded_at
+             FROM entities e
+             JOIN facts f ON f.subject_id = e.id AND f.kb_id = e.kb_id
              JOIN relation_types r ON r.id = f.predicate_id
-             JOIN entities e ON e.id = f.subject_id
-            WHERE f.subject_id = $1 AND r.builtin AND r.key = $2
+            WHERE e.id = ANY($1) AND r.builtin AND r.key = $2
               AND f.invalidated_at IS NULL
               AND lower(f.object_value->>'value') <> lower(e.canonical_name)
-            ORDER BY lower(f.object_value->>'value'), f.recorded_at
-         ) n ORDER BY n.recorded_at",
+            ORDER BY f.subject_id, lower(f.object_value->>'value'), f.recorded_at
+         ) n ORDER BY n.entity_id, n.recorded_at",
     )
-    .bind(entity_id)
+    .bind(entity_ids)
     .bind(KNOWN_AS)
     .fetch_all(pool)
     .await?;
-    Ok(rows.into_iter().map(|(v,)| v).collect())
+    let mut names: HashMap<Uuid, Vec<String>> = HashMap::new();
+    for (id, name) in rows {
+        names.entry(id).or_default().push(name);
+    }
+    Ok(names)
 }
