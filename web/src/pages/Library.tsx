@@ -21,6 +21,7 @@ import {
 import { useKb, useKbId } from "../kb";
 import { toast } from "../toast";
 import { copyAndSay } from "../clipboard";
+import { pushEndpoint } from "../pushEndpoint";
 import {
   Button,
   Checkbox,
@@ -303,7 +304,7 @@ export function Library() {
   const [adding, setAdding] = useState(false);
   const [editing, setEditing] = useState(false);
   // api 来源密钥弹窗（随时可查看/轮换）
-  const [tokenReveal, setTokenReveal] = useState<{ sourceId: string } | null>(null);
+  const [tokenReveal, setTokenReveal] = useState<{ sourceId: string; kind: string } | null>(null);
   const [cleaning, setCleaning] = useState(false);
   const [reExtracting, setReExtracting] = useState(false);
   const [rebuilding, setRebuilding] = useState(false);
@@ -666,7 +667,7 @@ export function Library() {
               onEdit={() => setEditing(true)}
               onCleanup={() => setCleaning(true)}
               onReExtract={canEdit ? () => setReExtracting(true) : undefined}
-              onToken={() => setTokenReveal({ sourceId: selectedSource.id })}
+              onToken={() => setTokenReveal({ sourceId: selectedSource.id, kind: selectedSource.kind })}
             />
           )}
 
@@ -793,11 +794,11 @@ export function Library() {
       {adding && (
         <SourceModal
           kbId={kb.id}
-          onDone={(id, isApi) => {
+          onDone={(id, pushKind) => {
             setAdding(false);
             if (id) setSelection(id);
-            // api 来源建好直接打开密钥弹窗（onboarding：端点 + 密钥一步拿全）
-            if (id && isApi) setTokenReveal({ sourceId: id });
+            // 推送来源建好直接打开密钥弹窗（onboarding：端点 + 密钥一步拿全）
+            if (id && pushKind) setTokenReveal({ sourceId: id, kind: pushKind });
             invalidate();
           }}
         />
@@ -806,6 +807,7 @@ export function Library() {
         <TokenModal
           kbId={kb.id}
           sourceId={tokenReveal.sourceId}
+          kind={tokenReveal.kind}
           onClose={() => setTokenReveal(null)}
         />
       )}
@@ -1173,10 +1175,12 @@ function ErrorModal({
 function TokenModal({
   kbId,
   sourceId,
+  kind,
   onClose,
 }: {
   kbId: string;
   sourceId: string;
+  kind: string;
   onClose: () => void;
 }) {
   const queryClient = useQueryClient();
@@ -1194,7 +1198,7 @@ function TokenModal({
   });
   const token = tokenQuery.data?.ingest_token ?? null;
 
-  const endpoint = `${location.origin}/api/v1/sources/${sourceId}/ingest`;
+  const endpoint = pushEndpoint(location.origin, sourceId, kind);
   return (
     <Dialog
       open
@@ -1322,7 +1326,8 @@ function SourceModal({
 }: {
   kbId: string;
   /** isApi=true 时父级紧接着打开密钥弹窗 */
-  onDone: (id?: string, isApi?: boolean) => void;
+  /** 第二个参数：建的是推送来源时它的 kind（`api` / `statements`），别的不给 */
+  onDone: (id?: string, pushKind?: string) => void;
 }) {
   const [kind, setKind] = useState<CreatableSourceKind>("folder");
   const [name, setName] = useState("");
@@ -1446,7 +1451,8 @@ function SourceModal({
         ...(syncing ? schedule : { sync_interval_minutes: null, sync_cron: null }),
       });
     },
-    onSuccess: (data) => onDone(data.source.id, kind === "api" || kind === "statements"),
+    onSuccess: (data) =>
+      onDone(data.source.id, kind === "api" || kind === "statements" ? kind : undefined),
   });
 
   const valid =
