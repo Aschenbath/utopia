@@ -19,6 +19,7 @@ pub(crate) mod ontology_routes;
 mod question_routes;
 mod review_routes;
 mod rig_model;
+mod rule_expression_input;
 pub(crate) mod rule_routes;
 mod search_routes;
 mod settings_routes;
