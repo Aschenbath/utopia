@@ -132,8 +132,6 @@ flowchart TB
 
 **The redirect step** is the least intuitive part of the graph and the easiest to delete by mistake. After a merge, the other pending pairs that involve the merged-away entity **must not be closed**; they are redirected to the merge target. The reason follows.
 
-**Reading the review queue.** A nonempty duplicate-review page uses five queries: pairs, entity metadata and degrees, top facts, aliases, and agent proposals. Shared entities are loaded once per page; each keeps its own four-fact limit and separate alias heading. The summary counts contested live facts by joining the distinct endpoints of open conflicts within the knowledge base. A compact partial index supports exact pending-pair totals.
-
 ### Three Holes, One Corpus
 
 Four runs over the first six stories of *The Adventures of Sherlock Holmes* (`scripts/bench/corpora/holmes.json`), each fixing one layer:
