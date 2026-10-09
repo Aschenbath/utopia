@@ -42,11 +42,12 @@ const NOTION_VERSION: &str = "2026-03-11";
 /// 可以有几万页。
 const MAX_PAGES_PER_SYNC: usize = 500;
 
-/// 每页最多取多少个 block。再深的页面截断，比让一次同步卡在一页上好。
+/// 每页所有层级合计最多取多少个 block，包含无文字容器。
+/// 再深的页面截断，比让一次同步卡在一页上好。
 const MAX_BLOCKS_PER_PAGE: usize = 500;
 
 /// 两次请求之间至少隔这么久。Notion 说的是「平均每秒三次」，取 350 毫秒留一点余量：
-/// 500 页的上限下一次同步最坏三分钟出头，比同步失败便宜得多。
+/// 总耗时还取决于每页的嵌套层级与分页数。
 const MIN_INTERVAL: Duration = Duration::from_millis(350);
 /// 一次请求撞上 429 最多等几回。`Retry-After` 通常是个位数秒，连等几回还在限流
 /// 就不是节奏问题了，该把错误交出去。
@@ -82,11 +83,17 @@ fn client(token: &str) -> anyhow::Result<reqwest::Client> {
 struct Paced {
     http: reqwest::Client,
     last: Option<Instant>,
+    // 私有地址入口让 HTTP 测试走真实取页和限流逻辑，不增加用户配置。
+    api_root: String,
 }
 
 impl Paced {
     fn new(http: reqwest::Client) -> Self {
-        Self { http, last: None }
+        Self {
+            http,
+            last: None,
+            api_root: "https://api.notion.com/v1".into(),
+        }
     }
 
     /// 发一次请求并解析 JSON。`what` 进日志和错误文案（"search" / "blocks"）。
@@ -160,9 +167,22 @@ fn retry_after(header: Option<&str>) -> Duration {
 ///
 /// **只搜页面，不搜 data source。** 后者是表格的容器，它自己没有正文；
 /// 表格里的每一行是一个页面，会在同一次搜索里出现。
-pub async fn fetch(token: &str, query: Option<&str>) -> anyhow::Result<(Vec<NotionPage>, bool)> {
+///
+/// 第三项是正文没读出来的页，每页一句原因。它们不在第一项里，见 `fetch_pages`。
+pub async fn fetch(
+    token: &str,
+    query: Option<&str>,
+) -> anyhow::Result<(Vec<NotionPage>, bool, Vec<String>)> {
     let mut http = Paced::new(client(token)?);
+    fetch_pages(&mut http, query).await
+}
+
+async fn fetch_pages(
+    http: &mut Paced,
+    query: Option<&str>,
+) -> anyhow::Result<(Vec<NotionPage>, bool, Vec<String>)> {
     let mut out = Vec::new();
+    let mut unread: Vec<String> = Vec::new();
     let mut cursor: Option<String> = None;
     let mut truncated = false;
 
@@ -178,11 +198,8 @@ pub async fn fetch(token: &str, query: Option<&str>) -> anyhow::Result<(Vec<Noti
             body["start_cursor"] = serde_json::Value::String(c.clone());
         }
 
-        let v = http
-            .send("search", |c| {
-                c.post("https://api.notion.com/v1/search").json(&body)
-            })
-            .await?;
+        let url = format!("{}/search", http.api_root);
+        let v = http.send("search", |c| c.post(&url).json(&body)).await?;
 
         for p in v["results"].as_array().unwrap_or(&vec![]).clone() {
             // 回收站里的和归档的都不要——它们在界面上已经不算数了
@@ -195,10 +212,18 @@ pub async fn fetch(token: &str, query: Option<&str>) -> anyhow::Result<(Vec<Noti
             }
             let Some(id) = p["id"].as_str() else { continue };
             let title = page_title(&p);
-            let text = page_text(&mut http, id).await.unwrap_or_else(|e| {
-                tracing::warn!(%id, error = %e, "notion page body could not be read, keeping the title only");
-                String::new()
-            });
+            // 正文读不出来的页整页跳过：不摄入，库里已有的正文原样留着，不拿仅标题的
+            // 版本去替换它。**其余的页照常同步**——中止整轮是另一头的错：有的页永远
+            // 读不出来（嵌套块没共享给 integration，Notion 回 404），那样整个来源
+            // 就再也不动了。对象存储的目录占位符是同一个教训（#214）。
+            let text = match page_text(http, id).await {
+                Ok(text) => text,
+                Err(error) => {
+                    tracing::warn!(%id, error = %format!("{error:#}"), "notion page body could not be read, leaving the stored page as it is");
+                    unread.push(format!("notion page {id}: {error:#}"));
+                    continue;
+                }
+            };
 
             out.push(NotionPage {
                 external_key: format!("notion://{id}"),
@@ -219,7 +244,7 @@ pub async fn fetch(token: &str, query: Option<&str>) -> anyhow::Result<(Vec<Noti
             break;
         }
     }
-    Ok((out, truncated))
+    Ok((out, truncated, unread))
 }
 
 /// 页面标题。
@@ -251,24 +276,58 @@ fn page_title(page: &serde_json::Value) -> String {
 /// 取一页的正文，逐层展开 block。
 async fn page_text(http: &mut Paced, page_id: &str) -> anyhow::Result<String> {
     let mut out = String::new();
-    let mut n = 0usize;
+    let mut block_count = 0;
+    append_children(http, page_id, &mut out, &mut block_count).await?;
+    Ok(out)
+}
+
+/// 每个父块独立分页，先写父块，再读完子树，最后继续兄弟块。
+/// 输出和预算由整页共享；递归深度也受同一块数上限约束。
+async fn append_children(
+    http: &mut Paced,
+    parent_id: &str,
+    out: &mut String,
+    block_count: &mut usize,
+) -> anyhow::Result<()> {
     let mut cursor: Option<String> = None;
 
-    loop {
-        let mut url = format!("https://api.notion.com/v1/blocks/{page_id}/children?page_size=100");
+    while *block_count < MAX_BLOCKS_PER_PAGE {
+        let mut url = format!(
+            "{}/blocks/{parent_id}/children?page_size=100",
+            http.api_root
+        );
         if let Some(c) = &cursor {
             url.push_str(&format!("&start_cursor={c}"));
         }
         let v = http.send("blocks", |c| c.get(&url)).await?;
 
         for b in v["results"].as_array().unwrap_or(&vec![]) {
-            if n >= MAX_BLOCKS_PER_PAGE {
-                return Ok(out);
+            if *block_count >= MAX_BLOCKS_PER_PAGE {
+                return Ok(());
             }
-            n += 1;
+            *block_count += 1;
             if let Some(line) = render_block(b) {
                 out.push_str(&line);
                 out.push('\n');
+            }
+            // 不能因父块没有 rich_text 而跳过 column 等容器。
+            // 独立页面由 search 单独摄入，数据库也不是父页正文的一部分。
+            let independent_content =
+                matches!(b["type"].as_str(), Some("child_page" | "child_database"));
+            if *block_count < MAX_BLOCKS_PER_PAGE
+                && b["has_children"].as_bool() == Some(true)
+                && !independent_content
+            {
+                let id = b["id"]
+                    .as_str()
+                    .context("notion blocks: child block is missing id")?;
+                if b["type"].as_str() == Some("table") {
+                    let mut rows = String::new();
+                    Box::pin(append_children(http, id, &mut rows, block_count)).await?;
+                    out.push_str(&render_table(&b["table"], &rows)?);
+                } else {
+                    Box::pin(append_children(http, id, out, block_count)).await?;
+                }
             }
         }
         if v["has_more"].as_bool() != Some(true) {
@@ -279,14 +338,14 @@ async fn page_text(http: &mut Paced, page_id: &str) -> anyhow::Result<String> {
             break;
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 /// 把一个 block 渲染成一行文本。
 ///
 /// **认不出的类型返回它的纯文本而不是丢掉。** Notion 的 block 类型一直在加，
-/// 硬编码一张白名单意味着新类型静默消失；而所有带文字的 block 都把文字放在
-/// `{type}.rich_text` 下，这个形状很稳。
+/// 硬编码一张白名单意味着新类型静默消失；普通文字在 `{type}.rich_text`，
+/// 表格行则按 `table_row.cells` 保留每个单元格。
 fn render_block(b: &serde_json::Value) -> Option<String> {
     let t = b["type"].as_str()?;
     let inner = &b[t];
@@ -307,6 +366,20 @@ fn render_block(b: &serde_json::Value) -> Option<String> {
             let lang = inner["language"].as_str().unwrap_or("");
             format!("```{lang}\n{text}\n```")
         }
+        "table_row" => {
+            let cells = inner["cells"].as_array()?;
+            let cells: Vec<String> = cells
+                .iter()
+                .map(|cell| {
+                    rich_text(cell)
+                        .replace('\\', "\\\\")
+                        .replace('|', "\\|")
+                        .replace("\r\n", "\n")
+                        .replace(['\r', '\n'], "<br>")
+                })
+                .collect();
+            format!("| {} |", cells.join(" | "))
+        }
         // 分割线与图片没有 rich_text，但它们在正文里也没有信息量
         "divider" | "image" | "video" | "file" => return None,
         // child_page 的标题在 `title` 而不是 rich_text
@@ -314,6 +387,34 @@ fn render_block(b: &serde_json::Value) -> Option<String> {
         _ if text.trim().is_empty() => return None,
         _ => text,
     })
+}
+
+/// 无列头的表用空表头占位，不能把第一条数据误标为列头。
+fn render_table(table: &serde_json::Value, rows: &str) -> anyhow::Result<String> {
+    if rows.is_empty() {
+        return Ok(String::new());
+    }
+    let width = table["table_width"]
+        .as_u64()
+        .context("notion table: missing column count")?;
+    let width = usize::try_from(width)?;
+    anyhow::ensure!(width > 0, "notion table: column count must be positive");
+    let has_header = table["has_column_header"].as_bool() == Some(true);
+    let separator = format!("|{}\n", " --- |".repeat(width));
+    let mut out = String::from("\n");
+    if !has_header {
+        out.push_str(&format!("|{}\n", "  |".repeat(width)));
+        out.push_str(&separator);
+    }
+    for (index, row) in rows.lines().enumerate() {
+        out.push_str(row);
+        out.push('\n');
+        if index == 0 && has_header {
+            out.push_str(&separator);
+        }
+    }
+    out.push('\n');
+    Ok(out)
 }
 
 /// rich_text 数组拼成纯文本。
@@ -340,6 +441,14 @@ fn slug(title: &str) -> String {
         s.chars().take(60).collect()
     }
 }
+
+#[cfg(test)]
+#[path = "notion_tests.rs"]
+mod traversal_tests;
+
+#[cfg(test)]
+#[path = "notion_resync_tests.rs"]
+mod resync_tests;
 
 #[cfg(test)]
 mod tests {
@@ -424,7 +533,7 @@ mod tests {
             eprintln!("跳过：未设 UTOPIA_NOTION_TEST_TOKEN");
             return Ok(());
         };
-        let (pages, _) = fetch(&token, None).await?;
+        let (pages, _, _) = fetch(&token, None).await?;
         assert!(
             !pages.is_empty(),
             "一页都没有——integration 可能没有被分享任何页面"

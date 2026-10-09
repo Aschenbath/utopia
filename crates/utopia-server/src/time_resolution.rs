@@ -13,12 +13,16 @@
 //!    没有一个时间词写在代码里（决定 8）。写明的日期是 A 级，从文档自己给的锚点算出来的是
 //!    B 级，锚不到的是 C 级——C 级什么也不写，等锚点（决定 4、6）。
 //! 4. 结果落到开放陈述的 `valid_from` / `valid_to`（决定 5 的第一根轴），时间轴上才有它。
+//!
+//! 例外只长在推送的陈述上（0054 来源）：`when` / `ended` 写的是完整日期或带区时刻时，
+//! 载荷就已经是结构化的绝对值——结构化的时间戳不是时间词（0045 决定 8，#1089），代码
+//! 直接读成解释，不送模型；没有对话模型时，代码读得动的照解，读不动的留 C，任务照常收工。
 
 use crate::extraction::chat_retrying_rate_limits_at;
 use crate::llm_util;
 use crate::state::AppState;
 use chrono::{DateTime, Duration, Months, NaiveDate, NaiveTime, TimeZone, Utc};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use utopia_extract::time::{
     build_interpretation_messages, headings_at, now_in_force, parse_interpretation_response,
     Anchor, DateParts, Direction, DocumentDating, Granularity, Interpretation, MentionInput,
@@ -232,7 +236,7 @@ fn anchor_time(
     }
 }
 
-/// 一条解释 → 世界轴位置。`earlier` 是同一批里已经算出来的提及（锚点指着它们）。
+/// 一条解释 → 世界轴位置。`earlier` 是同一文档里已经算出来的提及（锚点指着它们）。
 fn resolve_one(
     interp: &Interpretation,
     ctx: &DocumentDating,
@@ -347,6 +351,89 @@ fn resolve_one(
     }
 }
 
+/// 计算已收到的解释；每条解释使用它自己的章节上下文。
+fn resolve_interpretations(
+    interpretations: &[Interpretation],
+    context_for: impl Fn(i64) -> DocumentDating,
+) -> HashMap<i64, Resolved> {
+    let mut resolved = HashMap::new();
+    let mut pending: Vec<&Interpretation> = interpretations.iter().collect();
+    while !pending.is_empty() {
+        let before = pending.len();
+        pending.retain(|interp| {
+            let r = resolve_one(interp, &context_for(interp.id), &resolved);
+            if r == UNRESOLVED {
+                return true;
+            }
+            resolved.insert(interp.id, r);
+            false
+        });
+        // 每轮至少解开一条才继续；循环、自引用、缺失或不可用的锚点都在无进展时留下 C。
+        // 不能固定遍数：模型回复可以把任意长的依赖链倒着写。
+        if pending.len() == before {
+            break;
+        }
+    }
+    for interp in pending {
+        resolved.insert(interp.id, UNRESOLVED);
+    }
+    resolved
+}
+
+/// 算的时候文档的日期换成提及所在那一节的起算点。
+fn context_at(context: &DocumentDating, now: Option<usize>) -> DocumentDating {
+    let mut scoped = context.clone();
+    if let Some(entry) = now.and_then(|i| context.entries.get(i)) {
+        scoped.date = Some(entry.from.clone());
+        scoped.date_words = Some(entry.words.clone());
+    }
+    scoped
+}
+
+/// 推送的陈述把 `when` / `ended` 写成完整日期或带区时刻时，这里就把它读成一条解释
+/// （#1089；0045 决定 8：结构化的时间戳不是时间词）。形状是点、参照是照写的绝对值、
+/// 粒度是字写到的那一级——与模型对同样的字该给的回答一致。`from` 存换算成 UTC 后的
+/// 部件：`DateParts` 不带区，偏移在 `parse_time` 里已经折进值里；存 UTC 部件的解释
+/// 再算一遍得到同一个值，存原样的本地钟点反而会读出另一个时刻。
+///
+/// 只收 `parse_time` 读到「日」或更细的：`YYYY-MM-DD` 与带 `Z` 或偏移的
+/// `YYYY-MM-DDTHH[:MM[:SS]]`。光杆的年、年月、以及任何读不动的字都回 `None`，
+/// 照旧走模型那条路——这一刀不替代码认时间词。
+fn stated_reading(text: &str, id: i64) -> Option<Interpretation> {
+    let (t, precision) = utopia_extract::parse_time(text)?;
+    use chrono::{Datelike, Timelike};
+    let (granularity, hour, minute, second) = match precision {
+        "day" => (Granularity::Day, None, None, None),
+        "hour" => (Granularity::Hour, Some(t.hour()), None, None),
+        "minute" => (Granularity::Minute, Some(t.hour()), Some(t.minute()), None),
+        "second" => (
+            Granularity::Second,
+            Some(t.hour()),
+            Some(t.minute()),
+            Some(t.second()),
+        ),
+        // 光杆的年、年月不在这刀里（#1089 的界），退回 None 让模型读
+        _ => return None,
+    };
+    Some(Interpretation {
+        id,
+        shape: Shape::Point,
+        reference: Reference::Absolute {
+            from: DateParts {
+                year: t.year(),
+                quarter: None,
+                month: Some(t.month()),
+                day: Some(t.day()),
+                hour,
+                minute,
+                second,
+            },
+            to: None,
+        },
+        granularity,
+    })
+}
+
 /// 一条陈述的起与止：`when` 给起（点与区间也给止），`ended` 给止。
 fn combine(when: Option<Resolved>, ended: Option<Resolved>) -> Resolved {
     let mut r = when.unwrap_or(UNRESOLVED);
@@ -373,11 +460,17 @@ pub async fn resolve_document(state: &AppState, document_id: Uuid) -> anyhow::Re
         return Ok(());
     }
     let kb = utopia_store::kbs::get(pool, doc.kb_id).await?;
-    let settings = utopia_store::settings::get(pool, kb.workspace_id)
+    let settings = utopia_store::settings::get(pool, kb.workspace_id).await?;
+    let client = settings.as_ref().and_then(llm_util::chat_client);
+    // 推送来的陈述（0054）：`when` / `ended` 写的完整日期或带区时刻由代码直接读（#1089），
+    // 没有对话模型也照常解；别的文档照旧——没有对话模型，这一步就没有替它读字的人
+    let pushed = crate::pipeline::source_kind(state, doc.source_id)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("Chat model not configured; cannot resolve time"))?;
-    let client = llm_util::chat_client(&settings)
-        .ok_or_else(|| anyhow::anyhow!("Chat model not configured; cannot resolve time"))?;
+        .as_deref()
+        == Some("statements");
+    if !pushed && client.is_none() {
+        anyhow::bail!("Chat model not configured; cannot resolve time");
+    }
 
     // 1. 文档时间上下文：抽取时各块报上来的（0064）。这里不问模型
     let context: DocumentDating = match doc.time_context.clone() {
@@ -465,107 +558,105 @@ pub async fn resolve_document(state: &AppState, document_id: Uuid) -> anyhow::Re
     let mut distinct: Vec<Key> = Vec::new();
     let mut index: HashMap<Key, usize> = HashMap::new();
     let mut key_of: HashMap<Uuid, Key> = HashMap::new();
+    // 推送来的陈述（0054）：载荷写的完整日期或带区时刻由代码读成解释（#1089）。
+    // 解释与别的提及同去同回，只是它从不进问模型的清单——重问也只能是这个答案，
+    // 代码读过的不许模型盖掉；判据是文档来自 `statements` 来源，不是字长得像日期，
+    // 普通文档里同样的字照旧交给模型
+    let mut presolved: HashMap<usize, Interpretation> = HashMap::new();
     for m in &mentions {
         let key = (m.text.clone(), m.sentence.clone(), now_of(m));
         key_of.insert(m.id, key.clone());
-        if !index.contains_key(&key) {
-            index.insert(key.clone(), distinct.len());
-            distinct.push(key);
+        if index.contains_key(&key) {
+            continue;
+        }
+        index.insert(key.clone(), distinct.len());
+        distinct.push(key);
+        if pushed {
+            if let Some(interp) = stated_reading(&m.text, (distinct.len() - 1) as i64) {
+                presolved.insert(distinct.len() - 1, interp);
+            }
         }
     }
-    // 算的时候文档的日期换成那一节的起算点
-    let context_at = |now: Option<usize>| -> DocumentDating {
-        let mut c = context.clone();
-        if let Some(e) = now.and_then(|i| context.entries.get(i)) {
-            c.date = Some(e.from.clone());
-            c.date_words = Some(e.words.clone());
-        }
-        c
-    };
     let ctx = TimeContext {
         date: context.date.as_ref(),
         date_words: context.date_words.as_deref(),
         periods: &context.periods,
         fiscal_year_end: context.fiscal_year_end,
     };
-    let mut resolved: HashMap<usize, (Interpretation, Resolved)> = HashMap::new();
+    let mut interpretations: Vec<Interpretation> = presolved.values().cloned().collect();
+    let mut received = HashSet::new();
     let mut malformed = 0usize;
     // 问两轮：第一轮全部，第二轮只问第一轮没答到的。模型漏答的提及从前就留着字、没有解释，
-    // 也没有人再问（测量台上的「上周」三遍都是这样）
-    let mut todo: Vec<usize> = (0..distinct.len()).collect();
-    for round in 0..2 {
-        if round == 1 {
-            todo.retain(|i| !resolved.contains_key(i));
-            if todo.is_empty() {
-                break;
-            }
-            tracing::info!(%document_id, unanswered = todo.len(), "时间解释有没答到的，再问一次");
-        }
-        for batch in todo.clone().chunks(BATCH) {
-            let inputs: Vec<MentionInput<'_>> = batch
-                .iter()
-                .map(|&i| MentionInput {
-                    id: i as i64,
-                    text: &distinct[i].0,
-                    sentence: &distinct[i].1,
-                })
-                .collect();
-            let ids: Vec<i64> = inputs.iter().map(|m| m.id).collect();
-            let messages = build_interpretation_messages(&ctx, &inputs);
-            let reply = match chat_retrying_rate_limits_at(
-                state,
-                &settings,
-                &client,
-                &messages,
-                Some(0.0),
-            )
-            .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!(%document_id, error = %e, "时间解释调用失败，这一批留作未解析");
-                    continue;
+    // 也没有人再问（测量台上的「上周」三遍都是这样）。代码已经读出答案的不问
+    let mut todo: Vec<usize> = (0..distinct.len())
+        .filter(|i| !presolved.contains_key(i))
+        .collect();
+    if let (Some(settings), Some(client)) = (settings.as_ref(), client.as_ref()) {
+        for round in 0..2 {
+            if round == 1 {
+                todo.retain(|i| !received.contains(&(*i as i64)));
+                if todo.is_empty() {
+                    break;
                 }
-            };
-            let (interps, skipped) = match parse_interpretation_response(&reply.text, &ids) {
-                Ok(x) => x,
-                Err(e) => {
-                    tracing::warn!(%document_id, error = %e, "时间解释回复解析失败，这一批留作未解析");
-                    continue;
-                }
-            };
-            malformed += skipped;
-            if skipped > 0 {
-                // 坏条目要看得见是哪一条、坏在哪：只报一个数的话，「上周」三遍都没日期也查不出原因
-                tracing::warn!(%document_id, skipped, reply = %reply.text.chars().take(600).collect::<String>(), "时间解释里有读不了的条目");
+                tracing::info!(%document_id, unanswered = todo.len(), "时间解释有没答到的，再问一次");
             }
-            // 两遍：先算不靠别的提及的，再算指着别的提及的
-            let mut earlier: HashMap<i64, Resolved> = HashMap::new();
-            let anchored_to_mention = |i: &Interpretation| {
-                matches!(
-                    &i.reference,
-                    Reference::Anchored {
-                        anchor: Anchor::Mention { .. },
-                        ..
-                    }
-                )
-            };
-            for pass in 0..2 {
-                for interp in interps
+            for batch in todo.clone().chunks(BATCH) {
+                let inputs: Vec<MentionInput<'_>> = batch
                     .iter()
-                    .filter(|i| anchored_to_mention(i) == (pass == 1))
+                    .map(|&i| MentionInput {
+                        id: i as i64,
+                        text: &distinct[i].0,
+                        sentence: &distinct[i].1,
+                    })
+                    .collect();
+                let ids: Vec<i64> = inputs.iter().map(|m| m.id).collect();
+                let messages = build_interpretation_messages(&ctx, &inputs);
+                let reply = match chat_retrying_rate_limits_at(
+                    state,
+                    settings,
+                    client,
+                    &messages,
+                    Some(0.0),
+                )
+                .await
                 {
-                    let now = usize::try_from(interp.id)
-                        .ok()
-                        .and_then(|i| distinct.get(i))
-                        .and_then(|k| k.2);
-                    let r = resolve_one(interp, &context_at(now), &earlier);
-                    earlier.insert(interp.id, r);
-                    if let Ok(i) = usize::try_from(interp.id) {
-                        resolved.insert(i, (interp.clone(), r));
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::warn!(%document_id, error = %e, "时间解释调用失败，这一批留作未解析");
+                        continue;
                     }
+                };
+                let (interps, skipped) = match parse_interpretation_response(&reply.text, &ids) {
+                    Ok(x) => x,
+                    Err(e) => {
+                        tracing::warn!(%document_id, error = %e, "时间解释回复解析失败，这一批留作未解析");
+                        continue;
+                    }
+                };
+                malformed += skipped;
+                if skipped > 0 {
+                    // 坏条目要看得见是哪一条、坏在哪：只报一个数的话，「上周」三遍都没日期也查不出原因
+                    tracing::warn!(%document_id, skipped, reply = %reply.text.chars().take(600).collect::<String>(), "时间解释里有读不了的条目");
                 }
+                received.extend(interps.iter().map(|interp| interp.id));
+                interpretations.extend(interps);
             }
+        }
+    }
+    // 收到解释和算出日期是两件事：补答只问没收到的，计算则看全部批次和补答里的解释。
+    // 这样下游不用再问模型，也能用上后一批或补答才给出的锚点。
+    let computed = resolve_interpretations(&interpretations, |id| {
+        let now = usize::try_from(id)
+            .ok()
+            .and_then(|i| distinct.get(i))
+            .and_then(|key| key.2);
+        context_at(&context, now)
+    });
+    let mut resolved: HashMap<usize, (Interpretation, Resolved)> = HashMap::new();
+    for interp in interpretations {
+        if let Ok(i) = usize::try_from(interp.id) {
+            let r = computed[&interp.id];
+            resolved.insert(i, (interp, r));
         }
     }
 
@@ -577,7 +668,23 @@ pub async fn resolve_document(state: &AppState, document_id: Uuid) -> anyhow::Re
             continue;
         };
         let Some((interp, r)) = resolved.get(&i) else {
-            // 这一批没答到：留着字，不写等级（下次重跑再问）
+            // 推送的文档没有对话模型可问（#1089）：代码读不动的提及按 C 记——「有提及、
+            // 没能放上轴」和「没有时间词」要分得出；任务照常收工，不因一个没配的模型
+            // 留下永远失败的任务。解释列留空：没有人读过它，不编一条出来
+            if pushed && client.is_none() {
+                utopia_store::time_mentions::set_resolution(
+                    pool, m.id, "C", None, None, None, None,
+                )
+                .await?;
+                c += 1;
+                let slot = per_fact.entry(m.fact_id).or_insert((None, None));
+                if m.role == "ended" {
+                    slot.1 = Some(UNRESOLVED);
+                } else {
+                    slot.0 = Some(UNRESOLVED);
+                }
+            }
+            // 有模型而没答到的：留着字，不写等级（下次重跑再问）
             continue;
         };
         utopia_store::time_mentions::set_interpretation(
@@ -642,6 +749,17 @@ pub async fn resolve_document(state: &AppState, document_id: Uuid) -> anyhow::Re
     Ok(())
 }
 
+/// 见证的名字：日期的名字加它的字（「提报日期 2026年9月4日」）。没有名字的光是字；封面上
+/// 一个光秃秃的日期，模型常把日期自己又填成名字，那就只写一遍
+fn witness_name(name: &str, words: &str) -> String {
+    let (name, words) = (name.trim(), words.trim());
+    if name.is_empty() || name == words {
+        words.to_string()
+    } else {
+        format!("{name} {words}")
+    }
+}
+
 /// 这篇文档的陈述各由它所在那一节里文本说话的那一刻作证（0064 决定 3）。
 ///
 /// 一条陈述在哪一节，看它的引文在它那一块里的位置、那一块正文里的标题；管着它的是范围
@@ -680,12 +798,7 @@ async fn attest_statements(
         let path = headings_at(&text, usize::try_from(start.unwrap_or(0)).unwrap_or(0));
         let witness = now_in_force(&context.entries, &path).and_then(|now| {
             let (at, _) = parts_to_time(&now.from)?;
-            let by = if now.name.is_empty() {
-                now.words.clone()
-            } else {
-                format!("{} {}", now.name, now.words)
-            };
-            Some((at, by))
+            Some((at, witness_name(&now.name, &now.words)))
         });
         // 每条证据记下自己这一节的日期（没说的记成空）：事实上只留最早的那一个，证据所在
         // 的文档删了之后要照还在的证据重算，得知道每一条各是哪天
@@ -728,8 +841,83 @@ mod context_tests;
 mod attestation_tests;
 
 #[cfg(test)]
+#[path = "time_resolution_pushed_tests.rs"]
+mod pushed_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 推送载荷里写明的值（#1089）：完整日期与带区时刻读成点状绝对解释，精度随字；
+    /// 光杆的年、年月、读不动的字都回 None——不替代码认时间词
+    #[test]
+    fn a_stated_value_reads_at_the_precision_it_writes() {
+        let read = |s: &str| {
+            let interp = stated_reading(s, 0)?;
+            let Reference::Absolute { from, to } = interp.reference else {
+                return None;
+            };
+            assert_eq!(interp.shape, Shape::Point);
+            assert!(to.is_none());
+            Some((from, interp.granularity))
+        };
+        let date = |y, m, d, h, mi, s| DateParts {
+            year: y,
+            quarter: None,
+            month: Some(m),
+            day: Some(d),
+            hour: h,
+            minute: mi,
+            second: s,
+        };
+        assert_eq!(
+            read("2026-09-23"),
+            Some((date(2026, 9, 23, None, None, None), Granularity::Day))
+        );
+        assert_eq!(
+            read("2026-09-23T08Z"),
+            Some((date(2026, 9, 23, Some(8), None, None), Granularity::Hour))
+        );
+        assert_eq!(
+            read("2026-09-23T08:14Z"),
+            Some((
+                date(2026, 9, 23, Some(8), Some(14), None),
+                Granularity::Minute
+            ))
+        );
+        assert_eq!(
+            read("2026-09-23T08:14:03Z"),
+            Some((
+                date(2026, 9, 23, Some(8), Some(14), Some(3)),
+                Granularity::Second
+            ))
+        );
+        // 偏移折进值里：+08:00 的 08:14 是 UTC 的 00:14
+        assert_eq!(
+            read("2026-09-23T08:14:03+08:00"),
+            Some((
+                date(2026, 9, 23, Some(0), Some(14), Some(3)),
+                Granularity::Second
+            ))
+        );
+        // 这一刀之外的字：光杆的年、年月、自然语言
+        for s in ["2026", "2026-09", "last Tuesday", "ended", ""] {
+            assert!(read(s).is_none(), "{s:?} is not code-resolved");
+        }
+    }
+
+    #[test]
+    fn a_bare_date_is_named_once() {
+        assert_eq!(
+            witness_name("提报日期", "2026年9月4日"),
+            "提报日期 2026年9月4日"
+        );
+        assert_eq!(witness_name("", "2024年10月10日"), "2024年10月10日");
+        assert_eq!(
+            witness_name("2024年10月10日", " 2024年10月10日"),
+            "2024年10月10日"
+        );
+    }
     use utopia_extract::time::NamedPeriod;
 
     fn parts(y: i32, m: Option<u32>, d: Option<u32>) -> DateParts {
@@ -759,6 +947,268 @@ mod tests {
             fiscal_year_end: Some((1, 25)),
             skipped: 0,
         }
+    }
+
+    fn day_point(date: &str, grade: &'static str) -> Resolved {
+        Resolved {
+            from: Some(at(date)),
+            from_p: Some("day"),
+            to: Some(at(date)),
+            to_p: Some("day"),
+            grade,
+        }
+    }
+
+    fn absolute_day(id: i64) -> Interpretation {
+        Interpretation {
+            id,
+            shape: Shape::Point,
+            reference: Reference::Absolute {
+                from: parts(2024, Some(1), Some(1)),
+                to: None,
+            },
+            granularity: Granularity::Day,
+        }
+    }
+
+    fn next_day(id: i64, anchor_id: i64) -> Interpretation {
+        Interpretation {
+            reference: Reference::Anchored {
+                anchor: Anchor::Mention { id: anchor_id },
+                offset: Some(Offset {
+                    count: 1,
+                    unit: Unit::Day,
+                    direction: Direction::After,
+                }),
+            },
+            ..absolute_day(id)
+        }
+    }
+
+    #[test]
+    fn mention_dependencies_resolve_in_all_reply_orders() {
+        let items = [
+            serde_json::json!([0, "point", {"kind": "absolute", "from": {"y": 2024, "m": 1, "d": 1}}, "day"]),
+            serde_json::json!([1, "point", {"kind": "anchored", "anchor": {"kind": "mention", "id": 0}, "offset": {"count": 1, "unit": "day", "direction": "after"}}, "day"]),
+            serde_json::json!([2, "point", {"kind": "anchored", "anchor": {"kind": "mention", "id": 1}, "offset": {"count": 1, "unit": "day", "direction": "after"}}, "day"]),
+        ];
+        let expected = HashMap::from([
+            (0, day_point("2024-01-01T00:00:00Z", "A")),
+            (1, day_point("2024-01-02T00:00:00Z", "B")),
+            (2, day_point("2024-01-03T00:00:00Z", "B")),
+        ]);
+        for order in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let reply = serde_json::json!({"m": order.map(|i| items[i].clone())});
+            let (interpretations, skipped) =
+                parse_interpretation_response(&reply.to_string(), &[0, 1, 2]).unwrap();
+            assert_eq!(skipped, 0);
+            assert_eq!(interpretations.len(), 3);
+            let resolved = resolve_interpretations(&interpretations, |_| DocumentDating::default());
+            assert_eq!(resolved, expected, "reply order: {order:?}");
+        }
+    }
+
+    #[test]
+    fn a_long_reverse_chain_does_not_follow_numeric_ids_or_a_fixed_pass_limit() {
+        // 编号上下交错，与依赖次序无关；链长也超过一批的大小。
+        let ids: Vec<i64> = (0..81).map(|depth| 500 + (depth * 37) % 101).collect();
+        let mut interpretations = vec![absolute_day(ids[0])];
+        for pair in ids.windows(2) {
+            interpretations.push(next_day(pair[1], pair[0]));
+        }
+        interpretations.reverse();
+        let resolved = resolve_interpretations(&interpretations, |_| DocumentDating::default());
+        assert_eq!(resolved.len(), ids.len());
+        for (depth, id) in ids.iter().enumerate() {
+            let date = at("2024-01-01T00:00:00Z") + Duration::days(depth as i64);
+            assert_eq!(
+                resolved[id],
+                Resolved {
+                    from: Some(date),
+                    from_p: Some("day"),
+                    to: Some(date),
+                    to_p: Some("day"),
+                    grade: if depth == 0 { "A" } else { "B" },
+                },
+                "depth {depth}, id {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn independent_chains_resolve_while_cycles_and_missing_anchors_stay_unresolved() {
+        let second_root = Interpretation {
+            reference: Reference::Absolute {
+                from: parts(2025, Some(6), Some(10)),
+                to: None,
+            },
+            ..absolute_day(20)
+        };
+        let interpretations = [
+            next_day(2, 1),
+            next_day(30, 30), // 自引用
+            next_day(31, 32),
+            next_day(32, 31),  // 循环
+            next_day(33, 999), // 缺失的解释
+            next_day(34, 31),  // 依赖循环的下游
+            next_day(22, 21),
+            next_day(1, 0),
+            next_day(21, 20),
+            second_root,
+            absolute_day(0),
+        ];
+        let resolved = resolve_interpretations(&interpretations, |_| ctx_dated(2030, 1, 1));
+        assert_eq!(
+            resolved,
+            HashMap::from([
+                (0, day_point("2024-01-01T00:00:00Z", "A")),
+                (1, day_point("2024-01-02T00:00:00Z", "B")),
+                (2, day_point("2024-01-03T00:00:00Z", "B")),
+                (20, day_point("2025-06-10T00:00:00Z", "A")),
+                (21, day_point("2025-06-11T00:00:00Z", "B")),
+                (22, day_point("2025-06-12T00:00:00Z", "B")),
+                (30, UNRESOLVED),
+                (31, UNRESOLVED),
+                (32, UNRESOLVED),
+                (33, UNRESOLVED),
+                (34, UNRESOLVED),
+            ])
+        );
+    }
+
+    #[test]
+    fn received_interpretations_can_use_anchors_from_later_batches_and_the_makeup_reply() {
+        let first_reply = r#"{"m": [
+            [2, "point", {"kind": "anchored", "anchor": {"kind": "mention", "id": 1}, "offset": {"count": 1, "unit": "day", "direction": "after"}}, "day"],
+            [1, "point", {"kind": "anchored", "anchor": {"kind": "mention", "id": 40}, "offset": {"count": 1, "unit": "day", "direction": "after"}}, "day"]
+        ]}"#;
+        let (mut interpretations, skipped) =
+            parse_interpretation_response(first_reply, &[0, 1, 2]).unwrap();
+        assert_eq!(skipped, 0);
+        let before = resolve_interpretations(&interpretations, |_| DocumentDating::default());
+        assert_eq!(before, HashMap::from([(1, UNRESOLVED), (2, UNRESOLVED)]));
+        assert!(!before.contains_key(&0), "未回答与已回答但未解析的提及不同");
+
+        let later_batch = r#"{"m": [
+            [40, "point", {"kind": "anchored", "anchor": {"kind": "mention", "id": 0}, "offset": {"count": 1, "unit": "day", "direction": "after"}}, "day"]
+        ]}"#;
+        let (later, skipped) = parse_interpretation_response(later_batch, &[40]).unwrap();
+        assert_eq!(skipped, 0);
+        interpretations.extend(later);
+        let still_waiting =
+            resolve_interpretations(&interpretations, |_| DocumentDating::default());
+        assert_eq!(still_waiting[&2], UNRESOLVED);
+
+        let makeup_reply = r#"{"m": [
+            [0, "point", {"kind": "absolute", "from": {"y": 2024, "m": 1, "d": 1}}, "day"]
+        ]}"#;
+        let (makeup, skipped) = parse_interpretation_response(makeup_reply, &[0]).unwrap();
+        assert_eq!(skipped, 0);
+        interpretations.extend(makeup);
+        let after = resolve_interpretations(&interpretations, |_| DocumentDating::default());
+        assert_eq!(
+            after,
+            HashMap::from([
+                (0, day_point("2024-01-01T00:00:00Z", "A")),
+                (40, day_point("2024-01-02T00:00:00Z", "B")),
+                (1, day_point("2024-01-03T00:00:00Z", "B")),
+                (2, day_point("2024-01-04T00:00:00Z", "B")),
+            ])
+        );
+    }
+
+    #[test]
+    fn dependency_resolution_keeps_each_mentions_section_context() {
+        let mut context = ctx_dated(2030, 1, 1);
+        for (section, year) in [("First report", 2024), ("Second report", 2025)] {
+            context.entries.push(utopia_extract::time::TimeEntry {
+                kind: "now".into(),
+                name: String::new(),
+                words: year.to_string(),
+                from: parts(year, Some(1), Some(1)),
+                to: None,
+                scope: vec![section.into()],
+                chunk: None,
+                char_start: None,
+            });
+        }
+        let document_anchor = |id| Interpretation {
+            reference: Reference::Anchored {
+                anchor: Anchor::Document,
+                offset: None,
+            },
+            ..absolute_day(id)
+        };
+        // 偶数在第一节，奇数在第二节；两条链各自从本节日期起算。
+        let interpretations = [
+            next_day(4, 2),
+            next_day(5, 3),
+            next_day(2, 0),
+            next_day(3, 1),
+            document_anchor(1),
+            document_anchor(0),
+        ];
+        let resolved = resolve_interpretations(&interpretations, |id| {
+            context_at(&context, Some((id % 2) as usize))
+        });
+        assert_eq!(
+            resolved,
+            HashMap::from([
+                (0, day_point("2024-01-01T00:00:00Z", "B")),
+                (2, day_point("2024-01-02T00:00:00Z", "B")),
+                (4, day_point("2024-01-03T00:00:00Z", "B")),
+                (1, day_point("2025-01-01T00:00:00Z", "B")),
+                (3, day_point("2025-01-02T00:00:00Z", "B")),
+                (5, day_point("2025-01-03T00:00:00Z", "B")),
+            ])
+        );
+    }
+
+    #[test]
+    fn dependency_resolution_preserves_dateless_endings_and_unusable_anchors() {
+        let interpretations = [
+            next_day(1, 0),
+            Interpretation {
+                shape: Shape::Until,
+                ..absolute_day(0)
+            },
+            next_day(3, 2),
+            Interpretation {
+                shape: Shape::EndedUnknown,
+                ..next_day(2, 2)
+            },
+        ];
+        let resolved = resolve_interpretations(&interpretations, |_| DocumentDating::default());
+        assert_eq!(
+            resolved,
+            HashMap::from([
+                (
+                    0,
+                    Resolved {
+                        from: None,
+                        from_p: None,
+                        ..day_point("2024-01-01T00:00:00Z", "A")
+                    }
+                ),
+                (1, UNRESOLVED),
+                (
+                    2,
+                    Resolved {
+                        to_p: Some(ENDED_UNKNOWN),
+                        grade: "A",
+                        ..UNRESOLVED
+                    }
+                ),
+                (3, UNRESOLVED),
+            ])
+        );
     }
 
     #[test]

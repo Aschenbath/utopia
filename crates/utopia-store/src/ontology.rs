@@ -19,9 +19,15 @@ pub async fn entity_type_views(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<Enti
                   WHERE p.child_id = t.id AND p.is_primary) AS primary_parent,
                 ARRAY(SELECT d.b_id FROM entity_type_disjoint d
                       WHERE d.kb_id = t.kb_id AND d.a_id = t.id) AS disjoint,
-                (SELECT count(*) FROM entities e
-                 WHERE e.type_id = t.id AND e.merged_into IS NULL) AS usage
-         FROM entity_types t WHERE t.kb_id = $1 ORDER BY lower(t.label)",
+                COALESCE(u.usage, 0) AS usage
+         FROM entity_types t
+         LEFT JOIN (
+             SELECT type_id, count(*)::bigint AS usage
+             FROM entities
+             WHERE kb_id = $1 AND merged_into IS NULL AND type_id IS NOT NULL
+             GROUP BY type_id
+         ) u ON u.type_id = t.id
+         WHERE t.kb_id = $1 ORDER BY lower(t.label)",
     )
     .bind(kb_id)
     .fetch_all(pool)
@@ -39,8 +45,9 @@ pub async fn entity_instances(
     let rows: Vec<EntityInstance> = sqlx::query_as(
         "SELECT e.id, e.canonical_name AS name,
                 (SELECT count(*) FROM facts f
-                 WHERE (f.subject_id = e.id OR f.object_id = e.id)
-                   AND f.invalidated_at IS NULL) AS fact_count
+                  WHERE f.kb_id = e.kb_id
+                    AND (f.subject_id = e.id OR f.object_id = e.id)
+                    AND f.invalidated_at IS NULL) AS fact_count
          FROM entities e
          WHERE e.kb_id = $1 AND e.type_id = $2 AND e.merged_into IS NULL
          ORDER BY lower(e.canonical_name), e.id
@@ -85,9 +92,15 @@ pub async fn relation_type_views(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<Re
                       WHERE g.relation_type_id = r.id) AS ranges,
                 ARRAY(SELECT q.qualifier_type_id FROM relation_type_qualifiers q
                       WHERE q.relation_type_id = r.id) AS qualifiers,
-                (SELECT count(*) FROM facts f
-                 WHERE f.predicate_id = r.id AND f.invalidated_at IS NULL) AS usage
-         FROM relation_types r WHERE r.kb_id = $1 ORDER BY lower(r.label)",
+                COALESCE(u.usage, 0) AS usage
+         FROM relation_types r
+         LEFT JOIN (
+             SELECT predicate_id, count(*)::bigint AS usage
+             FROM facts
+             WHERE kb_id = $1 AND invalidated_at IS NULL AND predicate_id IS NOT NULL
+             GROUP BY predicate_id
+         ) u ON u.predicate_id = r.id
+         WHERE r.kb_id = $1 ORDER BY lower(r.label)",
     )
     .bind(kb_id)
     .fetch_all(pool)
@@ -1760,6 +1773,28 @@ pub async fn nearest_relation_type_ids(
     Ok(rows.into_iter().map(|(id,)| id).collect())
 }
 
+/// 这个库里有没有带向量的关系/属性（`only_kind` 同上）。谓词与
+/// [`nearest_relation_type_ids`] 的一字不差：这里答「没有」，那边对任何向量都返回空。
+///
+/// 存在的理由：短语对齐的短名单先把每条签名嵌入、再逐条问最近的属性，问回来是空才知道
+/// 属性还没向量。一个从没跑过 `embed_ontology` 的库每轮都把一万七千条签名送去嵌入，
+/// 一条也用不上（#1097）。先问这一句，用不上就不嵌
+pub async fn has_relation_type_vectors(
+    pool: &PgPool,
+    kb_id: Uuid,
+    only_kind: Option<&str>,
+) -> AppResult<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM relation_types
+                        WHERE kb_id = $1 AND embedding IS NOT NULL
+                          AND ($2::text IS NULL OR kind = $2))",
+    )
+    .bind(kb_id)
+    .bind(only_kind)
+    .fetch_one(pool)
+    .await?)
+}
+
 /// 一次插完一批类，返回 key → id。
 ///
 /// **存在的理由是 fsync。** 逐条 `execute(pool)` 每条各自提交，导入 schema.org
@@ -2494,6 +2529,27 @@ pub struct AgentProposalReport {
     pub adopted: i64,
     pub adopted_edited: i64,
     pub rejected: i64,
+}
+
+/// 文档说了、本体还放不下的：没绑到类的类别词，和没绑到属性的短语形状（判成 none 的
+/// 与两票不一致的）。本体代理读的就是这两样（0061 决定 2）；工作台拿这两个数说「还缺什么」，
+/// 不再拿 0003 的 `ontology_misses`——开放图谱的抽取不往那张表里写
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::FromRow, serde::Serialize)]
+pub struct Uncovered {
+    pub kind_words: i64,
+    pub phrases: i64,
+}
+
+pub async fn uncovered(pool: &PgPool, kb_id: Uuid) -> AppResult<Uncovered> {
+    Ok(sqlx::query_as(
+        "SELECT (SELECT count(*) FROM type_bindings
+                  WHERE kb_id = $1 AND status <> 'bound') AS kind_words,
+                (SELECT count(*) FROM phrase_bindings
+                  WHERE kb_id = $1 AND status <> 'bound') AS phrases",
+    )
+    .bind(kb_id)
+    .fetch_one(pool)
+    .await?)
 }
 
 pub async fn agent_proposal_report(pool: &PgPool, kb_id: Uuid) -> AppResult<AgentProposalReport> {

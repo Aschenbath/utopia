@@ -256,9 +256,49 @@ pub async fn resolve_mention(
     exclude: &[Uuid],
 ) -> AppResult<Resolution> {
     let mut r = resolve_by_name(pool, kb_id, type_id, raw_name, context, text, exclude).await?;
-    let Some(query) = name_vector else {
-        return Ok(r);
-    };
+    if let Some(query) = name_vector {
+        propose_by_name_vector(pool, kb_id, type_id, raw_name, query, exclude, &mut r).await?;
+    }
+    // 判过「不是一个」的对不再排。新建的实体没有过去，没东西要排的也不用问
+    if !r.created && !r.reviews.is_empty() {
+        let kept = kept_apart_from(pool, kb_id, r.entity_id).await?;
+        r.reviews.retain(|v| !kept.contains(&v.other_id));
+    }
+    Ok(r)
+}
+
+/// 跟这个实体判过「不是一个」的那些实体。
+///
+/// **每次提到都会走到召回**：名字向量通道不分新建还是归并，同名易混类型那条路也是
+/// 归并之后照常入队。而审核表的唯一索引只管 pending 的行——判完的一对下次被提到，
+/// 就又是一条新的 pending。一个有六万实体的库上，`migration 395` 每出现在一篇新文档里，
+/// 它跟 `migration 394` 等八个近邻就重新排一遍队，裁决器（或人）分开过多少次都一样
+/// （#1104）。分开这个决定要记得住，[`crate::names::pair_shared_name`] 早就是这么做的。
+///
+/// 人仍然可以在审核页把分开过的一对合并：这里拦的是自动重提，不是合并本身。
+async fn kept_apart_from(pool: &PgPool, kb_id: Uuid, entity_id: Uuid) -> AppResult<HashSet<Uuid>> {
+    let rows: Vec<(Uuid,)> = sqlx::query_as(
+        "SELECT CASE WHEN left_id = $2 THEN right_id ELSE left_id END
+           FROM resolution_reviews
+          WHERE kb_id = $1 AND status = 'kept' AND (left_id = $2 OR right_id = $2)",
+    )
+    .bind(kb_id)
+    .bind(entity_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+/// 通道 2：mention 名字向量的近邻，各排一对（规矩见 [`resolve_mention`]）
+async fn propose_by_name_vector(
+    pool: &PgPool,
+    kb_id: Uuid,
+    type_id: Option<Uuid>,
+    raw_name: &str,
+    query: &[f32],
+    exclude: &[Uuid],
+    r: &mut Resolution,
+) -> AppResult<()> {
     let mention_name = normalize_name(raw_name).to_lowercase();
     let mention_family = match type_id {
         Some(t) => type_label(pool, t)
@@ -298,7 +338,7 @@ pub async fn resolve_mention(
             stage: ReviewStage::Adjudicating,
         });
     }
-    Ok(r)
+    Ok(())
 }
 
 async fn type_label(pool: &PgPool, type_id: Uuid) -> AppResult<Option<String>> {
@@ -337,7 +377,7 @@ async fn resolve_by_name(
     let candidates: Vec<Candidate> = sqlx::query_as(&format!(
         "SELECT e.id, e.canonical_name, e.profile_embedding, e.profile_n,
                 (SELECT count(*) FROM facts f
-                 WHERE (f.subject_id = e.id OR f.object_id = e.id)
+                 WHERE f.kb_id = e.kb_id AND (f.subject_id = e.id OR f.object_id = e.id)
                    AND f.invalidated_at IS NULL AND {not_name}) AS degree
          FROM entities e
          -- IS NOT DISTINCT FROM 而不是 =（0009 的那个陷阱）：开放图谱里的实体都没有类
@@ -1254,7 +1294,7 @@ pub async fn existing_by_name(
             AND e.description IS NULL
             AND (lower(e.canonical_name) = ANY($2) OR {named})
           ORDER BY (SELECT count(*) FROM facts f
-                     WHERE (f.subject_id = e.id OR f.object_id = e.id) AND {not_name}) DESC,
+                     WHERE f.kb_id = e.kb_id AND (f.subject_id = e.id OR f.object_id = e.id) AND f.invalidated_at IS NULL AND {not_name}) DESC,
                    e.created_at
           LIMIT 1",
         named = crate::names::has_name_in("e", 1, 2),
@@ -1398,7 +1438,7 @@ async fn review_side(pool: &PgPool, kb_id: Uuid, entity_id: Uuid) -> AppResult<R
         "SELECT e.id, e.canonical_name AS name, t.label AS type_label,
                 coalesce(t.color, '#94a3b8') AS color, e.disambiguator,
                 (SELECT count(*) FROM facts f
-                 WHERE (f.subject_id = e.id OR f.object_id = e.id)
+                 WHERE f.kb_id = e.kb_id AND (f.subject_id = e.id OR f.object_id = e.id)
                    AND f.invalidated_at IS NULL AND {not_name}) AS degree
          -- LEFT JOIN：没判出类型的实体照样要能进审核（0009）。
          -- 内连接会让它整条审核项取不出来，而漂移审核恰恰最常发生在它们身上
@@ -1784,14 +1824,20 @@ pub async fn survivor(pool: &PgPool, kb_id: Uuid, mut id: Uuid) -> AppResult<Uui
 
 /// 合并方向：返回 (target 存活, source 被并)。
 pub async fn merge_direction(pool: &PgPool, a: Uuid, b: Uuid) -> AppResult<(Uuid, Uuid)> {
+    // 事实索引以 kb_id 开头；先用标量子查询取库，让 OR 两侧都能按复合索引定位。
+    // PG16 上直接 JOIN 可能只按 kb_id 扫描整个库，再过滤 subject/object。
     let (deg_a,): (i64,) = sqlx::query_as(
-        "SELECT count(*) FROM facts WHERE (subject_id = $1 OR object_id = $1) AND invalidated_at IS NULL",
+        "SELECT count(*) FROM facts
+         WHERE kb_id = (SELECT kb_id FROM entities WHERE id = $1)
+           AND (subject_id = $1 OR object_id = $1) AND invalidated_at IS NULL",
     )
     .bind(a)
     .fetch_one(pool)
     .await?;
     let (deg_b,): (i64,) = sqlx::query_as(
-        "SELECT count(*) FROM facts WHERE (subject_id = $1 OR object_id = $1) AND invalidated_at IS NULL",
+        "SELECT count(*) FROM facts
+         WHERE kb_id = (SELECT kb_id FROM entities WHERE id = $1)
+           AND (subject_id = $1 OR object_id = $1) AND invalidated_at IS NULL",
     )
     .bind(b)
     .fetch_one(pool)
