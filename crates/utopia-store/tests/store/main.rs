@@ -55,6 +55,7 @@ mod a_judged_entity_waits_its_turn;
 mod a_kind_word_binds_to_a_class;
 mod a_late_value_takes_its_place_in_history;
 mod a_mapping_is_not_a_fact;
+mod a_merge_keeps_distinct_statements;
 mod a_merge_rewinds_with_the_second_clock;
 mod a_merged_target_stays_out_of_the_export;
 mod a_moment_marks_its_state;

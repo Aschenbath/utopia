@@ -2039,14 +2039,15 @@ pub async fn merge_entities(
     .collect();
 
     // 合并后 SPO+valid_from 重复的 live 事实：留最早 recorded_at 的一条，其余作废。
+    // 没有谓词的行不参与：开放陈述的不同短语都带 NULL，不能因此当成同一句话。
     //
     // **宾语两侧都要分组。** 字面值事实的 object_id 全是 NULL，只按它分组就等于
     // 把同主同谓下的**所有值**当成同一条断言：一次合并之后，
     // (公司, 成立年份, 2015) 与 (公司, 注册资本, …) 之外，同谓词的多个值只活得下来
     // 最早记的那一个，其余无声消失，且没有 supersedes 可查。
     let dups: Vec<(Vec<Uuid>,)> = sqlx::query_as(
-        "SELECT (array_agg(id ORDER BY recorded_at))[2:] FROM facts
-         WHERE kb_id = $1 AND invalidated_at IS NULL
+        "SELECT array_agg(id ORDER BY recorded_at, id) FROM facts
+         WHERE kb_id = $1 AND invalidated_at IS NULL AND predicate_id IS NOT NULL
            AND (subject_id = $2 OR object_id = $2)
          GROUP BY subject_id, predicate_id, object_id, object_value, valid_from
          HAVING count(*) > 1",
@@ -2055,7 +2056,21 @@ pub async fn merge_entities(
     .bind(target_id)
     .fetch_all(&mut *tx)
     .await?;
-    let dup_ids: Vec<Uuid> = dups.into_iter().flat_map(|(ids,)| ids).collect();
+    let mut dup_ids = Vec::new();
+    for (ids,) in dups {
+        // 先给存活行接上来源，否则下一次物化可能作废它，再按原文重建，丢掉人的修正。
+        // 旧行的链接暂留：撤回合并还用得上；物化按它原有的规则清理失效链接。
+        sqlx::query(
+            "INSERT INTO typed_fact_sources (fact_id, statement_id)
+             SELECT $1, statement_id FROM typed_fact_sources WHERE fact_id = ANY($2)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(ids[0])
+        .bind(&ids[1..])
+        .execute(&mut *tx)
+        .await?;
+        dup_ids.extend_from_slice(&ids[1..]);
+    }
     if !dup_ids.is_empty() {
         sqlx::query("UPDATE facts SET invalidated_at = now() WHERE id = ANY($1)")
             .bind(&dup_ids)
