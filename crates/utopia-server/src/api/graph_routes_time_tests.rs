@@ -166,3 +166,105 @@ async fn a_correction_keeps_the_mark_unless_the_request_changes_it() -> anyhow::
         .await?;
     result
 }
+
+#[tokio::test]
+async fn review_closes_refuse_inverted_intervals_without_settling_the_item() -> anyhow::Result<()> {
+    let Some(url) = utopia_store::test_db::url() else {
+        return Ok(());
+    };
+    let pool = sqlx::PgPool::connect(&url).await?;
+    let [org, ws, kb, editor, property, lin, meridian, orion, old, new, conflict, violation] =
+        std::array::from_fn(|_| Uuid::now_v7());
+    // Only locally generated UUIDs and fixed timestamps enter this fixture SQL.
+    sqlx::raw_sql(&format!(
+        "INSERT INTO organizations(id,name) VALUES ('{org}','review-close-time');
+         INSERT INTO workspaces(id,org_id,name) VALUES ('{ws}','{org}','review-close-time');
+         INSERT INTO users(id,org_id,email,display_name,password_hash)
+              VALUES ('{editor}','{org}','{editor}@time.test','editor','unused');
+         INSERT INTO knowledge_bases(id,workspace_id,name) VALUES ('{kb}','{ws}','times');
+         INSERT INTO kb_members(kb_id,user_id,role) VALUES ('{kb}','{editor}','editor');
+         INSERT INTO relation_types(id,kb_id,key,label,temporal)
+              VALUES ('{property}','{kb}','works_for','works for','state');
+         INSERT INTO entities(id,kb_id,canonical_name) VALUES
+              ('{lin}','{kb}','Lin Zhao'), ('{meridian}','{kb}','Meridian'), ('{orion}','{kb}','Orion');
+         INSERT INTO facts(id,kb_id,subject_id,predicate_id,object_id,confidence,
+                           valid_from,valid_from_precision) VALUES
+              ('{old}','{kb}','{lin}','{property}','{meridian}',0.9,'{MARCH}','day'),
+              ('{new}','{kb}','{lin}','{property}','{orion}',0.9,NULL,NULL);
+         INSERT INTO fact_conflicts(id,kb_id,old_fact_id,new_fact_id,reason)
+              VALUES ('{conflict}','{kb}','{old}','{new}','no_time');
+         INSERT INTO axiom_violations(id,kb_id,kind,left_fact,right_fact)
+              VALUES ('{violation}','{kb}','derived_contradiction','{old}','{new}');"
+    ))
+    .execute(&pool)
+    .await?;
+    let result = async {
+        let dir = tempfile::tempdir()?;
+        let config = utopia_core::config::AppConfig {
+            data_dir: dir.path().to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        let search = Arc::new(utopia_search::SearchIndex::open(&dir.path().join("search"))?);
+        let state = crate::state::AppState::new(pool.clone(), &config, search, "test-only".into());
+        let token = crate::auth::issue_token(&state, editor)?;
+        let app = crate::api::router(state, &config);
+        let prefix = format!("/api/v1/kbs/{kb}");
+        // The first date is later as written, but earlier at year precision.
+        // The existing equal-state refusal must reach all three cards as well.
+        for (at, precision, code) in [
+            ("2024-10-01T00:00:00Z", "year", "interval_inverted"),
+            (MARCH, "month", "empty_state_span"),
+        ] {
+            for (path, body) in [
+                (
+                    format!("facts/{old}/close"),
+                    json!({"valid_to": at, "valid_to_precision": precision}),
+                ),
+                (
+                    format!("conflicts/{conflict}"),
+                    json!({"action": "close", "close_at": at, "close_at_precision": precision}),
+                ),
+                (
+                    format!("review/violations/{violation}"),
+                    json!({"resolution": "fact_closed", "close_at": at, "close_at_precision": precision}),
+                ),
+            ] {
+                let (status, reply) = send(&app, &token, "POST", format!("{prefix}/{path}"), &body).await?;
+                assert_eq!((status, reply["code"].as_str()), (StatusCode::UNPROCESSABLE_ENTITY, Some(code)), "{path}: {reply}");
+            }
+        }
+        // A conflict with no explicit date closes at the new row's start; it must
+        // get the same store guard, even though no date came through the route.
+        sqlx::query("UPDATE facts SET valid_from = '2024-01-01', valid_from_precision = 'year' WHERE id = $1")
+            .bind(new).execute(&pool).await?;
+        let (status, reply) = send(&app, &token, "POST", format!("{prefix}/conflicts/{conflict}"), &json!({"action": "close"})).await?;
+        assert_eq!((status, reply["code"].as_str()), (StatusCode::UNPROCESSABLE_ENTITY, Some("interval_inverted")));
+        let unchanged: bool = sqlx::query_scalar(
+            "SELECT (SELECT count(*) = 2 FROM facts WHERE kb_id = $1)
+                AND EXISTS (SELECT 1 FROM facts WHERE id = $2 AND invalidated_at IS NULL AND valid_to IS NULL)
+                AND EXISTS (SELECT 1 FROM fact_conflicts WHERE id = $3 AND status = 'open' AND resolution IS NULL)
+                AND EXISTS (SELECT 1 FROM axiom_violations WHERE id = $4 AND status = 'open' AND resolution IS NULL)",
+        ).bind(kb).bind(old).bind(conflict).bind(violation).fetch_one(&pool).await?;
+        assert!(unchanged, "refused closes write no replacement and leave both queues open");
+
+        // A later date can still close the refused row, with the endpoint stored
+        // at its supplied precision, without translating it to a period's end.
+        let (status, _) = send(&app, &token, "POST", format!("{prefix}/facts/{old}/close"),
+            &json!({"valid_to": "2024-09-19T00:00:00Z", "valid_to_precision": "month"})).await?;
+        assert_eq!(status, StatusCode::OK);
+        let closed: (DateTime<Utc>, String, bool) = sqlx::query_as(
+            "SELECT valid_to, valid_to_precision, end_after_period FROM facts WHERE supersedes = $1",
+        ).bind(old).fetch_one(&pool).await?;
+        assert_eq!(closed, ("2024-09-01T00:00:00Z".parse()?, "month".into(), false));
+        anyhow::Ok(())
+    }.await;
+    sqlx::query("DELETE FROM knowledge_bases WHERE id = $1")
+        .bind(kb)
+        .execute(&pool)
+        .await?;
+    sqlx::query("DELETE FROM organizations WHERE id = $1")
+        .bind(org)
+        .execute(&pool)
+        .await?;
+    result
+}

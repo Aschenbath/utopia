@@ -873,16 +873,41 @@ pub async fn retract(pool: &PgPool, kb_id: Uuid, fact_id: Uuid) -> AppResult<boo
 }
 
 /// 作废 + 改写成**写明的**终点：旧行记 invalidated_at（认知轴），插入闭合区间的修正行
-/// （世界轴），证据引用随行复制。原文说它在哪天结束、人裁决把它关上，都走这里——
-/// 这个终点此后不再由引擎重算。返回修正行 id；`None` = 这条已被作废，没动。
+/// （世界轴），证据引用随行复制。人裁决把它关上走这里，拒绝早于起点的终点；原文写入
+/// 走 `close_stated`。这个终点此后不再由引擎重算。返回修正行 id；`None` = 已作废，没动。
 pub async fn close_superseded<'a>(
     pool: impl sqlx::Acquire<'a, Database = Postgres>,
     fact_id: Uuid,
     valid_to: DateTime<Utc>,
     valid_to_precision: &str,
 ) -> AppResult<Option<Uuid>> {
+    let valid_to = crate::graph::truncate_to(valid_to, Some(valid_to_precision));
+    let mut tx = pool.begin().await?;
+    let row: Option<(Option<DateTime<Utc>>, Option<String>)> = sqlx::query_as(
+        "SELECT valid_from, valid_from_precision FROM facts
+         WHERE id = $1 AND invalidated_at IS NULL FOR UPDATE",
+    )
+    .bind(fact_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((from, from_precision)) = row else {
+        return Ok(None);
+    };
+    // 锁住起点后再比，避免并发修正穿过检查；两端都按各自精度截断（#1294）。
+    // 放在审核的 store 入口，也管住冲突默认取新事实起点的闭合，不改原文写入的规则。
+    if from
+        .is_some_and(|from| valid_to < crate::graph::truncate_to(from, from_precision.as_deref()))
+    {
+        return Err(utopia_core::AppError::invalid(
+            "interval_inverted",
+            "The start of the interval is after its end.",
+        ));
+    }
     // 按日期关上的（审核里关、冲突的 close_at、违规的 fact_closed）给的就是终点那一刻，不标
-    close_stated(pool, fact_id, valid_to, valid_to_precision, false).await
+    let end = End::At(valid_to, valid_to_precision.to_string());
+    let corrected = rewrite_end_tx(&mut tx, fact_id, &end, false, false, false).await?;
+    tx.commit().await?;
+    Ok(corrected)
 }
 
 /// [`close_superseded`]，外加这个终点是不是原文所说时段之后的那一刻（`end_after_period`，
