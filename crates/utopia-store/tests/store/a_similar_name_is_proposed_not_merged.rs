@@ -267,26 +267,40 @@ async fn the_same_literal_name_is_not_proposed_twice() -> anyhow::Result<()> {
     let f = seed(&pool, "name-vector-literal").await?;
     let run = async {
         let same: Vec<f32> = vec![1.0, 0.0, 0.0];
-        // 没有上下文向量：v1 路径归并到唯一的字面候选
-        let r = utopia_store::resolution::resolve_mention(
-            &pool,
-            f.kb,
-            Some(f.device),
-            "海洋探测器1号",
-            None,
-            Some(&same),
-            None,
-            &[],
+        // A second entity with the same name stays a channel-1 decision, including
+        // when the mention carries Markdown. Neither candidate is excluded here.
+        sqlx::query(
+            "UPDATE entities SET canonical_name = '海洋探测器1号', type_id = $2 WHERE id = $1",
         )
+        .bind(f.captain)
+        .bind(f.device)
+        .execute(&pool)
         .await?;
-        assert_eq!(r.entity_id, f.probe, "字面相等走通道 1");
-        // 夹具里 海洋探测队长 的向量与之相同、大类又拦不住，它照常被提议；要看的只是
-        // 已归并到的 海洋探测器1号 自己不会再被排一对
-        assert!(
-            !vector_reviews(&r).iter().any(|(id, _)| *id == f.probe),
-            "已经归并到它，不再对它排 name_vector：{:?}",
-            r.reviews
-        );
+        sqlx::query(
+            "UPDATE facts SET object_value = '{\"value\":\"海洋探测器1号\"}' WHERE subject_id = $1",
+        )
+        .bind(f.captain)
+        .execute(&pool)
+        .await?;
+        for mention in ["海洋探测器1号", "**海洋探测器1号**"] {
+            let r = utopia_store::resolution::resolve_mention(
+                &pool,
+                f.kb,
+                Some(f.device),
+                mention,
+                None,
+                Some(&same),
+                None,
+                &[],
+            )
+            .await?;
+            assert!(!r.created);
+            assert!(
+                vector_reviews(&r).is_empty(),
+                "a namesake must not be reconsidered by name vector: {:?}",
+                r.reviews
+            );
+        }
         Ok::<_, anyhow::Error>(())
     }
     .await;
