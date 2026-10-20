@@ -309,7 +309,8 @@ pub async fn revise(
     sqlx::query(
         "UPDATE concept_mappings
             SET table_name = $3, expr = $4, sql = $5, unit = $6, summary = $7,
-                derived = $8, decided_by = $9, decided_at = now(), updated_at = now()
+                derived = $8, decided_by = $9, decided_at = now(),
+                confidence = NULL, rationale = NULL, updated_at = now()
           WHERE id = $2 AND kb_id = $1",
     )
     .bind(kb_id)

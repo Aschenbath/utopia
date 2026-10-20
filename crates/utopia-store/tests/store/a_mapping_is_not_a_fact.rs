@@ -270,6 +270,8 @@ async fn automatic_definitions_refresh_until_a_person_decides() -> anyhow::Resul
         let human = utopia_store::mappings::proposed(&pool, kb, 10, 0).await?.remove(0);
         assert_eq!(human.expr.as_deref(), Some("SUM(human_amount)"));
         assert_eq!(human.decided_by, Some(user));
+        assert_eq!(human.confidence, None, "model evidence described the preceding definition");
+        assert_eq!(human.rationale, None);
         let revisions = utopia_store::mappings::revisions(&pool, kb, id).await?;
         assert_eq!(revisions.len(), 1);
         assert_eq!(revisions[0].before["decided_by"], serde_json::Value::Null);

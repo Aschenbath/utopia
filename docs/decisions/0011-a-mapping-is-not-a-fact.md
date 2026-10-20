@@ -82,7 +82,9 @@ rebuilding all three.
   re-evaluates the gate on each write: weaker evidence or a disabled switch returns that
   refreshed definition to proposed. Turning the switch off alone does not revoke existing
   definitions. Confirming, rejecting or revising a row records the person and protects it
-  from further exploration, including a person editing a still-pending proposal.
+  from further exploration, including a person editing a still-pending proposal. An edit
+  clears model evidence from the current definition; its history snapshot keeps the evidence
+  for the preceding definition.
   The upsert judges that protection while holding the row lock; human revision locks the
   row before taking its history snapshot. Each automatic write and its system audit event
   (`mapping.auto_confirmed`, including the definition and evidence) commit together, so
