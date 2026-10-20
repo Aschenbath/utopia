@@ -53,6 +53,7 @@ export const en = {
     wrong_password: "Current password is incorrect.",
     registration_closed:
       "Sign-up is closed on this deployment — ask an administrator for an account.",
+    password_login_disabled: "Password sign-in is turned off on this deployment. Continue with SSO.",
     no_chat_model:
       "No chat model configured yet. Set one under Administration → Models.",
     // 对话流里没答成的那一轮：`error` 帧带的 code（服务端的英文原句只给日志）
@@ -139,11 +140,17 @@ export const en = {
     inference_off:
       "Materialized inference is off for this knowledge base. Turn it on in Settings.",
     bad_resolution: "That is not a valid decision.",
+    interval_inverted:
+      "The end is before the start. Give an end after the start.",
     empty_state_span:
       "A state that ends where it starts holds at no moment. Give an end after the start, or leave it open.",
     unknown_marks: "A single date marks the start, the end, or neither.",
     marks_needs_state:
       "Only a state property says what a single date marks. Events and timeless properties don't.",
+    // 采纳提案（0061 决定 3）：撞上别的写、整次回滚了；复用要写的都已由人另定
+    alignment_busy: "Something else is updating the same items. Nothing was saved; try again shortly.",
+    proposal_stale:
+      "Nothing in this proposal is left to adopt: each of its phrases or kind words is decided differently by a person or no longer appears in any statement. Reject it to clear it.",
   },
   /** 机器给的补充（cron 解析器的原话之类）缀在措辞后面 */
   errDetail: (msg: string, detail: string) => `${msg} (${detail})`,
@@ -322,7 +329,7 @@ export const en = {
       },
       "governance.tripped": {
         title: "The agent stopped deciding on its own",
-        hint: "Two of its decisions were reverted within seven days, so the switch went off. Look at what it did under Review → Agent, then turn it back on in the base settings when you want it to resume.",
+        hint: "Two of its merges were reverted within seven days, so the switch went off. Look at what it did under Review → Agent, then turn it back on in the base settings when you want it to resume.",
       },
     } as Record<string, { title: string; hint: string } | undefined>,
     // 没见过的 kind 也要能显示：新告警源上线时前端可能还没更新
@@ -400,6 +407,8 @@ export const en = {
     ssoErrors: {
       unlinked:
         "This identity isn't linked to an account. Sign in with your password and link it from your account page.",
+      unlinked_sso_only:
+        "This identity can't sign in to this deployment. Ask an administrator for access.",
       cancelled: "Single sign-on was cancelled.",
       denied: "The identity provider's answer couldn't be verified.",
       session: "The sign-in started in a different browser session. Try again.",
@@ -583,6 +592,7 @@ export const en = {
       chunk_unextracted: "A passage the endpoint could not answer for",
       phrase_is_value: "Kept, but the phrase is the value itself",
       phrase_is_subject: "Kept, but the phrase is the subject's own name",
+      object_is_value: "Kept, with the object read as a value",
     } as Record<string, string>,
     // 来源级重抽：不危险，只是费时费钱——轻确认，文案直说成本与保留项
     reExtractSource: "Re-extract",
@@ -630,6 +640,7 @@ export const en = {
       statements: "Statements",
       custom: "Custom",
       github_issues: "GitHub issues",
+      github_repo: "GitHub repository files",
       jira_issues: "Jira issues",
       s3: "S3 / MinIO",
       azure_blob: "Azure Blob",
@@ -649,6 +660,9 @@ export const en = {
         "Syncs a repository's issues. **Each ticket, together with its state history**, becomes " +
         "one document — when it was opened, closed, relabelled, reassigned, all dated. " +
         "Without a token GitHub allows only 60 requests an hour.",
+      github_repo:
+        "Reads markdown files off a repository's default branch. Each file becomes one " +
+        "document dated by its last commit; unchanged files are not fetched again.",
       s3:
         "Reads documents out of an S3 bucket, or anything speaking the same protocol " +
         "(MinIO, Ceph, R2). **Leave the endpoint empty for AWS**; fill it in for a " +
@@ -679,6 +693,7 @@ export const en = {
     ingestGuide: "Read the ingest guide →",
     ingestGuideTitle: "Ingest interface guide",
     endpointField: "Endpoint URL",
+    feedPlaceholder: "https://your-service/utopia-feed",
     endpointCopied: "Endpoint URL copied",
     copyEndpoint: "Click to copy the full URL",
     // api 来源的推送状态（queued/running 不会出现，仅为类型完备）
@@ -745,6 +760,8 @@ export const en = {
     notionQueryField: "Search term (optional — empty takes every shared page)",
     tokenField: "GitHub token (optional, never shown again)",
     includePullRequests: "Treat pull requests as tickets too",
+    includeGlobsField: "Include globs (comma-separated, optional)",
+    excludeGlobsField: "Exclude globs (comma-separated, optional)",
     interval: "Sync schedule",
     intervalManual: "Manual only",
     intervalEvery: (m: number) =>
@@ -1344,6 +1361,40 @@ export const en = {
       `Saved. ${n} waiting ${n === 1 ? "file is" : "files are"} being read.`,
   },
   ontology: {
+    casesShort: "Regression cases",
+    casesTitle: "Property regression cases",
+    casesHint: "The last recorded comparisons of expected properties with alignment decisions. Refresh reads these results; property edits trigger the regular alignment process.",
+    casesEmpty: "No cases yet. Adopt a property proposal or add an open statement from a document.",
+    caseStatement: "Statement",
+    caseExpected: "Expected",
+    caseActual: "Actual",
+    caseResult: "Result",
+    caseChecked: "Last checked",
+    caseOrigin: "Added by",
+    casePassed: "Matches",
+    caseMismatch: "Mismatch",
+    caseNotChecked: "Not checked",
+    caseUnbound: "No property bound",
+    caseUndecided: "Undecided",
+    caseUnavailableProperty: "Bound property no longer available",
+    caseDecidedAt: "Decision made",
+    caseNoProperties: "Create a suitable property in Ontology before adding this case.",
+    caseHumanBound: "Human decision retained",
+    caseHumanHint: "A manual binding is preserved and counts as passing. This is not an independent model check.",
+    caseAdoption: "Proposal adoption",
+    casePerson: "Manual case",
+    caseUnknownCreator: "Former member",
+    caseEvidence: "Show source evidence",
+    caseHideEvidence: "Hide source evidence",
+    caseMake: "Add regression case",
+    caseAddTitle: "Add a property regression case",
+    caseAddHint: "Save the property and direction this open statement should bind to. Its existing alignment decision will be compared with this expectation.",
+    caseExpectedProperty: "Expected property",
+    caseDirection: "Direction",
+    caseForward: "Subject → Object",
+    caseReverse: "Object → Subject",
+    caseAdded: "Regression case added",
+    caseAdd: "Add case",
     title: "Ontology",
     hint: "Classes & properties",
     tabClasses: "Classes",
@@ -1366,10 +1417,10 @@ export const en = {
     axiomSymmetric: "Symmetric",
     axiomAsymmetric: "Asymmetric",
     axiomIrreflexive: "Irreflexive",
-    tabProperties: "Properties",
+    tabProperties: "Relations",
     newClass: "New class",
     newSubClass: "New sub-class",
-    newProperty: "New property",
+    newProperty: "New relation",
     filter: "Filter…",
     missesShort: "Unmatched",
     uniquenessShort: "Overlaps",
@@ -1520,8 +1571,9 @@ export const en = {
     /* 编辑弹窗（面板只展示，改动在弹窗里）：标题与面板里的入口 */
     edit: "Edit",
     editClass: "Edit class",
-    editProperty: "Edit property",
+    editProperty: "Edit relation",
     editAttribute: "Edit attribute",
+    attributeHost: "Belongs to class",
     connectTitle: "Connect a relationship",
     connectOpen: "Connect an existing relationship…",
     noDescription: "No description yet.",
@@ -1721,15 +1773,8 @@ export const en = {
         ? `Closed ${close} · ${review} in Review`
         : `Closed ${close}`,
     uniquenessSince: (d: string) => `since ${d}`,
-    dismiss: "Dismiss",
-    dismissed: (n: number) => `Dismissed (${n})`,
     /* 数字是**忽略之后**还在涨的那个——这一行的全部意义就在于此：
        当初"只出现过一次"的判断依据可能早就不成立了 */
-    dismissedHint:
-      "Still counted, but kept out of suggestions. If one has grown since you dismissed it, restore it.",
-    restore: "Restore",
-    suggest: "Suggest with AI",
-    suggesting: "Analyzing…",
     noMisses: "Nothing the documents say is waiting for a place in the ontology.",
     uncovered: (kindWords: number, phrases: number) => {
       const what = [
@@ -1746,41 +1791,8 @@ export const en = {
     mapOver: "Use existing",
     /* 影响面：采纳一个提案会把多少条无谓词事实认过去。
        没有这一句，"Add" 只是凭空多一个空关系 */
-    willRemap: (n: number) =>
-      n === 1 ? "reclassifies 1 fact" : `reclassifies ${n} facts`,
-    adopted: (n: number) =>
-      n === 1
-        ? "Added — 1 fact reclassified"
-        : `Added — ${n} facts reclassified`,
-    /* 一部分值换不动这个类型就没被改写。只报改写了多少条是报喜不报忧 */
-    adoptedPartly: (moved: number, left: number) =>
-      `Added — ${moved} reclassified, ${left} left behind (value did not fit the type)`,
-    /* 撤销：采纳改写了成批事实，没有回头路的话没人敢点第一下 */
-    undoAdopt: (key: string, n: number) =>
-      `${key} added, ${n} fact${n === 1 ? "" : "s"} reclassified`,
-    undoAdoptBtn: "Undo",
-    reverted: (n: number) =>
-      n === 1 ? "Reverted — 1 fact restored" : `Reverted — ${n} facts restored`,
-    undoKeepsRelation: "The relation stays; only the facts move back.",
-    /* 撤销要二次确认：它一次改回成批事实 */
-    undoTitle: "Undo this ontology change?",
-    undoHint: (n: number) =>
-      `${n} fact${n === 1 ? "" : "s"} will go back to “related to”. The relation itself stays — ` +
-      `nothing is deleted, and you can adopt it again later.`,
-    undoConfirm: "Undo",
-    undoCancel: "Keep",
     /* 自动扩本体的通知：默认开启的前提是它的动作可见且可退。
        只记在审计台账里不算可见——那是查证用的，不是通知用的 */
-    autoRanTitle: "Utopia extended this ontology from your documents",
-    autoRanBody: (rels: string[], facts: number) =>
-      `Added ${rels.join(", ")} · ${facts} fact${facts === 1 ? "" : "s"} reclassified`,
-    autoRanOff: "Turn this off in knowledge base settings.",
-    /* 批量：常见情形是"这些都对"，一条条点是把一个决定拆成八个 */
-    addAll: (n: number) => `Add all ${n}`,
-    addingAll: "Adding…",
-    addAllLabel: "batch",
-    addAllPartial: (keys: string[]) =>
-      `Some could not be added: ${keys.join(", ")} — the rest went through.`,
     proposals: "AI proposals",
     keyHint: "lowercase_snake_case",
     /* ---- 0061: the ontology agent and its questions ---- */
@@ -1801,6 +1813,12 @@ export const en = {
     rejectReasonPrompt:
       "Why not? (optional — the agent reads it before proposing again)",
     rejectedProposal: "Rejected",
+    /* 复用时人另定了的，照人的留着没写（0061 决定 3）：只说留了几条。不说是代理读过之后定的：
+       没记下读到哪一刻的旧提案，人在提案之前定的也照留 */
+    adoptKept: (n: number) =>
+      n === 1
+        ? "Saved. One of these was decided differently by a person and stays as they decided."
+        : `Saved. ${n} of these were decided differently by a person and stay as they decided.`,
     questions: "Competency questions",
     questionsHint:
       "What this knowledge base should be able to answer. The agent proposes classes and properties that serve these; they are the ontology's acceptance test.",
@@ -1999,10 +2017,7 @@ export const en = {
     agentHint:
       "What the agent proposed or decided for this base, from the decisions people made here before. Answering here is your decision, and it becomes precedent for the next look.",
     agentEmpty: "The agent has not looked at anything yet.",
-    agentActions: { merge: "Merge", keep: "Keep apart", unsure: "Unsure", close_old: "Close old",
-      retime_new: "Correct new start", keep_both: "Keep both", reject_new: "Reject new" } as Record<string, string>,
-    agentConflictDate: "Date for closing the old fact or correcting the new start",
-    agentInputsChanged: "The facts changed after this decision. Review their current state.",
+    agentActions: { merge: "Merge", keep: "Keep apart", unsure: "Unsure" } as Record<string, string>,
     agentStatus: {
       proposed: "Proposed",
       applied: "Applied",
@@ -2032,8 +2047,8 @@ export const en = {
       n === 1 ? "1 overridden, last 30 days" : `${n} overridden, last 30 days`,
     overviewAgentReverted: "Reverted by you",
     overviewAgentRunning: (n: number) =>
-      n === 0 ? "The agent is finishing this round" : `The agent is working · ${n} items still to look at`,
-    overviewAgentQueue: (n: number) => (n === 1 ? "1 item waiting for the agent" : `${n} items waiting for the agent`),
+      n === 0 ? "The agent is working on its last cluster" : `The agent is working · ${n} pairs still to look at`,
+    overviewAgentQueue: (n: number) => (n === 1 ? "1 pair waiting for the agent" : `${n} pairs waiting for the agent`),
     agentDeciding: "The agent is deciding this pair",
     // 总览（#377）
     overviewTitle: "Overview",
@@ -2074,8 +2089,6 @@ export const en = {
       "conflict.close_old": "Closed old",
       "conflict.keep_both": "Kept both",
       "conflict.reject_new": "Rejected new",
-      "conflict.retime_new": "Corrected new start",
-      "conflict.revert": "Reverted conflict decision",
       "merge.revert": "Reverted merge",
       "merge.manual": "Merged manually",
       "fact.time_corrected": "Time corrected",
@@ -2356,14 +2369,6 @@ export const en = {
     title: "Knowledge base settings",
     general: "General",
     members: "Members",
-    /* 自动扩本体开关。说明必须讲清关掉之后失去的**只是**代劳，不是留意——
-       否则用户会以为关掉它就看不到未匹配的信号了 */
-    autoExtend: "Extend the ontology automatically",
-    autoExtendNote:
-      "When extraction meets a relation this ontology does not have, add it and reclassify the " +
-      "facts that were waiting for it. Every change is listed and can be undone. Turning this " +
-      "off does not stop Utopia from noticing — the phrases still collect under Unmatched, they " +
-      "just wait for you to approve them.",
     materialize: "Materialize inferences",
     materializeNote:
       "Write facts the ontology entails into the ledger — transitive chains and symmetric pairs. " +
@@ -2372,9 +2377,9 @@ export const en = {
     autoResolveTypes: "Resolve entity types after extraction",
     autoResolveTypesNote:
       "After each document is extracted, run a round of type resolution on entities the engine has not looked at yet. Only refinements within the current class are applied on their own — a re-classification across the tree still waits for you on the Ontology page. Every batch is listed there and can be undone.",
-    governance: "Let the agent review duplicates and conflicts",
+    governance: "Let the agent work the duplicates queue",
     governanceNote:
-      "The agent reads source evidence and people's earlier decisions, reviews duplicates first and then factual conflicts. Decisions that cannot pass its checks wait for you as proposals. Automatic decisions are listed under Agent and can be reverted while their facts remain unchanged. Turning this off stops the queue.",
+      "First in, first out. Before deciding a pair the agent reads what people in this base decided on the same names and the same kinds of pairs. It merges only where that history supports it, keeps apart on confidence, and leaves a proposal for everything else. Every decision is listed under Agent on the Review page and can be reverted. Turning this off stops the queue.",
     inferEvery: "Re-derive every",
     minutes: "minutes",
     lastInference: (when: string) => `last run ${when}`,
@@ -2382,6 +2387,9 @@ export const en = {
     requeue: "Run again",
     requeued: (n: number) =>
       n === 1 ? "1 job back in the queue" : `${n} jobs back in the queue`,
+    exportKb: "Export knowledge base (RDF)",
+    exportKbNote: "Download every fact and its provenance as a Turtle file.",
+    exportKbAction: "Export",
     /* 语料语言。措辞要把"这不是界面语言"讲清楚，否则一定有人当成界面开关 */
     cardIdentity: "Name and description",
     cardIdentityNote:
@@ -2479,6 +2487,7 @@ export const en = {
   members: {
     title: "Deployment users",
     systemAdmin: "System admin",
+    systemAdminHint: "Opens Administration: deployment settings, accounts, data sources. You can't remove your own.",
     remove: "Remove",
     deactivate: "Deactivate",
     cancel: "Cancel",

@@ -17,6 +17,7 @@
 use crate::extraction::chat_retrying_rate_limits_at;
 use crate::llm_util;
 use crate::state::AppState;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use utopia_core::models::RelationTypeView;
 use utopia_extract::phrase_align::{
@@ -111,9 +112,21 @@ pub(crate) fn structurally_fits(
 
 /// 签名两端的类落在属性声明的域/值域里，经继承也算；正反两个方向都算。
 fn fits(p: &RelationTypeView, sig: &PhraseSignature, closure: &Closure) -> Option<Fit> {
+    fits_direction(p, sig, closure, Direction::Forward)
+        .or_else(|| fits_direction(p, sig, closure, Direction::Reverse))
+}
+
+// Admitting a property in either orientation does not admit both orientations.
+// Two agreeing model votes used to turn a forward-only candidate into a reverse binding.
+fn fits_direction(
+    p: &RelationTypeView,
+    sig: &PhraseSignature,
+    closure: &Closure,
+    direction: Direction,
+) -> Option<Fit> {
     let mut via = Vec::new();
     if sig.object_is_value {
-        if p.kind != "attribute" {
+        if p.kind != "attribute" || direction != Direction::Forward {
             return None;
         }
         via.extend(within(&p.domains, sig.subject_type_id, closure)?);
@@ -122,24 +135,173 @@ fn fits(p: &RelationTypeView, sig: &PhraseSignature, closure: &Closure) -> Optio
     if p.kind != "relation" {
         return None;
     }
-    let forward = within(&p.domains, sig.subject_type_id, closure).zip(within(
-        &p.ranges,
-        sig.object_type_id,
-        closure,
-    ));
-    let reverse = within(&p.domains, sig.object_type_id, closure).zip(within(
-        &p.ranges,
-        sig.subject_type_id,
-        closure,
-    ));
-    let (a, b) = forward.or(reverse)?;
+    let (subject, object) = match direction {
+        Direction::Forward => (sig.subject_type_id, sig.object_type_id),
+        Direction::Reverse => (sig.object_type_id, sig.subject_type_id),
+    };
+    let a = within(&p.domains, subject, closure)?;
+    let b = within(&p.ranges, object, closure)?;
     via.extend(a);
     via.extend(b);
     Some(Fit { via })
 }
 
+fn invalid_agent_direction(
+    b: &phrase_bindings::Binding,
+    sig: &PhraseSignature,
+    props: &[RelationTypeView],
+    closure: &Closure,
+) -> bool {
+    b.decided_by == "agent"
+        && b.status == "bound"
+        && b.relation_type_id
+            .and_then(|id| props.iter().find(|p| p.id == id))
+            .is_some_and(|p| match b.direction.as_deref() {
+                Some("forward") => fits_direction(p, sig, closure, Direction::Forward).is_none(),
+                Some("reverse") => fits_direction(p, sig, closure, Direction::Reverse).is_none(),
+                _ => true,
+            })
+}
+
+/// 这条关系叫这个短语：键或标签归一后与它相等（同类别词的归一）。像不算——
+/// 「validated by tests」不是 validated_by，那是模型的题
+fn named_by(p: &RelationTypeView, phrase: &str) -> bool {
+    phrase_bindings::normalize(&p.key) == phrase || phrase_bindings::normalize(&p.label) == phrase
+}
+
+/// 签名的短语正好是一条声明了的关系（#1242）：它叫这个短语，主语的类落在声明的域里、
+/// 宾语的类落在值域里（经继承也算），只认正向。域或值域没声明的不算——没声明是「不限」，
+/// 不是「就是它」；一端没有类的也不算。状态关系不算：绑上它还得说只带一个日期的陈述那个
+/// 日期标哪一端（`marks`，#966），本体答不了，留给对齐器——它绑上、顺带问这一格，问不到的
+/// 进队列等人。叫这个短语、两端也都对得上的不止一条，谁也不认：两条关系叫得一样，该由人
+/// 或模型来挑
+fn declared<'a>(
+    sig: &PhraseSignature,
+    props: &'a [RelationTypeView],
+    closure: &Closure,
+) -> Option<&'a RelationTypeView> {
+    if sig.object_is_value {
+        return None;
+    }
+    let mut fitting = props.iter().filter(|p| {
+        p.kind == "relation"
+            && p.temporal != "state"
+            && !p.domains.is_empty()
+            && !p.ranges.is_empty()
+            && named_by(p, &sig.phrase)
+            && fits_direction(p, sig, closure, Direction::Forward).is_some()
+    });
+    let only = fitting.next()?;
+    fitting.next().is_none().then_some(only)
+}
+
+/// 对齐器不再判的判定：人的；本体判的、此刻仍是它声明的那条关系的。本体判的行没有指纹，
+/// 按指纹比永远「过期」——不先放过它，每轮都会把它送去问模型、收尾时又以为变了再排一份
+fn settled(
+    b: &phrase_bindings::Binding,
+    sig: &PhraseSignature,
+    props: &[RelationTypeView],
+    closure: &Closure,
+) -> bool {
+    b.decided_by == "person"
+        || (b.decided_by == "ontology"
+            && b.relation_type_id.is_some()
+            && declared(sig, props, closure).map(|p| p.id) == b.relation_type_id)
+}
+
+/// 推送来的文档抽完（0054）：它的陈述落在的签名里，短语正好是一条声明了的关系的，由本体
+/// 直接绑上，记成本体判的（#1242）。不问模型，没配对话模型也照判；别的签名照旧留给对齐器。
+/// 判定照旧是签名上的一行（0044 决定 3），人看得见、改得了；人的判定不动（`decide_on`
+/// 的规矩），已经由本体按同一条关系判过的不重写——判定时刻和回归记录不该随每次推送翻新。
+/// 返回写下的判定数
+pub(crate) async fn bind_declared(
+    pool: &sqlx::PgPool,
+    kb_id: Uuid,
+    document_id: Uuid,
+) -> anyhow::Result<usize> {
+    let props = utopia_store::ontology::relation_type_views(pool, kb_id).await?;
+    let keys: HashSet<SignatureKey> =
+        phrase_bindings::signature_keys_of_document(pool, kb_id, document_id)
+            .await?
+            .into_iter()
+            .filter(|(phrase, ..)| props.iter().any(|p| named_by(p, phrase)))
+            .collect();
+    // 多数推送没有一个短语叫得出关系的名字：库级的签名就不必数了
+    if keys.is_empty() {
+        return Ok(0);
+    }
+    let classes = utopia_store::graph::entity_types(pool, kb_id).await?;
+    let closure = closures(classes.iter().map(|c| (c.id, c.parents.as_slice())));
+    let existing: HashMap<_, _> = phrase_bindings::bindings(pool, kb_id)
+        .await?
+        .into_iter()
+        .map(|b| (b.key(), b))
+        .collect();
+    // 判过的先剔掉：库级的签名是整库分组，每次推送都数一遍太贵（#1296）
+    let keys: HashSet<SignatureKey> = keys
+        .into_iter()
+        .filter(|k| {
+            !existing
+                .get(k)
+                .is_some_and(|b| settled(b, &keyed(k), &props, &closure))
+        })
+        .collect();
+    if keys.is_empty() {
+        return Ok(0);
+    }
+    let mut written = 0;
+    for s in phrase_bindings::signatures(pool, kb_id)
+        .await?
+        .iter()
+        .filter(|s| keys.contains(&s.key()))
+    {
+        let Some(p) = declared(s, &props, &closure) else {
+            continue;
+        };
+        if phrase_bindings::decide(
+            pool,
+            kb_id,
+            s,
+            Decision {
+                relation_type_id: Some(p.id),
+                direction: Some(Direction::Forward.as_str()),
+                status: "bound",
+                votes: &serde_json::json!({ "reason": "declared_relation" }),
+                decided_by: "ontology",
+                basis: None,
+                marks: None,
+                marks_asked: false,
+            },
+        )
+        .await?
+        {
+            written += 1;
+        }
+    }
+    Ok(written)
+}
+
 /// 签名的键：短语 + 两端的类 + 宾语是不是字面值（与 `PhraseSignature::key` 同形）
 type SignatureKey = (String, Option<Uuid>, Option<Uuid>, bool);
+
+/// 只有键的签名：`settled` 只看键上的这几格，不必为它把库里的签名数一遍
+fn keyed(
+    (phrase, subject_type_id, object_type_id, object_is_value): &SignatureKey,
+) -> PhraseSignature {
+    PhraseSignature {
+        phrase: phrase.clone(),
+        subject_type_id: *subject_type_id,
+        subject_type_key: None,
+        object_type_id: *object_type_id,
+        object_type_key: None,
+        object_is_value: *object_is_value,
+        count: 0,
+        examples: Vec::new(),
+        quotes: Vec::new(),
+        example_statement_ids: Vec::new(),
+    }
+}
+
 /// 每条签名此刻的候选与指纹
 type Considered<'a> = HashMap<SignatureKey, (Vec<&'a RelationTypeView>, String)>;
 
@@ -269,7 +431,10 @@ type Shortlist = HashMap<SignatureKey, Vec<Uuid>>;
 /// 按相关度给候选多的签名开短名单：签名的文本（短语加一条例句）嵌入后，与属性的向量比
 /// 近（`embed_ontology` 建的那份），留最近的 [`SHORTLIST`] 条；标签里的词出现在短语里的
 /// 属性无论远近都留着（"based in" 对 "based in"）。没配嵌入模型、属性还没向量、或候选本来
-/// 就不多的签名不进表——那时模型看的还是全部结构候选
+/// 就不多的签名不进表——那时模型看的还是全部结构候选。
+///
+/// 签名的向量按 (库, 嵌入模型, 文本的哈希) 存在 `signature_vectors` 里，一轮只嵌没见过的
+/// 文本（#1097）：签名的文本两轮之间几乎不变，从前每轮全部重嵌，判的可能只是新来的几十条
 async fn shortlist(
     state: &AppState,
     settings: &utopia_core::models::LlmSettings,
@@ -278,17 +443,28 @@ async fn shortlist(
     full: &Considered<'_>,
 ) -> anyhow::Result<Shortlist> {
     let mut out = Shortlist::new();
-    let Some(client) = llm_util::embed_client(settings) else {
+    let (Some(client), Some(model)) = (
+        llm_util::embed_client(settings),
+        settings.embed_model.as_deref(),
+    ) else {
         return Ok(out);
     };
     let wide: Vec<&PhraseSignature> = sigs
         .iter()
         .filter(|s| full.get(&s.key()).is_some_and(|(f, _)| f.len() > SHORTLIST))
         .collect();
+    let pool = &state.pool;
+    let texts: Vec<String> = wide.iter().map(|s| signature_text(s)).collect();
+    let hashes: Vec<Vec<u8>> = texts
+        .iter()
+        .map(|t| Sha256::digest(t.as_bytes()).to_vec())
+        .collect();
+    // 这一轮不再出现的文本、别的模型嵌的向量删掉。按全部候选多的签名留，不只按下面嵌了的：
+    // 一批嵌入失败时，上一轮存好的不跟着丢
+    utopia_store::signature_vectors::prune(pool, kb_id, model, &hashes).await?;
     if wide.is_empty() {
         return Ok(out);
     }
-    let pool = &state.pool;
     // 先问这一类属性有没有向量，没有的签名不嵌：嵌了最近邻也是空，照样看全部。一个没跑过
     // `embed_ontology` 的库从前每轮把一万七千条签名送去嵌入、短名单一条没开（#1097）。
     // 一类问一句，至多两句
@@ -300,23 +476,25 @@ async fn shortlist(
             has_vectors.insert(kind, has);
         }
     }
-    let usable: Vec<&PhraseSignature> = wide
+    let usable: Vec<usize> = (0..wide.len())
+        .filter(|&i| has_vectors.get(property_kind(wide[i])) == Some(&true))
+        .collect();
+    let wanted: Vec<Vec<u8>> = usable.iter().map(|&i| hashes[i].clone()).collect();
+    let mut vectors = utopia_store::signature_vectors::get(pool, kb_id, model, &wanted).await?;
+    let reused = vectors.len();
+    // 没存过的才嵌；两条签名文本相同（例句、引文都一样）只嵌一次
+    let mut queued = HashSet::new();
+    let missing: Vec<usize> = usable
         .iter()
         .copied()
-        .filter(|s| has_vectors.get(property_kind(s)) == Some(&true))
+        .filter(|&i| !vectors.contains_key(&hashes[i]) && queued.insert(&hashes[i]))
         .collect();
-    for batch in usable.chunks(SHORTLIST_EMBED_BATCH) {
-        let texts: Vec<String> = batch
-            .iter()
-            .map(|s| match (s.examples.first(), s.quotes.first()) {
-                (Some(e), Some(q)) => format!("{} · {e} · {q}", s.phrase),
-                (Some(e), None) => format!("{} · {e}", s.phrase),
-                _ => s.phrase.clone(),
-            })
-            .collect();
-        let vectors = {
+    let mut embedded = 0;
+    for batch in missing.chunks(SHORTLIST_EMBED_BATCH) {
+        let batch_texts: Vec<String> = batch.iter().map(|&i| texts[i].clone()).collect();
+        let got = {
             let _permit = llm_util::acquire_embed(state, settings).await;
-            match client.embed(&texts).await {
+            match client.embed(&batch_texts).await {
                 Ok(v) if v.len() == batch.len() => v,
                 Ok(v) => {
                     tracing::warn!(%kb_id, sent = batch.len(), got = v.len(), "签名向量数量对不上，这一批不开短名单");
@@ -328,40 +506,62 @@ async fn shortlist(
                 }
             }
         };
-        for (s, vector) in batch.iter().zip(vectors) {
-            let (fitting, _) = &full[&s.key()];
-            let near = utopia_store::ontology::nearest_relation_type_ids(
-                pool,
-                kb_id,
-                &vector,
-                (fitting.len() * 2) as i64,
-                Some(property_kind(s)),
-            )
-            .await?;
-            if near.is_empty() {
-                // 属性还没有向量：不开短名单，模型看全部
-                continue;
-            }
-            let fitting_ids: Vec<Uuid> = fitting.iter().map(|p| p.id).collect();
-            let must_keep: Vec<Uuid> = fitting
-                .iter()
-                .filter(|p| label_in_phrase(&p.label, &s.phrase))
-                .map(|p| p.id)
-                .collect();
-            out.insert(
-                s.key(),
-                pick_shortlist(&near, &fitting_ids, &must_keep, SHORTLIST),
-            );
+        let items: Vec<(Vec<u8>, Vec<f32>)> =
+            batch.iter().map(|&i| hashes[i].clone()).zip(got).collect();
+        utopia_store::signature_vectors::put(pool, kb_id, model, &items).await?;
+        embedded += items.len();
+        vectors.extend(items);
+    }
+    for &i in &usable {
+        let s = wide[i];
+        // 这一批没嵌出来：不开短名单，模型看全部
+        let Some(vector) = vectors.get(&hashes[i]) else {
+            continue;
+        };
+        let (fitting, _) = &full[&s.key()];
+        let near = utopia_store::ontology::nearest_relation_type_ids(
+            pool,
+            kb_id,
+            vector,
+            (fitting.len() * 2) as i64,
+            Some(property_kind(s)),
+        )
+        .await?;
+        if near.is_empty() {
+            // 属性还没有向量：不开短名单，模型看全部
+            continue;
         }
+        let fitting_ids: Vec<Uuid> = fitting.iter().map(|p| p.id).collect();
+        let must_keep: Vec<Uuid> = fitting
+            .iter()
+            .filter(|p| label_in_phrase(&p.label, &s.phrase))
+            .map(|p| p.id)
+            .collect();
+        out.insert(
+            s.key(),
+            pick_shortlist(&near, &fitting_ids, &must_keep, SHORTLIST),
+        );
     }
     tracing::info!(
         %kb_id,
         wide = wide.len(),
         skipped = wide.len() - usable.len(),
+        reused,
+        embedded,
         shortlisted = out.len(),
         "候选短名单开好"
     );
     Ok(out)
+}
+
+/// 嵌入用的签名文本：短语加第一条例句和它的引文。缓存按它的哈希认，改了这里旧向量都对不上，
+/// 下一轮全部重嵌一次
+fn signature_text(s: &PhraseSignature) -> String {
+    match (s.examples.first(), s.quotes.first()) {
+        (Some(e), Some(q)) => format!("{} · {e} · {q}", s.phrase),
+        (Some(e), None) => format!("{} · {e}", s.phrase),
+        _ => s.phrase.clone(),
+    }
 }
 
 /// 签名能绑的是哪一类属性：宾语是字面值的绑属性，否则绑关系
@@ -463,6 +663,9 @@ pub async fn align_phrases_reasking(
     reask: u32,
 ) -> anyhow::Result<()> {
     let pool = &state.pool;
+    // Human interpretations are deliberately preserved by alignment. Report that preservation
+    // explicitly even when no model is configured; it is not a fresh semantic judgment.
+    utopia_store::ontology_regressions::record_human(pool, kb_id).await?;
     let kb = utopia_store::kbs::get(pool, kb_id).await?;
     let settings = utopia_store::settings::get(pool, kb.workspace_id)
         .await?
@@ -548,16 +751,17 @@ async fn align_phrases_locked(
     let short = shortlist(state, settings, kb_id, &sigs, &full).await?;
     let considered = consider(&sigs, &props, &closure, &versions, Some(&short));
     // 过期 = 存下的指纹和此刻的不一样（没有指纹的是这一列出现前判的，各重判一次）。
-    // 不再按时间戳：父边的增删、请求途中的编辑（#795）时间戳看不见。人的判定不重判。
-    // 绑到状态属性、从没问过一刻标哪一端的代理判定也问（`awaits_marks`，#966）
+    // 不再按时间戳：父边的增删、请求途中的编辑（#795）时间戳看不见。人的判定、本体仍认的
+    // 判定（`settled`）不重判。绑到状态属性、从没问过一刻标哪一端的代理判定也问（`awaits_marks`，#966）
     let todo: Vec<&PhraseSignature> = sigs
         .iter()
         .filter(|s| match existing.get(&s.key()) {
             None => true,
             Some(b) => {
-                b.decided_by != "person"
+                !settled(b, s, &props, &closure)
                     && (b.basis.as_deref() != Some(considered[&s.key()].1.as_str())
-                        || awaits_marks(b, &props))
+                        || awaits_marks(b, &props)
+                        || invalid_agent_direction(b, s, &props, &closure))
             }
         })
         .collect();
@@ -568,8 +772,10 @@ async fn align_phrases_locked(
         .iter()
         .filter_map(|s| {
             let b = existing.get(&s.key())?;
-            (b.basis.as_deref() == Some(considered[&s.key()].1.as_str()) && awaits_marks(b, &props))
-                .then_some((s.key(), b))
+            (b.basis.as_deref() == Some(considered[&s.key()].1.as_str())
+                && awaits_marks(b, &props)
+                && !invalid_agent_direction(b, s, &props, &closure))
+            .then_some((s.key(), b))
         })
         .collect();
     tracing::info!(%kb_id, signatures = sigs.len(), to_decide = todo.len(), properties = props.len(), "短语对齐开始");
@@ -755,8 +961,10 @@ async fn align_phrases_locked(
                     %kb_id,
                     pass,
                     items = items.len(),
+                    item_ids = ?items.iter().map(|item| item.id).collect::<Vec<_>>(),
                     malformed,
                     finish_reason = ?reply.finish_reason,
+                    repeating = reply.repeating,
                     chars = reply.text.chars().count(),
                     reply = %snippet(&reply.text),
                     "短语对齐回复读不出一条，这一批留到下次"
@@ -874,18 +1082,27 @@ async fn align_phrases_locked(
                     })
                     .unwrap_or(serde_json::Value::Null)
             };
-            let record = if asked_twice {
+            let mut record = if asked_twice {
                 serde_json::json!({ "first": show(a), "second": show(b) })
             } else {
                 serde_json::json!({ "first": null, "reason": "first_vote_none" })
             };
+            let valid = |v: &Vote| v.as_ref().is_none_or(|(k, d, _)| {
+                by_key.get(k.as_str()).is_some_and(|p| fits_direction(p, s, closure, *d).is_some())
+            });
+            let invalid_direction = !valid(a) || !valid(b);
+            if invalid_direction {
+                // Keep both votes for review; an invalid direction is neither a
+                // semantic none nor permission to silently flip the model's answer.
+                record["reason"] = serde_json::json!("invalid_direction");
+            }
             // 两票选的属性与方向（或都说没有）是否一致
             let agree = match (a, b) {
                 (Some((ka, da, _)), Some((kb, db, _))) => ka == kb && da == db,
                 (None, None) => true,
                 _ => false,
             };
-            if !agree {
+            if !agree || invalid_direction {
                 phrase_bindings::decide(
                     pool,
                     kb_id,
@@ -986,6 +1203,69 @@ async fn align_phrases_locked(
             unanswered += un;
             marked += m;
             unsettled += us;
+        }
+    }
+    // Old invalid agent bindings have matching fingerprints, so explicitly retry
+    // them above. If the model fails, structural invalidity still cannot support
+    // their typed rows: keep the old votes in an undecided result for a person.
+    // Read again so a person who decided during the request remains protected.
+    let repair: Vec<_> = todo
+        .iter()
+        .copied()
+        .filter(|s| {
+            existing
+                .get(&s.key())
+                .is_some_and(|b| invalid_agent_direction(b, s, &props, &closure))
+        })
+        .collect();
+    if !repair.is_empty() {
+        let now: HashMap<_, _> = phrase_bindings::bindings(pool, kb_id)
+            .await?
+            .into_iter()
+            .map(|b| (b.key(), b))
+            .collect();
+        for s in repair {
+            let Some(b) = now.get(&s.key()) else {
+                continue;
+            };
+            if !invalid_agent_direction(b, s, &props, &closure) {
+                continue;
+            }
+            let previous: Option<serde_json::Value> = sqlx::query_scalar(
+                "SELECT votes FROM phrase_bindings WHERE kb_id=$1 AND phrase=$2
+             AND subject_type_id IS NOT DISTINCT FROM $3
+             AND object_type_id IS NOT DISTINCT FROM $4 AND object_is_value=$5",
+            )
+            .bind(kb_id)
+            .bind(&s.phrase)
+            .bind(s.subject_type_id)
+            .bind(s.object_type_id)
+            .bind(s.object_is_value)
+            .fetch_optional(pool)
+            .await?;
+            let Some(previous) = previous else {
+                continue;
+            };
+            if phrase_bindings::decide(
+                pool,
+                kb_id,
+                s,
+                Decision {
+                    relation_type_id: None,
+                    direction: None,
+                    status: "undecided",
+                    votes: &serde_json::json!({"reason":"invalid_direction", "previous":previous,
+                                      "previous_decided_at":b.decided_at}),
+                    decided_by: "agent",
+                    basis: Some(&considered[&s.key()].1),
+                    marks: None,
+                    marks_asked: false,
+                },
+            )
+            .await?
+            {
+                undecided += 1;
+            }
         }
     }
     tracing::info!(%kb_id, bound, none, undecided, skipped, failed, unanswered, marked, unsettled, "短语对齐完成");
@@ -1126,7 +1406,7 @@ async fn align_phrases_locked(
         sigs.iter().any(|s| match now.get(&s.key()) {
             None => !attempted.contains(&s.key()),
             Some(b) => {
-                b.decided_by != "person"
+                !settled(b, s, &props, &closure)
                     && b.basis.as_deref() != Some(now_considered[&s.key()].1.as_str())
             }
         })
@@ -1180,6 +1460,10 @@ async fn align_phrases_locked(
 #[cfg(test)]
 #[path = "phrase_alignment_tests.rs"]
 mod lifecycle_tests;
+
+#[cfg(test)]
+#[path = "phrase_alignment_declared_tests.rs"]
+mod declared_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1289,6 +1573,7 @@ mod tests {
             count: 1,
             examples: Vec::new(),
             quotes: Vec::new(),
+            example_statement_ids: Vec::new(),
         }
     }
 
@@ -1356,6 +1641,49 @@ mod tests {
             fits(&hq, &sig(Some(org), Some(place), false), &Closure::new()).is_none(),
             "without the parent edge the property is not a candidate"
         );
+    }
+
+    #[test]
+    fn a_selected_direction_respects_inheritance_unknown_types_and_literal_shape() {
+        let (parent, child, place) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+        let closure = closures([(parent, &[][..]), (child, &[parent][..]), (place, &[][..])]);
+        let relation = view("relation", vec![parent], vec![place]);
+        let attribute = view("attribute", vec![parent], vec![]);
+        let open = view("relation", vec![], vec![]);
+        let any_to_place = view("relation", vec![], vec![place]);
+        for (p, s, allowed) in [
+            (
+                &relation,
+                sig(Some(child), Some(place), false),
+                [true, false],
+            ),
+            (
+                &relation,
+                sig(Some(place), Some(child), false),
+                [false, true],
+            ),
+            (&relation, sig(None, Some(place), false), [false, false]),
+            (&any_to_place, sig(None, Some(place), false), [true, false]),
+            (&any_to_place, sig(Some(place), None, false), [false, true]),
+            (&open, sig(None, None, false), [true, true]),
+            (&attribute, sig(Some(child), None, true), [true, false]),
+            (
+                &attribute,
+                sig(Some(child), Some(place), false),
+                [false, false],
+            ),
+            (&relation, sig(Some(child), None, true), [false, false]),
+        ] {
+            for (direction, expected) in [Direction::Forward, Direction::Reverse]
+                .into_iter()
+                .zip(allowed)
+            {
+                assert_eq!(
+                    fits_direction(p, &s, &closure, direction).is_some(),
+                    expected
+                );
+            }
+        }
     }
 
     /// 闭包：多继承与菱形，每个祖先只出现一次，且含自己

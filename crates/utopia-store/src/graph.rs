@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use utopia_core::models::{
     ChunkFactView, EntityFact, EntityHistoryEvent, EntityType, EvidenceView, FactQualifier,
-    FactReviewItem, GraphChange, GraphEdge, GraphNode, ProposedPredicate, RelationType,
+    FactReviewItem, GraphChange, GraphEdge, GraphNode, RelationType, StatementQualifier,
 };
 use utopia_core::{AppError, AppResult};
 use uuid::Uuid;
@@ -17,12 +17,6 @@ type FactSpanRow = (
     Option<chrono::DateTime<chrono::Utc>>,
     Option<String>,
 );
-
-/// 采纳时旧事实的去向（`fact_adoptions.mode`）：新写一行取代它。
-const ADOPT_SUPERSEDED: &str = "superseded";
-/// 目标断言已存在 → 并进去。旧行被作废且没有后继，实体历史必须据此把它
-/// 读成"并入"而不是"撤回"，否则界面会宣称一件没发生的事。
-const ADOPT_MERGED: &str = "merged";
 
 // 建库不再播种任何关系，也不再有 `ensure_default_ontology`。
 //
@@ -205,17 +199,6 @@ pub async fn fact_qualifiers_for(
     Ok(out)
 }
 
-/// 开放陈述上的一个属性（0044 第一刀）：按文档的角色词记，不按本体属性。
-/// 值或实体二选一；实体那一格带上它的显示名
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct StatementQualifier {
-    /// 文档自己的角色词（"amount"、"buyer"）
-    pub role: String,
-    pub value: Option<serde_json::Value>,
-    pub entity_id: Option<Uuid>,
-    pub entity_name: Option<String>,
-}
-
 /// 往一条开放陈述上写一个按角色词记的属性。**先写者留着**：同一条陈述同一个角色词
 /// 再听到一次不覆盖（与 [`upsert_fact_qualifier`] 的 Conflict 一条规矩——两次观察
 /// 不一致该另立一行加一条冲突，这一刀还没走到那一步）。值与实体必须恰好给一个
@@ -346,6 +329,10 @@ pub struct Validity<'a> {
     /// `C` 有时间词但锚不到。`None` = 没经过时间解析（人写的、规则算的），按 A 算。
     /// 时态引擎读它决定这一行能不能关上前任
     pub from_grade: Option<&'a str>,
+    /// 终点是原文所说时段之后的那一刻（`facts.end_after_period`，#994）：「2024 年离开」关上
+    /// 2024-03-01 起的那段，存 2025-01-01，原文说的是 2024。只看值分不出它和「到 2025 年」。
+    /// 写入口归一（`drop_period_mark_unless`），只留在带得了它的行上（[`period_mark_fits`]）
+    pub end_after_period: bool,
 }
 
 /// `valid_to_precision` 表示「结束了，但不知道是哪天」。
@@ -464,6 +451,7 @@ impl<'a> Validity<'a> {
             to_precision: None,
             attested_at: None,
             from_grade: None,
+            end_after_period: false,
         }
     }
 
@@ -533,6 +521,15 @@ impl<'a> Validity<'a> {
         self
     }
 
+    /// 「终点说的是它之前那个时段」带不了的行（[`period_mark_fits`]），标记在这里丢掉：两个
+    /// 写入口（`insert_fact_on`、`correct_interval`）在 [`Validity::under`] 之后各过一遍。
+    /// 事件归一成一刻、恒常抹掉日期、没有谓词的行不过 `under`，都落在这里。进写入口的终点是
+    /// 写明的，不是时间线画的
+    pub(crate) fn drop_period_mark_unless(mut self, declared_state: bool) -> Self {
+        self.end_after_period &= period_mark_fits(declared_state, self.from, self.to, false);
+        self
+    }
+
     /// 这条断言是否已经不再成立——**两种结束都算**。
     ///
     /// 判据写在这里而不是散在各处的 `valid_to.is_some()`：那种写法会把
@@ -540,6 +537,23 @@ impl<'a> Validity<'a> {
     pub fn has_ended(&self) -> bool {
         self.to.is_some() || self.to_precision == Some(ENDED_UNKNOWN)
     }
+}
+
+/// 一个终点带不带得了「说的是它之前那个时段」的标记（`end_after_period`，#994）：属性声明成
+/// 状态、有起点、终点有日期、不是时间线画的。
+///
+/// 与约束 `facts_end_after_period_needs_a_stated_end` 同一句话（属性是不是状态约束看不到，
+/// 由这里查）。Rust 这边判这件事的都调它：写入口的归一（`Validity::drop_period_mark_unless`）、
+/// `temporal::rewrite_end_tx` 落标记前、`temporal::mark_end_after_period` 补标记前、改区间的
+/// 路由。没有起点的行第一刀不标：终点只在起点落在那个时段里时才被挪到时段的尽头。第二刀让
+/// 时间解析自己写这种终点时，起点那一条在这里和约束里一起去掉
+pub fn period_mark_fits(
+    declared_state: bool,
+    from: Option<chrono::DateTime<chrono::Utc>>,
+    to: Option<chrono::DateTime<chrono::Utc>>,
+    end_derived: bool,
+) -> bool {
+    declared_state && from.is_some() && to.is_some() && !end_derived
 }
 
 /// 一段起止同值的状态（#966）：写入、改区间、关上都拒它，说的是同一句话
@@ -598,7 +612,8 @@ pub(crate) async fn insert_fact_on(
         validity.truncated().under(temporal)?
     } else {
         validity.truncated()
-    };
+    }
+    .drop_period_mark_unless(declared_state);
     let same_sql = match object {
         FactObject::Entity(_) => {
             "SELECT id, valid_from, valid_to, valid_to_precision FROM facts
@@ -656,9 +671,14 @@ pub(crate) async fn insert_fact_on(
                 && vtp.as_deref() == Some(ENDED_UNKNOWN)
                 && validity.from.is_none_or(|f| Some(f) == *vf)
         }) {
-            if let Some(stated) =
-                crate::temporal::state_derived_end(&mut *conn, *ended, None, validity.attested_at)
-                    .await?
+            if let Some(stated) = crate::temporal::state_derived_end(
+                &mut *conn,
+                *ended,
+                None,
+                false,
+                validity.attested_at,
+            )
+            .await?
             {
                 return Ok((stated, true));
             }
@@ -680,27 +700,43 @@ pub(crate) async fn insert_fact_on(
             // 照旧关在时段的开头（0053 修订 2026-09-27）。同一天开始又结束的也是这样：关在
             // 那一天的尽头，不关在它自己的起点——那是一段不成立的状态（#966）
             let period_end = declared_state.then(|| bucket_end(to, Some(precision)));
+            // 关在哪一刻，和终点是不是因此挪到了时段的尽头：挪了的，行上记下终点说的是它之前
+            // 那个时段（`end_after_period`，#994），读者才印得出原文说的 2024
             let closes_at = |from: Option<chrono::DateTime<chrono::Utc>>| match (from, period_end) {
-                (Some(f), Some(end)) if to <= f && f < end => end,
-                _ => to,
+                (Some(f), Some(end)) if to <= f && f < end => (end, true),
+                _ => (to, false),
             };
             // 已经关在那一刻的：同一件事，复用那一行（引擎推的终点改成写明的，同上）
             if let Some((ended, from, _, _)) = same
                 .iter()
-                .find(|(_, vf, vt, _)| *vt == Some(closes_at(*vf)))
+                .find(|(_, vf, vt, _)| *vt == Some(closes_at(*vf).0))
             {
+                let (at, moved) = closes_at(*from);
                 if let Some(stated) = crate::temporal::state_derived_end(
                     &mut *conn,
                     *ended,
-                    Some((closes_at(*from), precision)),
+                    Some((at, precision)),
+                    moved,
                     validity.attested_at,
                 )
                 .await?
                 {
                     return Ok((stated, true));
                 }
-                attest_earlier(&mut *conn, *ended, validity.attested_at, true).await?;
-                return Ok((*ended, false));
+                // 写明的终点被另一种说法再说一遍：那一行是「到 2025 年」关上的，这次是「2024 年
+                // 离开」，同一个终点。标上它，两句谁先到都一样。上面只比了时刻：人改过的终点、
+                // 别的精度写明的终点不改，由 `mark_end_after_period` 锁住那一行再查。
+                // 标上了也是并进那一行，不报新行：报成新行，物化会给它记上这句的
+                // `from_statement_id`、规则会记上 `implied`，人关上的行就成了算出来的，这句的
+                // 陈述一没，它跟着被作废
+                let marked = if moved {
+                    crate::temporal::mark_end_after_period(&mut *conn, *ended, precision).await?
+                } else {
+                    None
+                };
+                let row = marked.unwrap_or(*ended);
+                attest_earlier(&mut *conn, row, validity.attested_at, true).await?;
+                return Ok((row, false));
             }
             let open = same
                 .iter()
@@ -714,13 +750,9 @@ pub(crate) async fn insert_fact_on(
                 })
                 .max_by_key(|(_, vf, _, _)| *vf);
             if let Some((open, from, _, _)) = open {
-                if let Some(closed) = crate::temporal::close_superseded(
-                    &mut *conn,
-                    *open,
-                    closes_at(*from),
-                    precision,
-                )
-                .await?
+                let (at, moved) = closes_at(*from);
+                if let Some(closed) =
+                    crate::temporal::close_stated(&mut *conn, *open, at, precision, moved).await?
                 {
                     return Ok((closed, true));
                 }
@@ -730,13 +762,16 @@ pub(crate) async fn insert_fact_on(
     // 精确重复：同 valid_from → 复用。同起点、**这次带了终点、那行还开着** → 关上它
     // （「自 2020-01-10 起任董事」之后读到「2020-01-10 至 2024-04-30 任董事」）
     if let Some((existing, _, vt, vtp)) = same.iter().find(|(_, vf, _, _)| *vf == validity.from) {
+        // 这次带来的终点若说的是它之前那个时段（勘误改出来的行接旧行的标记），关上时一起带上；
+        // 复用的那行原样留着它自己的终点和标记
         if temporal == Temporal::State && vt.is_none() && vtp.is_none() {
             if let Some(to) = validity.to {
-                if let Some(closed) = crate::temporal::close_superseded(
+                if let Some(closed) = crate::temporal::close_stated(
                     &mut *conn,
                     *existing,
                     to,
                     validity.to_precision.unwrap_or("day"),
+                    validity.end_after_period,
                 )
                 .await?
                 {
@@ -753,6 +788,7 @@ pub(crate) async fn insert_fact_on(
                 &mut *conn,
                 *existing,
                 stated_to,
+                validity.end_after_period,
                 validity.attested_at,
             )
             .await?
@@ -806,22 +842,22 @@ pub(crate) async fn insert_fact_on(
             if vf.is_some() {
                 return None;
             }
-            let end = match (validity.to, *vt) {
+            let (end, moved) = match (validity.to, *vt) {
                 (None, Some(t)) if declared_state && t <= from => {
                     let end = bucket_end(t, Some(vtp.as_deref().unwrap_or("day")));
                     if from >= end {
                         return None;
                     }
-                    Some(end)
+                    (Some(end), true)
                 }
                 (Some(to), Some(t)) if to != t => return None,
-                (_, vt) => vt,
+                (_, vt) => (vt, false),
             };
-            Some((*id, end, vtp.clone()))
+            Some((*id, end, vtp.clone(), moved))
         }),
         None => None,
     };
-    if let Some((_, Some(vt), vtp)) = &refine_target {
+    if let Some((_, Some(vt), vtp, moved)) = &refine_target {
         if validity.to.is_none() {
             validity.to = Some(*vt);
             validity.to_precision = vtp.as_deref().map(|p| match p {
@@ -833,9 +869,11 @@ pub(crate) async fn insert_fact_on(
                 "second" => "second",
                 _ => ENDED_UNKNOWN,
             });
+            // 沿用来的终点挪到了时段的尽头：与收尾那条路同一个标记，两种陈述顺序写下同一行
+            validity.end_after_period = *moved;
         }
     }
-    let refine_target = refine_target.map(|(id, _, _)| id);
+    let refine_target = refine_target.map(|(id, _, _, _)| id);
 
     let id = Uuid::now_v7();
     let insert_sql = match object {
@@ -844,17 +882,17 @@ pub(crate) async fn insert_fact_on(
             "INSERT INTO facts (id, kb_id, subject_id, predicate_id, object_id,
                                 valid_from, valid_from_precision,
                                 valid_to, valid_to_precision, confidence,
-                                attested_from, attested_to, valid_from_grade)
+                                attested_from, attested_to, valid_from_grade, end_after_period)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE($11, now()),
-                     CASE WHEN $9::text = 'unknown' THEN COALESCE($11, now()) END, $12)"
+                     CASE WHEN $9::text = 'unknown' THEN COALESCE($11, now()) END, $12, $13)"
         }
         FactObject::Value(_) => {
             "INSERT INTO facts (id, kb_id, subject_id, predicate_id, object_value,
                                 valid_from, valid_from_precision,
                                 valid_to, valid_to_precision, confidence,
-                                attested_from, attested_to, valid_from_grade)
+                                attested_from, attested_to, valid_from_grade, end_after_period)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE($11, now()),
-                     CASE WHEN $9::text = 'unknown' THEN COALESCE($11, now()) END, $12)"
+                     CASE WHEN $9::text = 'unknown' THEN COALESCE($11, now()) END, $12, $13)"
         }
     };
     let mut ins = sqlx::query(insert_sql)
@@ -873,6 +911,7 @@ pub(crate) async fn insert_fact_on(
         .bind(confidence)
         .bind(validity.attested_at)
         .bind(validity.from_grade)
+        .bind(validity.end_after_period)
         .execute(&mut *conn)
         .await?;
 
@@ -1473,14 +1512,16 @@ async fn edges_among(
     .bind(as_of)
     .fetch_all(pool)
     .await?;
-    // 边上的属性另一张表（0037），按 id 一次取回补上
+    // 边上的属性另两张表（0037 按本体属性、0061 按角色词），按 id 一次取回补上
     {
         let ids: Vec<Uuid> = edges.iter().map(|x| x.id).collect();
-        let mut by_fact = fact_qualifiers_for(pool, &ids).await?;
+        let (mut typed, mut worded) = tokio::try_join!(
+            fact_qualifiers_for(pool, &ids),
+            statement_qualifiers_for(pool, &ids)
+        )?;
         for x in edges.iter_mut() {
-            if let Some(q) = by_fact.remove(&x.id) {
-                x.qualifiers = q;
-            }
+            x.qualifiers = typed.remove(&x.id).unwrap_or_default();
+            x.statement_qualifiers = worded.remove(&x.id).unwrap_or_default();
         }
     }
     Ok(edges)
@@ -1756,7 +1797,7 @@ pub async fn entity_detail(
                                  WHERE fe.fact_id = f.id AND {chunk_live})
                 ) AS stale,
                 (f.supersedes IS NOT NULL) AS corrected,
-                f.end_derived, {corrected_ends} AS corrected_ends,
+                f.end_derived, f.end_after_period, {corrected_ends} AS corrected_ends,
                 {corrected_ends} IS NOT NULL AS time_corrected,
                 closer.closed_by_id, closer.closed_by, closer.closed_by_value,
                 CASE WHEN {corrected_ends} IS NOT NULL THEN {correction_note} END
@@ -1820,14 +1861,16 @@ pub async fn entity_detail(
     .bind(at)
     .fetch_all(pool)
     .await?;
-    // 边上的属性另一张表（0037），按 id 一次取回补上
+    // 边上的属性另两张表（0037 按本体属性、0061 按角色词），按 id 一次取回补上
     {
         let ids: Vec<Uuid> = facts.iter().map(|x| x.id).collect();
-        let mut by_fact = fact_qualifiers_for(pool, &ids).await?;
+        let (mut typed, mut worded) = tokio::try_join!(
+            fact_qualifiers_for(pool, &ids),
+            statement_qualifiers_for(pool, &ids)
+        )?;
         for x in facts.iter_mut() {
-            if let Some(q) = by_fact.remove(&x.id) {
-                x.qualifiers = q;
-            }
+            x.qualifiers = typed.remove(&x.id).unwrap_or_default();
+            x.statement_qualifiers = worded.remove(&x.id).unwrap_or_default();
         }
     }
 
@@ -2077,8 +2120,11 @@ pub async fn document_extractions(
     let rows: Vec<ChunkFactView> = sqlx::query_as(
         "SELECT fe.chunk_id, f.id AS fact_id,
                 f.subject_id, s.canonical_name AS subject,
-                COALESCE(r.label, fact_surface_predicate(f.id)) AS predicate,
+                -- 开放陈述的短语在 facts 本身，不依赖旧证据的 proposed_predicate。
+                CASE WHEN f.layer='open' THEN f.phrase
+                     ELSE COALESCE(r.label, fact_surface_predicate(f.id)) END AS predicate,
                 r.id IS NULL AS inferred,
+                (f.layer='open' AND nullif(btrim(f.phrase),'') IS NOT NULL) AS is_open_statement,
                 -- 宾语是一样东西就用它的名字，是字面值（名字、金额、百分比）就用那个值。
                 -- 只取 canonical_name 的话，每一条值宾语的陈述在阅读页右栏都是主语加短语、
                 -- 后面空着一片——「Hugging Face, Inc. known as」后面什么都没有
@@ -2163,7 +2209,18 @@ pub async fn first_live_evidence(
 
 /// 证据回放路径：不过滤 superseded——它的职责就是能看旧版。
 /// stale = 证据版本落后于文档当前版本（UI 标 "from v{n}"）。
-pub async fn fact_evidence(pool: &PgPool, fact_id: Uuid) -> AppResult<Vec<EvidenceView>> {
+/// 事实不在本 KB 时 NotFound：路由只校验了路径里的 kb，事实 id 是调用方给的。
+pub async fn fact_evidence(
+    pool: &PgPool,
+    kb_id: Uuid,
+    fact_id: Uuid,
+) -> AppResult<Vec<EvidenceView>> {
+    sqlx::query("SELECT 1 FROM facts WHERE id = $1 AND kb_id = $2")
+        .bind(fact_id)
+        .bind(kb_id)
+        .fetch_optional(pool)
+        .await?
+        .ok_or(AppError::NotFound)?;
     let rows: Vec<EvidenceView> = sqlx::query_as(
         "SELECT fe.quote, fe.proposed_predicate, fe.chunk_id, c.document_id, d.filename, c.seq,
                 c.doc_version,
@@ -2492,566 +2549,6 @@ pub async fn graph_changes(
     .await?)
 }
 
-// ---------------------------------------------------------------------------
-// 谓词消解：把没有谓词的事实认领回本体
-// ---------------------------------------------------------------------------
-
-// 视图类型 ProposedPredicate 定义在 utopia-core::models（store 不直接依赖 serde）
-
-/// 没有谓词的事实上，原文用过哪些说法。
-///
-/// 这是本体扩展建议的证据基础——比 `ontology_misses` 的纯计数强的地方在于：
-/// 它连着具体事实，所以采纳一个说法时能直接说"将重新归类 57 条"并真的去改。
-pub async fn proposed_predicates(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<ProposedPredicate>> {
-    Ok(sqlx::query_as(
-        // **普遍程度从全量证据里数，不从积压里数。**
-        //
-        // 下面那些 WHERE 把行集收窄到「还没有谓词、还活着、宾语是实体」
-        // ——那是**采纳要改写的东西**，`fact_count` 该这么数。但 `doc_count`
-        // 回答的是另一个问题：这个说法在语料里有多普遍。拿残渣去数它会系统性
-        // 偏低，而且越用越低——说法一旦被采纳、被谓词匹配接住、或被修正作废，
-        // 它的行就离开积压了。一篇一篇往里灌的库尤其吃亏：每轮搬走一批，
-        // 剩下的永远攒不够两篇，本体于是永远长不起来。
-        //
-        // 实测（ai-timeline 348 块）：两种口径下 8 个说法分处门槛两侧，
-        // 按积压数是「只在 1 篇」、按全量数是「≥2 篇」。
-        //
-        // 走 CTE 而不是相关子查询：后者每组重扫一遍证据表，同一份数据上
-        // 360ms 对 7ms。这个函数每次 Suggest 和每次自动扩本体都要跑。
-        // **只看类型化那一层。** 开放陈述（0044）的短语也写在证据的 proposed_predicate
-        // 上，好让读路径按它显示；但它不是等着被采纳的说法——把一个开放短语自动
-        // 采纳成关系类型，正是那一刀说不做的事（对齐与绑定是第二刀）
-        "WITH spread AS (
-             SELECT e.proposed_predicate AS form,
-                    count(DISTINCT e.document_id) AS doc_count
-             FROM fact_evidence e
-             JOIN facts ff ON ff.id = e.fact_id
-             WHERE ff.kb_id = $1 AND ff.layer = 'typed' AND e.proposed_predicate IS NOT NULL
-             GROUP BY 1
-         )
-         SELECT fe.proposed_predicate AS form,
-                count(DISTINCT f.id) AS fact_count,
-                max(sp.doc_count) AS doc_count,
-                (SELECT s.canonical_name || ' → ' || o.canonical_name
-                 FROM fact_evidence e2
-                 JOIN facts f2 ON f2.id = e2.fact_id
-                 JOIN entities s ON s.id = f2.subject_id
-                 JOIN entities o ON o.id = f2.object_id
-                 WHERE e2.proposed_predicate = fe.proposed_predicate
-                   AND f2.kb_id = $1 AND f2.layer = 'typed'
-                   AND f2.predicate_id IS NULL AND f2.invalidated_at IS NULL
-                 LIMIT 1) AS example
-         FROM fact_evidence fe
-         JOIN facts f ON f.id = fe.fact_id
-         JOIN spread sp ON sp.form = fe.proposed_predicate
-         WHERE f.kb_id = $1 AND f.layer = 'typed' AND f.predicate_id IS NULL
-           AND f.invalidated_at IS NULL AND fe.proposed_predicate IS NOT NULL
-           -- 字面值宾语的不算：它们同样没有谓词、也带原文说法，但要的是
-           -- 一个属性而不是一个关系。混进来提案就会照着建关系，然后
-           -- `founding_date` 变成一条指向「2015」的边——正是这条路要修掉的东西
-           AND f.object_id IS NOT NULL
-           -- 用户拒绝过的说法不再出现在候选里（人工与自动两条路都据此绕开）
-           AND NOT EXISTS (SELECT 1 FROM ontology_misses m
-                           WHERE m.kb_id = $1 AND m.kind = 'relation_type'
-                             AND m.key = fe.proposed_predicate AND m.dismissed_at IS NOT NULL)
-         GROUP BY fe.proposed_predicate
-         ORDER BY fact_count DESC, form",
-    )
-    .bind(kb_id)
-    .fetch_all(pool)
-    .await?)
-}
-
-/// 每个待认领说法出现在**哪些文档**里。
-///
-/// [`proposed_predicates`] 已经给了 `doc_count`，但采纳那条路要先按屈折基把说法
-/// 归并（`sued` 与 `sues` 是一个关系），归并之后的篇数是**并集**而不是相加——
-/// 同一篇文档完全可能两种写法都用过，相加就成了重复计数，一篇文档能把一个说法
-/// 顶过「≥2 篇」的门槛。
-///
-/// **不筛兜底谓词。** 这条查询与 [`proposed_predicates`] 回答的是两个问题：
-/// 那条问「还有哪些说法等着被采纳」，看的是积压；这条问「这个说法有多普遍」，
-/// 看的是全量证据，条件与它内部那个 `spread` CTE 一致。
-///
-/// 第一版照抄了 `rt.key = 'related_to'`（当时还有那个兜底关系），理由写的是「两处条件要一致」——错的。
-/// 那样数出来的还是残渣：说法一旦被采纳、被谓词匹配接住、或被修正作废，
-/// 它的行就离开积压，篇数随之下降。一篇一篇往里灌的库因此永远攒不够两篇。
-/// 测试当场抓住了（两篇里只回来一篇）。
-pub async fn proposed_predicate_documents(
-    pool: &PgPool,
-    kb_id: Uuid,
-) -> AppResult<Vec<(String, Uuid)>> {
-    Ok(sqlx::query_as(
-        "SELECT DISTINCT fe.proposed_predicate, fe.document_id
-         FROM fact_evidence fe
-         JOIN facts f ON f.id = fe.fact_id
-         WHERE f.kb_id = $1 AND f.layer = 'typed'
-           AND fe.proposed_predicate IS NOT NULL
-           AND fe.document_id IS NOT NULL
-           AND NOT EXISTS (SELECT 1 FROM ontology_misses m
-                           WHERE m.kb_id = $1 AND m.kind = 'relation_type'
-                             AND m.key = fe.proposed_predicate AND m.dismissed_at IS NOT NULL)",
-    )
-    .bind(kb_id)
-    .fetch_all(pool)
-    .await?)
-}
-
-/// 把由 `forms` 认出来的无谓词事实改写到 `predicate_id`。
-/// 返回 (批次 id, 改写条数)——批次 id 是撤销的把手。
-///
-/// **追加而非原地改**：插入带 `supersedes` 的新行并作废旧行，与人工纠正、
-/// 时态闭合走同一条路——认知变更本身是信息，实体历史里读得到
-/// "先记成 related to，后精化成 available on"。
-///
-/// 只改写说法**全部**落在 `forms` 内的事实：一条事实可能积累多种说法
-/// （甲块 "runs on"、乙块 "optimized for"），只认领了其中一种就改写等于替
-/// 另一种也做了决定。实测这类事实占比不到 1%，宁可漏也不猜。
-///
-/// 每条去向都写进 `fact_adoptions`。`supersedes` 一个指针不够用——目标断言
-/// 已存在时走的是"并入"，旧行被作废却没有后继，于是既撤不回来、实体历史
-/// 又会把它判成 rejected 而对外宣称"这条被撤回了"（它其实一字未少地并进了
-/// 另一条）。
-/// `swap = true`：这些说法是目标关系的**被动形**，改写时主宾要对调。
-///
-/// `X produced_by Y` 与 `Y produces X` 是同一条边。不对调就会在图上多出一条
-/// 反着的箭头，而且它跟正向那些永远合不到一起——同一件事分在两个方向上。
-pub async fn adopt_proposed_predicates(
-    pool: &PgPool,
-    kb_id: Uuid,
-    predicate_id: Uuid,
-    forms: &[String],
-    swap: bool,
-) -> AppResult<Adopted> {
-    adopt(pool, kb_id, predicate_id, AdoptTargets::ByForm(forms), swap).await
-}
-
-/// 一次采纳的账。`left_off` 必须往上传：改写了 20 条、留下 3 条，只报前半句是报喜不报忧。
-#[derive(Debug, Clone, Copy)]
-pub struct Adopted {
-    pub batch_id: Uuid,
-    /// 改写过去的条数
-    pub moved: u32,
-    /// 签名两边都对不上、**没有**挂上谓词的条数（#190）。它们照旧留在空谓词上，
-    /// 原文说法还在证据里——与抽取遇到同样情形的处置一致
-    pub left_off: u32,
-    /// 按签名对调了主宾的条数。
-    ///
-    /// **掰正不该静默。** 抽取那条路每掰一次就落一条 `direction_corrected`
-    /// 丢弃信号（#138 的原话是「绝不静默」：用可能错的声明驱动的自动动作，
-    /// 留痕才不属于 0001 判据 2 反对的那一类）。采纳走的是同一道判断，
-    /// 也该说出来自己动了几条，否则台账上只剩「改写了 N 条」，看不出其中
-    /// 有几条是被本体掉了个头的
-    pub corrected: u32,
-}
-
-/// 要改写哪些事实，以及新行的宾语从哪来。
-pub enum AdoptTargets<'a> {
-    /// 关系那一路：按表层说法去找，宾语原样搬走。
-    ByForm(&'a [String]),
-    /// 属性那一路：调用方已经挑好事实、并把值按 datatype 归一化过。
-    ///
-    /// **归一化必须在调用方做**：那套规则（"2015" → 日期、"1,200" → 数字）
-    /// 住在抽取模块，store 够不着也不该够得着。更要紧的是它会**失败**——
-    /// 一个换算不出来的值不该硬塞进一个日期属性里，那条事实宁可继续没有
-    /// 谓词（原词还在证据里）。所以由调用方筛完再交回来。
-    WithValues(&'a [(Uuid, serde_json::Value)]),
-}
-
-async fn adopt(
-    pool: &PgPool,
-    kb_id: Uuid,
-    predicate_id: Uuid,
-    targets: AdoptTargets<'_>,
-    swap: bool,
-) -> AppResult<Adopted> {
-    let batch_id = Uuid::now_v7();
-    let nothing = Adopted {
-        batch_id,
-        moved: 0,
-        left_off: 0,
-        corrected: 0,
-    };
-    let targets: Vec<(Uuid, Uuid, Option<Uuid>, Option<serde_json::Value>)> = match targets {
-        AdoptTargets::ByForm(forms) => {
-            if forms.is_empty() {
-                return Ok(nothing);
-            }
-            sqlx::query_as(
-                "SELECT f.id, f.subject_id, f.object_id, f.object_value
-                 FROM facts f
-                 WHERE f.kb_id = $1 AND f.predicate_id IS NULL AND f.invalidated_at IS NULL
-                   -- 开放陈述（0044）不采纳：短语挂上谓词是第二刀的对齐做的事
-                   AND f.layer = 'typed'
-                   -- **只碰宾语是实体的。** 同一个说法可能既有指向实体的事实
-                   -- 又有带字面值的（location 两种都用），后者归属性那条路：
-                   -- 把它改挂到一条关系上，那个值就再也不是值了
-                   AND f.object_id IS NOT NULL
-                   AND EXISTS (SELECT 1 FROM fact_evidence e
-                               WHERE e.fact_id = f.id AND e.proposed_predicate = ANY($2))
-                   AND NOT EXISTS (SELECT 1 FROM fact_evidence e
-                                   WHERE e.fact_id = f.id AND e.proposed_predicate IS NOT NULL
-                                     AND NOT (e.proposed_predicate = ANY($2)))
-                 ORDER BY f.recorded_at",
-            )
-            .bind(kb_id)
-            .bind(forms)
-            .fetch_all(pool)
-            .await?
-        }
-        AdoptTargets::WithValues(items) => {
-            if items.is_empty() {
-                return Ok(nothing);
-            }
-            // 主语要从库里读回来（调用方给的是 fact_id 与新值），顺带确认这些
-            // 事实还活着——挑选与采纳之间可能隔着一次重抽
-            let ids: Vec<Uuid> = items.iter().map(|(id, _)| *id).collect();
-            let live: Vec<(Uuid, Uuid)> = sqlx::query_as(
-                "SELECT id, subject_id FROM facts
-                 WHERE kb_id = $1 AND id = ANY($2) AND invalidated_at IS NULL
-                   AND layer = 'typed'",
-            )
-            .bind(kb_id)
-            .bind(&ids)
-            .fetch_all(pool)
-            .await?;
-            let subject_of: std::collections::HashMap<Uuid, Uuid> = live.into_iter().collect();
-            items
-                .iter()
-                .filter_map(|(id, value)| {
-                    Some((*id, *subject_of.get(id)?, None, Some(value.clone())))
-                })
-                .collect()
-        }
-    };
-
-    let mut moved = 0u32;
-    let mut left_off = 0u32;
-    let mut corrected = 0u32;
-    for (old_id, subject_id, object_id, object_value) in targets {
-        // 被动形改写：主宾对调。字面值宾语的事实换不了（值不能当主语），
-        // 而 ByForm 那条查询本来就只取 object_id 非空的，所以这里只可能是实体宾语
-        let (subject_id, object_id) = match (swap, object_id) {
-            (true, Some(o)) => (o, Some(subject_id)),
-            _ => (subject_id, object_id),
-        };
-        // **挂谓词之前过一遍签名**（#190）。抽取写入时按 domain 掰正方向或留空，
-        // 而采纳是第二条写谓词的路——从前直接把谓词挂回去，实测把违反率从 0 抬到
-        // 12.3%，全在包关系上。同一道判断（`ontology::judge_direction`），同样三种
-        // 结果：合就挂，主语不合宾语合就对调着挂，都不合就**不挂**——那条事实留在
-        // 空谓词上，原文说法还在证据里，与抽取遇到同样情形的处置一致
-        let (subject_id, object_id) = match object_id {
-            Some(o) => {
-                match crate::ontology::judge_direction(pool, predicate_id, subject_id, o).await? {
-                    crate::ontology::Fit::Swap => {
-                        corrected += 1;
-                        (o, Some(subject_id))
-                    }
-                    crate::ontology::Fit::Neither => {
-                        left_off += 1;
-                        continue;
-                    }
-                    crate::ontology::Fit::Keep | crate::ontology::Fit::Unchecked => {
-                        (subject_id, Some(o))
-                    }
-                }
-            }
-            None => (subject_id, None),
-        };
-        let mut tx = pool.begin().await?;
-        // 目标断言可能已存在（同主宾已有一条真关系）：那就并进去，别造重复。
-        //
-        // **宾语两侧都要比。** 字面值事实的 object_id 都是 NULL，只比它就等于
-        // 把同主同谓的所有值当成同一条断言——(星云科技, founding_date, 2015) 与
-        // (星云科技, founding_date, 2016) 会被并成一条，后一个值静默消失
-        let existing: Option<(Uuid,)> = sqlx::query_as(
-            "SELECT id FROM facts
-             WHERE kb_id = $1 AND subject_id = $2 AND predicate_id = $3
-               AND object_id IS NOT DISTINCT FROM $4
-               AND object_value IS NOT DISTINCT FROM $5
-               AND invalidated_at IS NULL",
-        )
-        .bind(kb_id)
-        .bind(subject_id)
-        .bind(predicate_id)
-        .bind(object_id)
-        .bind(&object_value)
-        .fetch_optional(&mut *tx)
-        .await?;
-
-        let (new_id, mode) = match existing {
-            Some((id,)) => (id, ADOPT_MERGED),
-            None => {
-                let id = Uuid::now_v7();
-                // 宾语显式绑定而不是从旧行复制：属性那一路的新值是归一化过的
-                //（"2015" → 日期），照抄旧行就等于把没换算的原值塞进去。
-                // 关系那一路绑的就是旧行的值，行为一字不变
-                let inserted: Option<(Uuid,)> = sqlx::query_as(
-                    "INSERT INTO facts (id, kb_id, subject_id, predicate_id, object_id, object_value,
-                                        valid_from, valid_from_precision,
-                                        valid_to, valid_to_precision, confidence, supersedes,
-                                        attested_from, attested_to, end_derived,
-                                        corrected_ends)
-                     SELECT $1, kb_id, $6, $3, $4, $5,
-                            valid_from, valid_from_precision,
-                            valid_to, valid_to_precision, confidence, id,
-                            attested_from, attested_to, end_derived, corrected_ends
-                     FROM facts WHERE id = $2 AND invalidated_at IS NULL
-                     RETURNING id",
-                )
-                .bind(id)
-                .bind(old_id)
-                .bind(predicate_id)
-                .bind(object_id)
-                .bind(&object_value)
-                // 主语也显式绑定，不再从旧行复制——被动形改写要的正是换掉它。
-                // 第一版漏了这一处：局部变量换了、SQL 里还写着 subject_id，
-                // 于是宾语换了、主语没换，凭空造出一条 `OpenAI produces OpenAI`
-                .bind(subject_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-                // 已被并发改写：不重复动手
-                let Some((id,)) = inserted else {
-                    tx.rollback().await?;
-                    continue;
-                };
-                (id, ADOPT_SUPERSEDED)
-            }
-        };
-
-        // 证据整体搬过去，表层谓词一并保留——它是这次改写的依据，不该在改写中丢失
-        sqlx::query(
-            "INSERT INTO fact_evidence (fact_id, chunk_id, quote, proposed_predicate, document_id, doc_version,
-                                        quote_start, quote_end)
-             SELECT $1, chunk_id, quote, proposed_predicate, document_id, doc_version,
-                    quote_start, quote_end
-             FROM fact_evidence WHERE fact_id = $2
-             ON CONFLICT DO NOTHING",
-        )
-        .bind(new_id)
-        .bind(old_id)
-        .execute(&mut *tx)
-        .await?;
-        /* **边上的属性跟着搬**（0037）。谓词还没被采纳时金额就已经落在旧行上——
-        一句「NVIDIA invested $1.5 billion in SB Energy」在 schema.org 库里
-        `invested_in` 是未知说法，钱不能等到采纳那天才有地方放。旧行作废、
-        新行接上，属性照证据的样子整体复制；顺手在关系上补声明——
-        这些属性定义本来就在库里，缺的只是关系上的一条声明 */
-        sqlx::query(
-            "INSERT INTO fact_qualifiers (fact_id, qualifier_type_id, value, entity_id)
-             SELECT $1, qualifier_type_id, value, entity_id
-             FROM fact_qualifiers WHERE fact_id = $2
-             ON CONFLICT DO NOTHING",
-        )
-        .bind(new_id)
-        .bind(old_id)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "INSERT INTO relation_type_qualifiers (relation_type_id, qualifier_type_id)
-             SELECT $1, q.qualifier_type_id
-             FROM fact_qualifiers q JOIN relation_types r ON r.id = q.qualifier_type_id
-             WHERE q.fact_id = $2 AND r.kind = 'attribute' AND r.id <> $1
-             ON CONFLICT DO NOTHING",
-        )
-        .bind(predicate_id)
-        .bind(new_id)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query("UPDATE facts SET invalidated_at = now() WHERE id = $1")
-            .bind(old_id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query(
-            "INSERT INTO fact_adoptions
-                (batch_id, kb_id, predicate_id, old_fact_id, new_fact_id, mode)
-             VALUES ($1, $2, $3, $4, $5, $6)",
-        )
-        .bind(batch_id)
-        .bind(kb_id)
-        .bind(predicate_id)
-        .bind(old_id)
-        .bind(new_id)
-        .bind(mode)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        moved += 1;
-    }
-    Ok(Adopted {
-        batch_id,
-        moved,
-        left_off,
-        corrected,
-    })
-}
-
-/// 撤销一次采纳：新写的行作废、旧行复活。
-///
-/// 关系类型**不删**——已有事实指向过它（`delete_relation_type` 也会拒绝），
-/// 而按 append-only 的规矩"它存在过"本身是历史；一个没人用的关系是惰性的。
-/// 证据也不清：新行已作废，其证据随之惰性，删掉反而抹掉"我们曾经这么认为"。
-///
-/// 并入那种（mode = merged）只复活旧行，不动被并入的目标——它本来就在，
-/// 复制过去的证据留着无害（`ON CONFLICT DO NOTHING` 本就可能是它自己的）。
-pub async fn unadopt(pool: &PgPool, kb_id: Uuid, batch_id: Uuid) -> AppResult<u32> {
-    let rows: Vec<(Uuid, Uuid, String)> = sqlx::query_as(
-        "SELECT old_fact_id, new_fact_id, mode FROM fact_adoptions
-         WHERE batch_id = $1 AND kb_id = $2 AND reverted_at IS NULL",
-    )
-    .bind(batch_id)
-    .bind(kb_id)
-    .fetch_all(pool)
-    .await?;
-    if rows.is_empty() {
-        return Err(AppError::NotFound);
-    }
-
-    let mut tx = pool.begin().await?;
-    let mut reverted = 0u32;
-    for (old_id, new_id, mode) in &rows {
-        if mode == ADOPT_SUPERSEDED {
-            sqlx::query(
-                "UPDATE facts SET invalidated_at = now() WHERE id = $1 AND invalidated_at IS NULL",
-            )
-            .bind(new_id)
-            .execute(&mut *tx)
-            .await?;
-        }
-        sqlx::query("UPDATE facts SET invalidated_at = NULL WHERE id = $1")
-            .bind(old_id)
-            .execute(&mut *tx)
-            .await?;
-        reverted += 1;
-    }
-    // 标记而不是删除：这次采纳发生过，撤销也发生过，两件都是历史
-    sqlx::query(
-        "UPDATE fact_adoptions SET reverted_at = now()
-         WHERE batch_id = $1 AND kb_id = $2 AND reverted_at IS NULL",
-    )
-    .bind(batch_id)
-    .bind(kb_id)
-    .execute(&mut *tx)
-    .await?;
-    tx.commit().await?;
-    Ok(reverted)
-}
-
-/// 词表外的**字面值**说法：还没有谓词、宾语是值而不是实体的那些。
-///
-/// 跟 [`proposed_predicates`] 互补，两边用 `object_id` 是否为空严格分开。
-/// 混在一起提案就会把 `founding_date` 提成一条关系，而那正是这条路要修掉的。
-pub async fn proposed_attributes(
-    pool: &PgPool,
-    kb_id: Uuid,
-) -> AppResult<Vec<utopia_core::models::ProposedAttribute>> {
-    Ok(sqlx::query_as(
-        // 同 proposed_predicates：普遍程度从全量证据数，改写量从积压数；
-        // 走 CTE 而不是相关子查询，后者每组重扫一遍证据表
-        // 同 proposed_predicates：开放陈述（0044）的短语不是等着被采纳的说法
-        "WITH spread AS (
-             SELECT e.proposed_predicate AS form,
-                    count(DISTINCT e.document_id) AS doc_count
-             FROM fact_evidence e
-             JOIN facts ff ON ff.id = e.fact_id
-             WHERE ff.kb_id = $1 AND ff.layer = 'typed' AND e.proposed_predicate IS NOT NULL
-             GROUP BY 1
-         )
-         SELECT fe.proposed_predicate AS form,
-                count(DISTINCT f.id) AS fact_count,
-                max(sp.doc_count) AS doc_count,
-                (SELECT f2.object_value::text
-                 FROM fact_evidence e2
-                 JOIN facts f2 ON f2.id = e2.fact_id
-                 WHERE e2.proposed_predicate = fe.proposed_predicate
-                   AND f2.kb_id = $1 AND f2.layer = 'typed' AND f2.predicate_id IS NULL
-                   AND f2.object_id IS NULL AND f2.invalidated_at IS NULL
-                 LIMIT 1) AS example,
-                -- 主语实际是什么类：属性的 domain 从这里来，不靠猜
-                ARRAY(SELECT DISTINCT t.key
-                      FROM fact_evidence e3
-                      JOIN facts f3 ON f3.id = e3.fact_id
-                      JOIN entities s ON s.id = f3.subject_id
-                      JOIN entity_types t ON t.id = s.type_id
-                      WHERE e3.proposed_predicate = fe.proposed_predicate
-                        AND f3.kb_id = $1 AND f3.layer = 'typed' AND f3.predicate_id IS NULL
-                        AND f3.object_id IS NULL AND f3.invalidated_at IS NULL) AS domain_keys
-         FROM fact_evidence fe
-         JOIN facts f ON f.id = fe.fact_id
-         JOIN spread sp ON sp.form = fe.proposed_predicate
-         WHERE f.kb_id = $1 AND f.layer = 'typed' AND f.predicate_id IS NULL
-           AND f.invalidated_at IS NULL AND fe.proposed_predicate IS NOT NULL
-           AND f.object_id IS NULL
-           -- 拒绝过的说法不再出现在候选里
-           AND NOT EXISTS (SELECT 1 FROM ontology_misses m
-                           WHERE m.kb_id = $1 AND m.kind = 'attribute_type'
-                             AND m.key = fe.proposed_predicate AND m.dismissed_at IS NOT NULL)
-         GROUP BY fe.proposed_predicate
-         ORDER BY fact_count DESC, form",
-    )
-    .bind(kb_id)
-    .fetch_all(pool)
-    .await?)
-}
-
-/// 某几个字面值说法当前挂着的事实：id、主语的类型、原始值。
-///
-/// 给采纳那一步用。**归一化不在这里做**——它按 datatype 把 "2015" 变成日期、
-/// 把 "1,200" 变成数字，那套规则住在抽取模块，store 够不着也不该够得着。
-/// 调用方归一化完，把结果原样交回来。
-pub async fn value_facts_for_forms(
-    pool: &PgPool,
-    kb_id: Uuid,
-    forms: &[String],
-) -> AppResult<Vec<(Uuid, Option<Uuid>, serde_json::Value)>> {
-    if forms.is_empty() {
-        return Ok(Vec::new());
-    }
-    // **主语类型是 Option**。列本来就可空——「抽取器抽到了东西，但本体里没有
-    // 对应的类」是一个正常状态（0009），不是异常。解成裸 `Uuid` 的时候，批里
-    // 只要有一条主语没类型，整次采纳就在解码那一步报错退出：
-    // `decoding column 1: unexpected null`，一条也改写不了。实测一个库里攒着
-    // 2454 条等谓词的值事实，其中 58 条主语无类型，够把好几个说法卡死。
-    // 没类型的那些不参与 domain（属性得声明挂在哪些类下），但照样跟着改写——
-    // 把它们一起丢掉等于让一条有名有姓的事实继续没有谓词
-    Ok(sqlx::query_as(
-        "SELECT DISTINCT f.id, s.type_id, f.object_value
-         FROM facts f
-         JOIN entities s ON s.id = f.subject_id
-         WHERE f.kb_id = $1 AND f.layer = 'typed'
-           AND f.predicate_id IS NULL AND f.invalidated_at IS NULL
-           AND f.object_id IS NULL AND f.object_value IS NOT NULL
-           AND EXISTS (SELECT 1 FROM fact_evidence e
-                       WHERE e.fact_id = f.id AND e.proposed_predicate = ANY($2))",
-    )
-    .bind(kb_id)
-    .bind(forms)
-    .fetch_all(pool)
-    .await?)
-}
-
-/// 采纳一批**字面值**说法：把它们的事实改挂到某个属性上。
-///
-/// 与 [`adopt_proposed_predicates`] 共用改写、批次与撤销——对图做的事是同一件，
-/// 只有"新宾语从哪来"不同：这里的值由调用方按属性的 datatype 归一化过，
-/// 换算不出来的那些根本不会传进来（它们继续没有谓词，等下一次）。
-pub async fn adopt_value_facts(
-    pool: &PgPool,
-    kb_id: Uuid,
-    attribute_id: Uuid,
-    rewrites: &[(Uuid, serde_json::Value)],
-) -> AppResult<Adopted> {
-    // 属性那一路没有对调可言：宾语是字面值，值不能当主语
-    adopt(
-        pool,
-        kb_id,
-        attribute_id,
-        AdoptTargets::WithValues(rewrites),
-        false,
-    )
-    .await
-}
-
 #[cfg(test)]
 mod temporal_shape_tests {
     use super::*;
@@ -3095,6 +2592,7 @@ mod temporal_shape_tests {
             to_precision: Some("day"),
             attested_at: None,
             from_grade: None,
+            end_after_period: false,
         }
         .under(Temporal::Event)
         .unwrap();
@@ -3112,6 +2610,7 @@ mod temporal_shape_tests {
             to_precision: Some("month"),
             attested_at: None,
             from_grade: None,
+            end_after_period: false,
         }
         .under(Temporal::Event)
         .unwrap();
@@ -3156,6 +2655,7 @@ mod temporal_shape_tests {
             to_precision: Some("day"),
             attested_at: None,
             from_grade: None,
+            end_after_period: false,
         };
         let refused = moment
             .under(Temporal::State)

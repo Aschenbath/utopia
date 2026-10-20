@@ -6,6 +6,7 @@ use crate::state::AppState;
 use futures_util::{stream, StreamExt};
 use utopia_core::models::{LlmSettings, Proposer};
 use utopia_llm::LlmClient;
+use utopia_store::documents::{self, ProcessingInput};
 use uuid::Uuid;
 
 /// 这份文档的来源要不要抽取。没有来源的文档（直接上传、记忆片段）照旧抽。
@@ -47,14 +48,19 @@ const EMBED_BATCH: usize = 16;
 const EMBED_JOBS: usize = 4;
 
 pub async fn process_document(state: &AppState, document_id: Uuid) -> anyhow::Result<()> {
-    match run(state, document_id).await {
+    let input = documents::processing_input(&state.pool, document_id).await?;
+    let doc = &input.document;
+    match run(state, &input).await {
         Ok(()) => Ok(()),
         // 在等读字的服务读完：文档照旧是 parsing，任务过一会儿再来问
-        Err(e) if utopia_core::is_deferred(&e).is_some() => Err(e),
+        Err(e) if utopia_core::is_deferred(&e).is_some() => {
+            if documents::processing_is_current(&state.pool, &input).await? {
+                Err(e)
+            } else {
+                Ok(())
+            }
+        }
         Err(e) => {
-            let doc = utopia_store::documents::get(&state.pool, document_id)
-                .await
-                .ok();
             // 字要靠模型读、而那种模型没配（0040）：**降级**。文件留着，文档停在 failed
             // 并记下缺哪一种，报一条库级告警；配上模型会自己重新处理。重试没用——
             // 模型不会在两分钟里自己配上，所以挂 Terminal。
@@ -66,33 +72,40 @@ pub async fn process_document(state: &AppState, document_id: Uuid) -> anyhow::Re
                     e.downcast_ref::<utopia_ingest::NoSpeakers>()
                         .map(|_| utopia_ingest::Reader::Transcribe)
                 });
+            if !documents::set_failed_if_current(
+                &state.pool,
+                &input,
+                &e.to_string(),
+                waiting.map(|reader| reader.as_str()),
+            )
+            .await?
+            {
+                // 过期模型结果可丢弃，数据库故障仍要让队列看见。
+                if e.is::<sqlx::Error>()
+                    || matches!(
+                        e.downcast_ref::<utopia_core::AppError>(),
+                        Some(utopia_core::AppError::Db(_))
+                    )
+                {
+                    return Err(e);
+                }
+                tracing::info!(%document_id, "discarding a superseded document failure");
+                return Ok(());
+            }
             if let Some(reader) = waiting {
-                let _ = utopia_store::documents::set_needs_reader(
-                    &state.pool,
+                crate::alerting::observe_document_needs_reader(
+                    state,
+                    doc.kb_id,
                     document_id,
-                    reader.as_str(),
+                    &doc.filename,
+                    reader,
                     &e.to_string(),
                 )
                 .await;
-                if let Some(doc) = &doc {
-                    crate::alerting::observe_document_needs_reader(
-                        state,
-                        doc.kb_id,
-                        document_id,
-                        &doc.filename,
-                        reader,
-                        &e.to_string(),
-                    )
-                    .await;
-                    state.emit_document(doc.kb_id, document_id);
-                }
+                state.emit_document(doc.kb_id, document_id);
                 return Err(e.context(utopia_core::Terminal));
             }
-            let _ =
-                utopia_store::documents::set_failed(&state.pool, document_id, &e.to_string()).await;
-            if let Some(doc) = &doc {
-                state.emit_document(doc.kb_id, document_id);
-            }
+            state.emit_document(doc.kb_id, document_id);
             // 读不了的格式（视频、二进制、空文件）换多少次也一样
             if e.downcast_ref::<utopia_ingest::Unreadable>().is_some() {
                 return Err(e.context(utopia_core::Terminal));
@@ -102,8 +115,9 @@ pub async fn process_document(state: &AppState, document_id: Uuid) -> anyhow::Re
     }
 }
 
-async fn run(state: &AppState, document_id: Uuid) -> anyhow::Result<()> {
-    let doc = utopia_store::documents::get(&state.pool, document_id).await?;
+async fn run(state: &AppState, input: &ProcessingInput) -> anyhow::Result<()> {
+    let doc = &input.document;
+    let document_id = doc.id;
     // 排队之后被删了（#268）：墓碑不重建分块、不回索引；清过的连原文都没了
     if doc.deleted_at.is_some() {
         tracing::info!(document = %document_id, "skipping a deleted document");
@@ -111,7 +125,9 @@ async fn run(state: &AppState, document_id: Uuid) -> anyhow::Result<()> {
     }
 
     // 1. 解析（CPU 密集，放 blocking 线程）
-    utopia_store::documents::set_status(&state.pool, document_id, "parsing").await?;
+    if !documents::set_status_if_current(&state.pool, input, "parsing").await? {
+        return Ok(());
+    }
     state.emit_document(doc.kb_id, document_id);
     let bytes = state.blob.get(&doc.sha256).await?;
     let filename = doc.filename.clone();
@@ -157,13 +173,13 @@ async fn run(state: &AppState, document_id: Uuid) -> anyhow::Result<()> {
             let reading = match (needs.reader, settings.as_ref()) {
                 (utopia_ingest::Reader::Ocr, Some(s)) => {
                     match crate::readers::Ocr::from_settings(s) {
-                        Some(ocr) => ocr.read(state, &doc, bytes).await?,
+                        Some(ocr) => ocr.read(state, doc, bytes).await?,
                         None => return Err(e),
                     }
                 }
                 (utopia_ingest::Reader::Transcribe, Some(s)) => {
                     match crate::readers::Transcriber::from_settings(s) {
-                        Some(t) => t.read(&doc, bytes).await?,
+                        Some(t) => t.read(doc, bytes).await?,
                         None => return Err(e),
                     }
                 }
@@ -180,14 +196,8 @@ async fn run(state: &AppState, document_id: Uuid) -> anyhow::Result<()> {
         }
     };
     let text_len = text.chars().count() as i32;
-    let Some(chunk_pairs) = utopia_store::documents::replace_chunks_if_current(
-        &state.pool,
-        doc.kb_id,
-        document_id,
-        &pieces,
-        &doc.sha256,
-    )
-    .await?
+    let Some(chunk_pairs) =
+        documents::replace_chunks_if_current(&state.pool, input, &pieces).await?
     else {
         // 读取期间源文档可能已更新或删除，丢弃过期结果，
         // 不再改写新任务的索引、状态和抽取队列。
@@ -208,7 +218,9 @@ async fn run(state: &AppState, document_id: Uuid) -> anyhow::Result<()> {
     }
 
     // 3. 全文索引（Tantivy）
-    utopia_store::documents::set_status(&state.pool, document_id, "indexing").await?;
+    if !documents::set_status_if_current(&state.pool, input, "indexing").await? {
+        return Ok(());
+    }
     state.emit_document(doc.kb_id, document_id);
     let search = state.search.clone();
     let kb = doc.kb_id.to_string();
@@ -217,12 +229,12 @@ async fn run(state: &AppState, document_id: Uuid) -> anyhow::Result<()> {
 
     // 4. embedding（工作区配置了 embedding 模型才做；没配也算 ready，先享受 BM25 搜索）
     if let Some((settings, client)) = embedder(settings.as_ref()) {
-        utopia_store::documents::set_status(&state.pool, document_id, "embedding").await?;
+        if !documents::set_status_if_current(&state.pool, input, "embedding").await? {
+            return Ok(());
+        }
         state.emit_document(doc.kb_id, document_id);
-        embed_pending(state, settings, &client, document_id).await?;
+        embed_pending(state, settings, &client, input).await?;
     }
-
-    utopia_store::documents::set_ready(&state.pool, document_id, text_len, chunk_count).await?;
 
     // 来源说了不抽取的，到这里为止：可搜、可问，不进图。
     //
@@ -230,23 +242,26 @@ async fn run(state: &AppState, document_id: Uuid) -> anyhow::Result<()> {
     // 结果是抽取器把每个列名当成一个实体（宽表语料上四十个概念实体里二十八个是
     // 列名，#553）。状态记成 `skipped` 而不是留在 `none`：`none` 在 Library 里读作
     // 「还没排到」，而它永远不会排到
-    if !source_extracts(state, doc.source_id).await? {
-        utopia_store::documents::set_graph_status(&state.pool, document_id, "skipped").await?;
-        state.emit_document(doc.kb_id, document_id);
-        tracing::info!(%document_id, chunks = chunk_count, "文档处理完成，来源不抽取");
-        return Ok(());
-    }
-
     // 两段式：索引就绪后，若配置了对话模型则排队图谱抽取（不阻塞可搜可问）。
     // 推送来的陈述不问模型（0054），没配也排
-    if pushed_statements || settings.as_ref().is_some_and(|s| s.chat_ready()) {
-        utopia_store::documents::set_graph_status(&state.pool, document_id, "queued").await?;
-        utopia_store::jobs::enqueue(
-            &state.pool,
-            "extract_document",
-            serde_json::json!({ "document_id": document_id }),
-        )
-        .await?;
+    let graph_status = if !source_extracts(state, doc.source_id).await? {
+        Some("skipped")
+    } else if pushed_statements || settings.as_ref().is_some_and(|s| s.chat_ready()) {
+        Some("queued")
+    } else {
+        None
+    };
+    if !documents::finish_processing_if_current(
+        &state.pool,
+        input,
+        text_len,
+        chunk_count,
+        graph_status,
+    )
+    .await?
+    {
+        tracing::info!(%document_id, "discarding a superseded document completion");
+        return Ok(());
     }
     state.emit_document(doc.kb_id, document_id);
 
@@ -273,8 +288,11 @@ pub async fn memory_ingest(
     let kb_row = utopia_store::kbs::get(&state.pool, doc.kb_id).await?;
     let settings = utopia_store::settings::get(&state.pool, kb_row.workspace_id).await?;
 
+    // 一句一句嵌，嵌不了的那句留着没有向量，别的照常往下走。日志是一篇越写越长的文档，
+    // 从前所有没向量的块一起嵌、一处出错整个任务失败：一句嵌不了的记忆从此挡在每一句
+    // 新记忆前面，索引不重建、抽取不排队，而 `remember` 照样回「记下了」（#1187）
     if let Some((settings, client)) = embedder(settings.as_ref()) {
-        embed_pending(state, settings, &client, document_id).await?;
+        embed_each(state, settings, &client, document_id).await?;
     }
 
     let chunks = utopia_store::documents::chunks_full(&state.pool, document_id).await?;
@@ -304,6 +322,40 @@ pub async fn memory_ingest(
     Ok(())
 }
 
+/// 记忆日志的嵌入：每块单独一次请求，失败的只记日志、留着下次再试，返回嵌成了几条。
+/// 与 [`embed_pending`] 相反的取舍——那边一批错位会把向量写到别人身上，所以整篇失败；
+/// 这里一次一条，没有错位可言，而一条失败不该连累后来的
+async fn embed_each(
+    state: &AppState,
+    settings: &LlmSettings,
+    client: &LlmClient,
+    document_id: Uuid,
+) -> anyhow::Result<usize> {
+    let pending =
+        utopia_store::documents::chunks_pending_embedding(&state.pool, document_id).await?;
+    let mut done = 0;
+    for (chunk_id, text) in pending {
+        let embedded = {
+            let _permit = llm_util::acquire_embed(state, settings).await;
+            client.embed(std::slice::from_ref(&text)).await
+        };
+        match embedded {
+            Ok(mut vectors) if vectors.len() == 1 => {
+                let vector = vectors.remove(0);
+                utopia_store::documents::set_embeddings(&state.pool, &[(chunk_id, vector)]).await?;
+                done += 1;
+            }
+            Ok(vectors) => {
+                tracing::warn!(%document_id, %chunk_id, got = vectors.len(), "记忆的向量数量对不上，这一句先不嵌");
+            }
+            Err(e) => {
+                tracing::warn!(%document_id, %chunk_id, error = %e, "这一句记忆没嵌成，别的照常");
+            }
+        }
+    }
+    Ok(done)
+}
+
 /// 工作区配了嵌入模型才有客户端；设置与客户端一起交出去，闸门许可证要按设置取。
 fn embedder(settings: Option<&LlmSettings>) -> Option<(&LlmSettings, LlmClient)> {
     let s = settings?;
@@ -326,10 +378,9 @@ async fn embed_pending(
     state: &AppState,
     settings: &LlmSettings,
     client: &LlmClient,
-    document_id: Uuid,
+    input: &ProcessingInput,
 ) -> anyhow::Result<usize> {
-    let pending =
-        utopia_store::documents::chunks_pending_embedding(&state.pool, document_id).await?;
+    let pending = documents::chunks_pending_embedding(&state.pool, input.document.id).await?;
     // 批次先切成拥有的数据：借来的切片捕进并发驱动的 future 过不了 Send 边界
     //（ontology_index 里同一句话）
     let batches: Vec<Vec<(Uuid, String)>> =
@@ -348,7 +399,9 @@ async fn embed_pending(
             }
             let items: Vec<(Uuid, Vec<f32>)> =
                 batch.iter().map(|(id, _)| *id).zip(embeddings).collect();
-            utopia_store::documents::set_embeddings(&state.pool, &items).await?;
+            if !documents::set_embeddings_if_current(&state.pool, input, &items).await? {
+                return Ok(0);
+            }
             Ok::<usize, anyhow::Error>(items.len())
         })
         .buffer_unordered(EMBED_JOBS);

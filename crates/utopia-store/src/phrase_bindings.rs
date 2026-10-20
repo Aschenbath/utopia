@@ -17,7 +17,7 @@ use uuid::Uuid;
 /// SQL 侧的归一：与 [`normalize`] 一致。`$col` 由调用处替换成列名。
 const PHRASE_SQL: &str = "lower(btrim(regexp_replace($col, '\\s+', ' ', 'g')))";
 
-fn phrase_sql(col: &str) -> String {
+pub(crate) fn phrase_sql(col: &str) -> String {
     PHRASE_SQL.replace("$col", col)
 }
 
@@ -47,10 +47,16 @@ pub struct PhraseSignature {
     /// 例句：最多 3 条「主语 —短语→ 宾语」，每条跟着它自己的引文
     pub examples: Vec<String>,
     pub quotes: Vec<String>,
+    /// Statement identities in the same order as the live examples and quotes.
+    pub example_statement_ids: Vec<Uuid>,
 }
 
 /// 库里每条 distinct 的签名：活着的开放陈述，按短语、两端的类、宾语是不是字面值分组。
-pub async fn signatures(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<PhraseSignature>> {
+/// 采纳复用一条属性时在它自己的事务里读（不另占一条连接），所以收任何执行器
+pub async fn signatures<'e>(
+    pool: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
+    kb_id: Uuid,
+) -> AppResult<Vec<PhraseSignature>> {
     // 一条陈述可以有多条证据。计数、取例句前先为每条陈述选一条稳定的引用，
     // 优先有完整位置的证据，避免证据多的陈述挤掉其他陈述。
     let sql = format!(
@@ -88,14 +94,16 @@ pub async fn signatures(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<PhraseSigna
                     array_agg(r.subject_name || ' —' || r.spelling || '→ ' || r.object_name ORDER BY r.rn)
                         FILTER (WHERE r.rn <= 3) AS examples,
                     array_agg(coalesce(substr(c.text, r.quote_start + 1, r.quote_end - r.quote_start), '') ORDER BY r.rn)
-                        FILTER (WHERE r.rn <= 3) AS quotes
+                        FILTER (WHERE r.rn <= 3) AS quotes,
+                    array_agg(r.id ORDER BY r.rn) FILTER (WHERE r.rn <= 3) AS example_statement_ids
              FROM ranked r
              LEFT JOIN chunks c ON c.id = r.chunk_id AND r.rn <= 3
              GROUP BY r.phrase, r.subject_type_id, r.object_type_id, r.object_is_value
          )
          SELECT g.phrase, g.subject_type_id, st.key AS subject_type_key,
                 g.object_type_id, ot.key AS object_type_key, g.object_is_value, g.count,
-                coalesce(g.examples, '{{}}') AS examples, coalesce(g.quotes, '{{}}') AS quotes
+                coalesce(g.examples, '{{}}') AS examples, coalesce(g.quotes, '{{}}') AS quotes,
+                coalesce(g.example_statement_ids, '{{}}'::uuid[]) AS example_statement_ids
          FROM grouped g
          LEFT JOIN entity_types st ON st.id = g.subject_type_id
          LEFT JOIN entity_types ot ON ot.id = g.object_type_id
@@ -104,6 +112,31 @@ pub async fn signatures(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<PhraseSigna
         phrase = phrase_sql("f.phrase")
     );
     Ok(sqlx::query_as(&sql).bind(kb_id).fetch_all(pool).await?)
+}
+
+/// 一篇文档里活着的开放陈述落在哪些签名上（键同 [`PhraseSignature::key`]）。推送来的
+/// 文档抽完，本体只判这些签名（#1242）；别的签名还是对齐器的
+pub async fn signature_keys_of_document(
+    pool: &PgPool,
+    kb_id: Uuid,
+    document_id: Uuid,
+) -> AppResult<Vec<(String, Option<Uuid>, Option<Uuid>, bool)>> {
+    let sql = format!(
+        "SELECT DISTINCT {phrase}, s.type_id, o.type_id, (f.object_id IS NULL)
+           FROM facts f
+           JOIN entities s ON s.id = f.subject_id
+      LEFT JOIN entities o ON o.id = f.object_id
+          WHERE f.kb_id = $1 AND f.layer = 'open' AND f.invalidated_at IS NULL
+            AND f.phrase IS NOT NULL AND btrim(f.phrase) <> ''
+            AND EXISTS (SELECT 1 FROM fact_evidence fe JOIN chunks c ON c.id = fe.chunk_id
+                         WHERE fe.fact_id = f.id AND c.document_id = $2)",
+        phrase = phrase_sql("f.phrase")
+    );
+    Ok(sqlx::query_as(&sql)
+        .bind(kb_id)
+        .bind(document_id)
+        .fetch_all(pool)
+        .await?)
 }
 
 /// 按 id 取一条绑定的签名（人在队列里定它时用）：短语、两端的类、宾语是不是字面值，
@@ -116,7 +149,8 @@ pub async fn signature_of(
     Ok(sqlx::query_as(
         "SELECT b.phrase, b.subject_type_id, st.key AS subject_type_key,
                 b.object_type_id, ot.key AS object_type_key, b.object_is_value,
-                b.statement_count::bigint AS count, b.examples, '{}'::text[] AS quotes
+                b.statement_count::bigint AS count, b.examples, '{}'::text[] AS quotes,
+                '{}'::uuid[] AS example_statement_ids
            FROM phrase_bindings b
       LEFT JOIN entity_types st ON st.id = b.subject_type_id
       LEFT JOIN entity_types ot ON ot.id = b.object_type_id
@@ -142,7 +176,7 @@ pub struct Binding {
     /// bound / none / undecided
     pub status: String,
     pub decided_at: DateTime<Utc>,
-    /// agent / person
+    /// agent / person / ontology（短语正好是一条声明了的关系，#1242）
     pub decided_by: String,
     /// 判定时输入的指纹；NULL = 这一列出现之前的判定
     pub basis: Option<String>,
@@ -270,7 +304,7 @@ pub struct Decision<'a> {
     /// bound / none / undecided
     pub status: &'a str,
     pub votes: &'a serde_json::Value,
-    /// agent / person
+    /// agent / person / ontology
     pub decided_by: &'a str,
     /// 判定时输入的指纹（[`basis_of`]）：代理的判定必带，人的判定不带——人不按指纹重判
     pub basis: Option<&'a str>,
@@ -284,8 +318,8 @@ pub struct Decision<'a> {
 
 /// 记下一条签名的判定（有则改）。返回是否写入了。
 ///
-/// **人的判定不被代理覆盖**：已有行是人判的而这次是代理，原样留着、返回 false。
-/// 反过来人可以改代理的。
+/// **人的判定不被代理覆盖**：已有行是人判的而这次是代理或本体，原样留着、返回 false。
+/// 反过来人可以改代理的、本体的。
 pub async fn decide(
     pool: &PgPool,
     kb_id: Uuid,
@@ -293,8 +327,12 @@ pub async fn decide(
     d: Decision<'_>,
 ) -> AppResult<bool> {
     validate_decision(sig, &d)?;
-    let mut connection = pool.acquire().await?;
-    decide_on(&mut connection, kb_id, sig, d).await
+    // The observed regression outcome belongs to this decision, not to a later read that
+    // could see a different person's binding. Commit both together, as delivery already does.
+    let mut tx = pool.begin().await?;
+    let changed = decide_on(&mut tx, kb_id, sig, d).await?;
+    tx.commit().await?;
+    Ok(changed)
 }
 
 fn validate_decision(sig: &PhraseSignature, d: &Decision<'_>) -> AppResult<String> {
@@ -325,7 +363,7 @@ fn validate_decision(sig: &PhraseSignature, d: &Decision<'_>) -> AppResult<Strin
             return Err(AppError::Validation(format!("unknown marks {marks:?}")));
         }
     }
-    if !matches!(d.decided_by, "agent" | "person") {
+    if !matches!(d.decided_by, "agent" | "person" | "ontology") {
         return Err(AppError::Validation(format!(
             "unknown decider {:?}",
             d.decided_by
@@ -385,7 +423,7 @@ async fn decide_with_delivery_budget(
     Ok(Some(id))
 }
 
-/// Write on the caller's connection, so related durable work can share its transaction.
+/// Write on the caller's transaction connection, so related durable work shares its commit.
 pub async fn decide_on(
     connection: &mut sqlx::PgConnection,
     kb_id: Uuid,
@@ -412,7 +450,7 @@ pub async fn decide_on(
                 basis = EXCLUDED.basis,
                 marks = EXCLUDED.marks,
                 marks_asked_at = EXCLUDED.marks_asked_at
-          WHERE NOT (phrase_bindings.decided_by = 'person' AND EXCLUDED.decided_by = 'agent')",
+          WHERE NOT (phrase_bindings.decided_by = 'person' AND EXCLUDED.decided_by <> 'person')",
     )
     .bind(Uuid::now_v7())
     .bind(kb_id)
@@ -434,9 +472,13 @@ pub async fn decide_on(
     .bind(d.basis)
     .bind(d.marks)
     .bind(d.marks_asked)
-    .execute(connection)
+    .execute(&mut *connection)
     .await?;
-    Ok(res.rows_affected() > 0)
+    let changed = res.rows_affected() > 0;
+    if changed {
+        crate::ontology_regressions::record_for_signature(connection, kb_id, sig).await?;
+    }
+    Ok(changed)
 }
 
 /// 给这一列之前绑上的签名补问 marks 的结果（0053 修订 2026-09-27）。这一问只问一刻标哪一端，

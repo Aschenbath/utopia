@@ -79,7 +79,9 @@ function scheduleLabel(s: SourceView): string {
 type ScheduleMode = "manual" | "interval" | "daily" | "weekly" | "advanced";
 
 /** 已存日程 → 选择器初始状态（编辑模式回显；识别不了的 cron 落到 Advanced）。 */
-function scheduleToPickerState(initial?: ScheduleValue) {
+const CRON_WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"] as const;
+
+export function scheduleToPickerState(initial?: ScheduleValue) {
   const base = {
     mode: "manual" as ScheduleMode,
     every: 30,
@@ -97,7 +99,7 @@ function scheduleToPickerState(initial?: ScheduleValue) {
     if (weekly) {
       const idx = weekly[3]
         .split(",")
-        .map((n) => (S.library.schedule.daysShort as readonly string[]).indexOf(n))
+        .map((n) => (CRON_WEEKDAYS as readonly string[]).indexOf(n))
         .filter((i) => i >= 0);
       if (idx.length)
         return {
@@ -119,7 +121,7 @@ function scheduleToPickerState(initial?: ScheduleValue) {
 }
 
 /** 可视化同步日程选择器：Manual / Interval / Daily / Weekly 构建，Advanced 才暴露 cron。 */
-function SchedulePicker({
+export function SchedulePicker({
   onChange,
   initial,
 }: {
@@ -143,7 +145,7 @@ function SchedulePicker({
     const t = v.time ?? time;
     const [hh, mm] = t.split(":").map(Number);
     // 时间格式未成形时（手输中途）不更新日程，保留上一个有效值
-    if ((m === "daily" || m === "weekly") && (Number.isNaN(hh) || Number.isNaN(mm))) return;
+    if ((m === "daily" || m === "weekly") && !/^([01]?\d|2[0-3]):[0-5]\d$/.test(t)) return;
     switch (m) {
       case "manual":
         return onChange({ sync_interval_minutes: null, sync_cron: null });
@@ -159,7 +161,7 @@ function SchedulePicker({
         return onChange({ sync_interval_minutes: null, sync_cron: `${mm} ${hh} * * *` });
       case "weekly": {
         const ds = [...(v.days ?? days)].sort();
-        const names = ds.map((i) => S.library.schedule.daysShort[i]).join(",");
+        const names = ds.map((i) => CRON_WEEKDAYS[i]).join(",");
         return onChange({
           sync_interval_minutes: null,
           sync_cron: ds.length ? `${mm} ${hh} * * ${names}` : null,
@@ -1358,6 +1360,8 @@ function SourceModal({
   // PR 在 GitHub 的模型里也是工单。默认不收——问「工单」要的是工单；
   // 但有些仓库的决策记录实际写在 PR 描述里，所以给个开关
   const [includePrs, setIncludePrs] = useState(false);
+  const [includeGlobs, setIncludeGlobs] = useState("");
+  const [excludeGlobs, setExcludeGlobs] = useState("");
   const [schedule, setSchedule] = useState<ScheduleValue>({
     sync_interval_minutes: null,
     sync_cron: null,
@@ -1368,6 +1372,7 @@ function SourceModal({
     kind === "rss" ||
     kind === "custom" ||
     kind === "github_issues" ||
+    kind === "github_repo" ||
     kind === "jira_issues" ||
     kind === "s3" ||
     kind === "azure_blob" ||
@@ -1377,6 +1382,11 @@ function SourceModal({
 
   const create = useMutation({
     mutationFn: () => {
+      // 留空就不发，后端按默认的 markdown 规则筛
+      const globs = (key: string, value: string) => {
+        const list = value.split(",").map((g) => g.trim()).filter(Boolean);
+        return list.length ? { [key]: list } : {};
+      };
       const config =
         kind === "url"
           ? { urls: urls.split("\n").map((u) => u.trim()).filter(Boolean) }
@@ -1387,11 +1397,13 @@ function SourceModal({
                   endpoint: endpoint.trim(),
                   ...(authHeader.trim() ? { auth_header: authHeader.trim() } : {}),
                 }
-              : kind === "github_issues"
+              : kind === "github_issues" || kind === "github_repo"
                 ? {
                     repo: repo.trim(),
                     ...(authHeader.trim() ? { auth_header: authHeader.trim() } : {}),
-                    ...(includePrs ? { include_pull_requests: true } : {}),
+                    ...(kind === "github_issues"
+                      ? includePrs ? { include_pull_requests: true } : {}
+                      : { ...globs("include", includeGlobs), ...globs("exclude", excludeGlobs) }),
                   }
                 : kind === "jira_issues"
                   ? {
@@ -1576,7 +1588,7 @@ function SourceModal({
               {field(
                 S.library.endpointField,
                 <Input className="w-full font-mono"
-                  placeholder="https://your-service/utopia-feed"
+                  placeholder={S.library.feedPlaceholder}
                   value={endpoint}
                   onChange={(e) => setEndpoint(e.target.value)}
                 />,
@@ -1797,7 +1809,7 @@ function SourceModal({
               )}
             </>
           )}
-          {kind === "github_issues" && (
+          {(kind === "github_issues" || kind === "github_repo") && (
             <>
               {field(
                 S.library.repoField,
@@ -1816,12 +1828,33 @@ function SourceModal({
                   onChange={(e) => setAuthHeader(e.target.value)}
                 />,
               )}
-              <Checkbox
-                className="mb-4"
-                checked={includePrs}
-                onChange={(v) => setIncludePrs(v)}
-                label={S.library.includePullRequests}
-              />
+              {kind === "github_issues" ? (
+                <Checkbox
+                  className="mb-4"
+                  checked={includePrs}
+                  onChange={(v) => setIncludePrs(v)}
+                  label={S.library.includePullRequests}
+                />
+              ) : (
+                <>
+                  {field(
+                    S.library.includeGlobsField,
+                    <Input className="w-full font-mono"
+                      placeholder="**/*.md, **/*.markdown, **/*.mdx"
+                      value={includeGlobs}
+                      onChange={(e) => setIncludeGlobs(e.target.value)}
+                    />,
+                  )}
+                  {field(
+                    S.library.excludeGlobsField,
+                    <Input className="w-full font-mono"
+                      placeholder="**/.*/**, **/node_modules/**, **/vendor/**"
+                      value={excludeGlobs}
+                      onChange={(e) => setExcludeGlobs(e.target.value)}
+                    />,
+                  )}
+                </>
+              )}
             </>
           )}
 

@@ -345,7 +345,7 @@ pub async fn plan(
 ///
 /// 单次导入认本文件里的类和库里已有的类（见 [`apply`] 里的 resolve），但包是挨个
 /// 装的：装 W3C Org 时 FOAF 还没来，`headOf` 的 `rdfs:domain foaf:Agent` 就落了空；
-/// 等 FOAF 装好，没人回头补。没有 domain 的谓词 `judge_direction` 不判方向，
+/// 等 FOAF 装好，没人回头补。没有 domain 的谓词判不出方向，
 /// 反向的 `Project Aurora head_of Li Ting` 就原样进图（#222）。
 ///
 /// 只补不删，关联表 ON CONFLICT DO NOTHING，重复跑无害。属性不在这里：属性的
@@ -401,10 +401,13 @@ pub async fn relink_domains_ranges(
 
 /// 执行计划。属性在类之后落库——它们要挂在 domain 上，而 domain 要等
 /// 类先建好并解析 IRI → id（就是下面那个 `id_of`）。
+///
+/// `via_token`：代 `actor` 导入的那枚令牌，只进审计行（0014 决定 6）；会话是 None
 pub async fn apply(
     state: &AppState,
     kb_id: Uuid,
     actor: Uuid,
+    via_token: Option<Uuid>,
     filename: &str,
     bytes: &[u8],
 ) -> AppResult<(Uuid, ImportPlan)> {
@@ -584,7 +587,7 @@ pub async fn apply(
         //
         // **库里已有的类也算数。** 从前只认本文件里的类，于是 W3C Org 的
         // `headOf rdfs:domain foaf:Agent` 在 FOAF 已经装好的库里照样丢 domain，
-        // 而没有 domain 的谓词 `judge_direction` 根本不判方向（#222）
+        // 而没有 domain 的谓词根本判不出方向（#222）
         let resolve = |iris: &[String]| -> Vec<Uuid> {
             iris.iter()
                 .filter_map(|i| {
@@ -607,6 +610,7 @@ pub async fn apply(
                 &p.description,
                 &domains,
                 &ranges,
+                p.temporal.as_deref(),
             )
             .await?
             {
@@ -628,6 +632,8 @@ pub async fn apply(
             symmetric: p.symmetric,
             asymmetric: p.asymmetric,
             irreflexive: p.irreflexive,
+            // 本体用 `utopia:temporal` 说了的照它说的（0031）；没说的是 state
+            temporal: p.temporal.as_deref().unwrap_or("state").to_string(),
         });
         pending_links.push((p.key.clone(), domains, ranges));
     }
@@ -716,6 +722,8 @@ pub async fn apply(
             symmetric: false,
             asymmetric: false,
             irreflexive: false,
+            // 属性建成 state，页面也不给别的选（0031 的「未决」里那一条）
+            temporal: "state".to_string(),
         });
         pending_attr_domains.push((p.key.clone(), domain_ids));
     }
@@ -771,7 +779,7 @@ pub async fn apply(
         "ontology.imported",
         "kb",
         Some(kb_id),
-        summary,
+        utopia_store::audit::via_token(summary, via_token),
     )
     .await;
     // 本体刚变过，向量都是陈的。**排任务而不是就地跑**：这一趟要嵌几千行，

@@ -54,6 +54,7 @@ export const zh: Strings = {
     bad_display_name: "显示名需要 1–64 个字符。",
     wrong_password: "当前密码不对。",
     registration_closed: "本部署已关闭自助注册——请找管理员开通账户。",
+    password_login_disabled: "本部署已关闭密码登录，请用单点登录。",
     no_chat_model: "还没有配置对话模型。到「管理 → 模型」里配一个。",
     // 对话流里没答成的那一轮：`error` 帧带的 code（服务端的英文原句只给日志）
     answer_empty: "模型没有给出回答，请再问一次。",
@@ -126,9 +127,14 @@ export const zh: Strings = {
     concurrency_range: "填一个 1 到 256 之间的数。",
     inference_off: "这个库没有打开物化推理。到设置里开。",
     bad_resolution: "这不是一个有效的裁决。",
+    interval_inverted: "终点早于起点。请给一个晚于起点的终点。",
     empty_state_span: "起止相同的状态任何时刻都不成立。给一个晚于起点的终点，或者让它开着。",
     unknown_marks: "单个日期标的是开始、结束，或者都不是。",
     marks_needs_state: "只有状态属性才说单个日期标的是什么，事件与恒常属性不说。",
+    // 采纳提案（0061 决定 3）：撞上别的写、整次回滚了；复用要写的都已由人另定
+    alignment_busy: "另一项操作正在改同样的内容，这次什么都没保存，请稍后再试。",
+    proposal_stale:
+      "这条提案已经没有可采纳的了：它的每个短语或类别词要么已由人另行判定，要么已不在任何陈述里。拒绝它就能清掉。",
   },
   errDetail: (msg: string, detail: string) => `${msg}（${detail}）`,
   toast: {
@@ -278,7 +284,7 @@ export const zh: Strings = {
       },
       "governance.tripped": {
         title: "agent 停止自动裁决了",
-        hint: "七天内它的裁决被撤回了两次，开关已自动关掉。到「审核 > Agent」看看它做了什么，想让它接着跑就在库设置里再打开。",
+        hint: "七天内它的合并被撤回了两次，开关已自动关掉。到「审核 > Agent」看看它做了什么，想让它接着跑就在库设置里再打开。",
       },
       "llm.unreachable": {
         title: "模型端点没有给出可用的回答",
@@ -356,6 +362,7 @@ export const zh: Strings = {
     ssoButton: "使用单点登录",
     ssoErrors: {
       unlinked: "这个身份还没绑定任何账号。先用密码登录，再到账户页绑定。",
+      unlinked_sso_only: "这个身份登不进本部署，请找管理员开通。",
       cancelled: "单点登录已取消。",
       denied: "身份提供方的应答没能通过校验。",
       session: "这次登录是在另一个浏览器会话里开始的，请重试。",
@@ -526,6 +533,7 @@ export const zh: Strings = {
       chunk_unextracted: "这一段端点没能答上，没有进图",
       phrase_is_value: "已保留，但短语就是那个值",
       phrase_is_subject: "已保留，但短语就是主语的名字",
+      object_is_value: "已保留，宾语按值记下",
     },
     reExtractSource: "重新抽取",
     reExtractTitle: "重新抽取这个来源？",
@@ -571,6 +579,7 @@ export const zh: Strings = {
       statements: "陈述",
       custom: "自定义",
       github_issues: "GitHub 工单",
+      github_repo: "GitHub 仓库文件",
       jira_issues: "Jira 工单",
       s3: "S3 / MinIO",
       azure_blob: "Azure Blob",
@@ -589,6 +598,9 @@ export const zh: Strings = {
         "同步一个仓库的工单。**每张工单连同它的状态变更史**成为一篇文档——" +
         "何时开出、何时关闭、标签与负责人怎么变的，都带着日期。未配令牌时" +
         "每小时只有 60 次请求配额。",
+      github_repo:
+        "读取一个仓库默认分支上的 markdown 文件。每个文件成为一篇文档，" +
+        "日期取最后一次改动它的提交；没变的文件不会重抓。",
       s3:
         "从 S3 桶里读文档，或者任何说同一套协议的东西（MinIO、Ceph、R2）。" +
         "**端点留空就是 AWS**，填了就是自建。每个对象成为一篇文档，" +
@@ -617,6 +629,7 @@ export const zh: Strings = {
     ingestGuide: "阅读摄入接口指南 →",
     ingestGuideTitle: "摄入接口指南",
     endpointField: "接口地址",
+    feedPlaceholder: "https://your-service/utopia-feed",
     endpointCopied: "接口地址已复制",
     copyEndpoint: "点击复制完整地址",
     pushStatus: {
@@ -680,6 +693,8 @@ export const zh: Strings = {
     notionQueryField: "搜索词（可选——留空则取全部已分享页面）",
     tokenField: "GitHub 令牌（可选，不再显示）",
     includePullRequests: "把 PR 也当工单收进来",
+    includeGlobsField: "包含的 glob（逗号分隔，可选）",
+    excludeGlobsField: "排除的 glob（逗号分隔，可选）",
     interval: "同步计划",
     intervalManual: "仅手动",
     intervalEvery: (m: number) =>
@@ -1191,6 +1206,40 @@ export const zh: Strings = {
     savedRequeued: (n: number) => `已保存。${n} 个等待中的文件开始读取。`,
   },
   ontology: {
+    casesShort: "回归案例",
+    casesTitle: "属性回归案例",
+    casesHint: "显示最近记录的预期属性与对齐决定的对比结果。刷新只读取这些结果；修改属性后由现有对齐流程更新。",
+    casesEmpty: "还没有案例。采纳属性提案，或从文档中添加一条开放陈述。",
+    caseStatement: "陈述",
+    caseExpected: "预期",
+    caseActual: "实际",
+    caseResult: "结果",
+    caseChecked: "最近检查",
+    caseOrigin: "添加来源",
+    casePassed: "一致",
+    caseMismatch: "不一致",
+    caseNotChecked: "未检查",
+    caseUnbound: "未绑定属性",
+    caseUndecided: "未决定",
+    caseUnavailableProperty: "原绑定属性已不可用",
+    caseDecidedAt: "决定时间",
+    caseNoProperties: "请先在本体中创建适合的属性，再添加此案例。",
+    caseHumanBound: "保留人工决定",
+    caseHumanHint: "人工绑定予以保留，并按通过计入。这不代表一次独立的模型检查。",
+    caseAdoption: "采纳提案",
+    casePerson: "手动添加",
+    caseUnknownCreator: "已离开的成员",
+    caseEvidence: "展开原文证据",
+    caseHideEvidence: "收起原文证据",
+    caseMake: "添加回归案例",
+    caseAddTitle: "添加属性回归案例",
+    caseAddHint: "保存这条开放陈述应绑定的属性及方向，再将已有的对齐决定与此预期比较。",
+    caseExpectedProperty: "预期属性",
+    caseDirection: "方向",
+    caseForward: "主语 → 宾语",
+    caseReverse: "宾语 → 主语",
+    caseAdded: "回归案例已添加",
+    caseAdd: "添加案例",
     title: "本体",
     hint: "类与属性",
     tabClasses: "类",
@@ -1213,10 +1262,10 @@ export const zh: Strings = {
     axiomSymmetric: "对称",
     axiomAsymmetric: "反对称",
     axiomIrreflexive: "非自反",
-    tabProperties: "属性",
+    tabProperties: "关系",
     newClass: "新建类",
     newSubClass: "新建子类",
-    newProperty: "新建属性",
+    newProperty: "新建关系",
     filter: "筛选…",
     missesShort: "未匹配",
     uniquenessShort: "并存",
@@ -1342,6 +1391,7 @@ export const zh: Strings = {
     editClass: "编辑类",
     editProperty: "编辑关系",
     editAttribute: "编辑属性",
+    attributeHost: "挂在哪个类",
     connectTitle: "连接一个关系",
     connectOpen: "用已有的关系连接…",
     noDescription: "还没有描述。",
@@ -1507,13 +1557,6 @@ export const zh: Strings = {
     uniquenessDone: (close: number, review: number) =>
       review > 0 ? `已闭合 ${close} 条 · ${review} 条待审` : `已闭合 ${close} 条`,
     uniquenessSince: (d: string) => `自 ${d}`,
-    dismiss: "忽略",
-    dismissed: (n: number) => `已忽略（${n}）`,
-    dismissedHint:
-      "仍在计数，只是不进建议。如果某一个在你忽略之后涨了，可以撤回。",
-    restore: "撤回忽略",
-    suggest: "用 AI 建议",
-    suggesting: "分析中…",
     noMisses: "文档说到的东西里，没有在等本体给位置的。",
     uncovered: (kindWords: number, phrases: number) => {
       const what = [
@@ -1526,30 +1569,6 @@ export const zh: Strings = {
     },
     approve: "加入",
     mapOver: "用已有的",
-    willRemap: (n: number) => `将重新归类 ${n} 条事实`,
-    adopted: (n: number) => `已加入——${n} 条事实已重新归类`,
-    adoptedPartly: (moved: number, left: number) =>
-      `已加入——${moved} 条已重新归类，${left} 条留在原处（值与类型对不上）`,
-    undoAdopt: (key: string, n: number) =>
-      `已加入 ${key}，${n} 条事实已重新归类`,
-    undoAdoptBtn: "撤销",
-    reverted: (n: number) => `已撤销——${n} 条事实已复原`,
-    undoKeepsRelation: "关系保留；只有事实被移回去。",
-    undoTitle: "撤销这次本体变更？",
-    undoHint: (n: number) =>
-      `${n} 条事实会回到「related to」。关系本身保留——` +
-      `什么都不会被删除，之后仍可再次采纳。`,
-    undoConfirm: "撤销",
-    undoCancel: "保持",
-    autoRanTitle: "Utopia 依据你的文档扩展了这个本体",
-    autoRanBody: (rels: string[], facts: number) =>
-      `新增 ${rels.join("、")} · ${facts} 条事实已重新归类`,
-    autoRanOff: "可在知识库设置里关掉它。",
-    addAll: (n: number) => `全部加入（${n}）`,
-    addingAll: "加入中…",
-    addAllLabel: "批量",
-    addAllPartial: (keys: string[]) =>
-      `有几个没能加入：${keys.join("、")}——其余的已经成功。`,
     proposals: "AI 提案",
     keyHint: "小写下划线命名",
     /* ---- 0061：本体代理与能力问题 ---- */
@@ -1566,6 +1585,7 @@ export const zh: Strings = {
     rejectProposal: "拒绝",
     rejectReasonPrompt: "为什么不要？（可不填——代理下次提案前会读）",
     rejectedProposal: "已拒绝",
+    adoptKept: (n: number) => `已保存。其中 ${n} 条已由人另行判定，按人的判定保留。`,
     questions: "能力问题",
     questionsHint:
       "这个知识库应该答得上来的问题。代理提的类与属性要服务它们；它们就是本体的验收标准。",
@@ -1739,11 +1759,8 @@ export const zh: Strings = {
     agentTitle: "Agent",
     agentHint:
       "agent 依据这个库里人以前的决定，提议或裁决了什么。在这里回答就是你的决定，也会成为它下一次的先例。",
-    agentEmpty: "agent 还没看过任何审核项。",
-    agentActions: { merge: "合并", keep: "分开", unsure: "说不准", close_old: "结束旧事实",
-      retime_new: "修正新事实起点", keep_both: "两者都保留", reject_new: "驳回新事实" } as Record<string, string>,
-    agentConflictDate: "旧事实结束日期或新事实的正确起点",
-    agentInputsChanged: "裁决后的事实已经变化，请查看当前内容后再决定。",
+    agentEmpty: "agent 还没看过任何一对。",
+    agentActions: { merge: "合并", keep: "分开", unsure: "说不准" } as Record<string, string>,
     agentStatus: {
       proposed: "建议",
       applied: "已裁",
@@ -1771,8 +1788,8 @@ export const zh: Strings = {
     overviewAgentAccepted: "你接受的建议",
     overviewAgentOverridden: (n) => `改判 ${n}，近 30 天`,
     overviewAgentReverted: "你撤回的",
-    overviewAgentRunning: (n) => (n === 0 ? "agent 在完成这一轮" : `agent 处理中 · 还有 ${n} 项没看`),
-    overviewAgentQueue: (n) => `${n} 项等 agent 看`,
+    overviewAgentRunning: (n) => (n === 0 ? "agent 在处理最后一簇" : `agent 处理中 · 还有 ${n} 对没看`),
+    overviewAgentQueue: (n) => `${n} 对等 agent 看`,
     agentDeciding: "agent 正在裁这一对",
     overviewTitle: "总览",
     overviewHint: "这个库要你做什么：有多少在等、等了多久、办过什么、还有多少是暂定的。",
@@ -1807,8 +1824,6 @@ export const zh: Strings = {
       "conflict.close_old": "闭合旧的",
       "conflict.keep_both": "两条都留",
       "conflict.reject_new": "驳回新的",
-      "conflict.retime_new": "修正了新事实起点",
-      "conflict.revert": "撤回了冲突裁决",
       "merge.revert": "撤销合并",
       "merge.manual": "手动合并",
       "fact.time_corrected": "改了时间",
@@ -2055,26 +2070,24 @@ export const zh: Strings = {
     title: "知识库设置",
     general: "常规",
     members: "成员",
-    autoExtend: "自动扩展本体",
-    autoExtendNote:
-      "当抽取遇到这个本体里没有的关系时，把它加进来，并把一直等着它的那些事实重新归类。" +
-      "每一次变更都会列出，并且可以撤销。关掉它并不会让 Utopia 不再留意——" +
-      "那些说法仍然会汇集到「未匹配」下，只是要等你点头。",
     materialize: "物化推理",
     materializeNote:
       "把本体蕴含的事实写进账本——传递链与对称对。它们带派生标记、单列一段，背后的声明要是错了，撤掉只要一下。",
     autoResolveTypes: "抽取后自动消解实体类型",
     autoResolveTypesNote:
       "每篇文档抽完，对引擎还没看过的实体跑一轮类型消解。只有在现类子树里精化的才自动落地，跨轴的改判仍留在本体页等你。每一批都列在本体页，随时可以撤回。",
-    governance: "让 agent 审核重复实体和事实冲突",
+    governance: "让 agent 处理重复项队列",
     governanceNote:
-      "agent 先读原文证据和人的历史决定，依次审核重复实体和事实冲突。没通过检查的会作为建议留给你；自动裁决列在审核页的 Agent 中，相关事实未被后续修改时可以撤回。关掉，队列就停。",
+      "先进先出。裁一对之前，agent 先读这个库里的人对同样的名字、同样的类型对做过什么决定：有先例撑着才合并，有把握就分开，其余的写成建议留给你。每一笔都列在审核页的 Agent 里，可以撤回。关掉，队列就停。",
     inferEvery: "每隔",
     minutes: "分钟重推",
     lastInference: (when: string) => `上次 ${when}`,
     failedJobs: (n: number) => `${n} 个失败的任务`,
     requeue: "再跑一遍",
     requeued: (n: number) => `${n} 个任务回到队列`,
+    exportKb: "导出整个知识库（RDF）",
+    exportKbNote: "把所有事实及其出处下载为 Turtle 文件。",
+    exportKbAction: "导出",
     cardIdentity: "名字与描述",
     cardIdentityNote: "最长 64 个字符。切换器和这个库每一页的顶上用的都是它。",
     cardVisibilityNote:
@@ -2162,6 +2175,7 @@ export const zh: Strings = {
   members: {
     title: "部署用户",
     systemAdmin: "系统管理员",
+    systemAdminHint: "可进入系统管理：部署配置、账号、数据源。不能收回自己的。",
     remove: "移除",
     deactivate: "停用账号",
     cancel: "取消",

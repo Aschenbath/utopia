@@ -19,6 +19,11 @@ pub struct ToolCall {
     pub name: String,
     /// JSON 字符串参数（协议原样透传）
     pub arguments: String,
+    /// 端点挂在调用上的私货，原样带回。Gemini 3 在每个 function call 上给一个
+    /// `extra_content.google.thought_signature`，同一回合把结果送回去时**必须**
+    /// 原样附上，否则 400「Function call is missing a thought_signature」；上一回合
+    /// 的可以不带。内容不解读，不是对象就当没有。
+    pub extra_content: Option<serde_json::Value>,
 }
 
 /// 工具对话的一个 assistant 回合：文本与工具调用至少其一。
@@ -27,6 +32,8 @@ pub struct AssistantTurn {
     /// Preserve the provider value; absent is not an implicit `stop`.
     pub finish_reason: Option<String>,
     pub content: Option<String>,
+    /// Provider reasoning, kept apart from visible text and replayed for tool continuation.
+    pub reasoning_content: Option<String>,
     pub tool_calls: Vec<ToolCall>,
 }
 
@@ -34,24 +41,57 @@ impl AssistantTurn {
     /// 还原为 OpenAI 协议的 assistant 消息（回灌对话历史用）。
     pub fn to_message(&self) -> serde_json::Value {
         let mut msg = json!({ "role": "assistant", "content": self.content });
+        if let Some(reasoning) = &self.reasoning_content {
+            msg["reasoning_content"] = json!(reasoning);
+        }
         if !self.tool_calls.is_empty() {
             msg["tool_calls"] = json!(self
                 .tool_calls
                 .iter()
-                .map(|c| json!({
-                    "id": c.id,
-                    "type": "function",
-                    "function": { "name": c.name, "arguments": c.arguments },
-                }))
+                .map(|c| {
+                    let mut call = json!({
+                        "id": c.id,
+                        "type": "function",
+                        "function": { "name": c.name, "arguments": c.arguments },
+                    });
+                    if let Some(extra) = &c.extra_content {
+                        call["extra_content"] = extra.clone();
+                    }
+                    call
+                })
                 .collect::<Vec<_>>());
         }
         msg
     }
 }
 
+/// 一段 tool_call 增量归到哪个调用。写了 `index` 的听它的；没写的，带着 `id`
+/// 就是一个新调用，什么都不带就是上一个调用的续篇。
+///
+/// **不写 `index` 的端点把并行调用也不编号。** Gemini 的 OpenAI 兼容端点一个
+/// 调用一块，块上没有 `index`、有 `id`、参数一次给全；两个并行调用都按 0 归并，
+/// 名字就拼成了 `find_entitiessearch_chunks`，于是「未知工具」整轮作废。续篇的
+/// 判据是没有 `id`：OpenAI 的续篇只带参数碎片，开头那块才带 `id`
+fn tool_call_slot(delta: &serde_json::Value, seen: usize) -> usize {
+    if let Some(index) = delta["index"].as_u64() {
+        return index as usize;
+    }
+    let starts_a_call = delta["id"].as_str().is_some_and(|id| !id.is_empty());
+    if starts_a_call || seen == 0 {
+        seen
+    } else {
+        seen - 1
+    }
+}
+
 /// 工具结果消息（role=tool）。
 pub fn tool_result_message(tool_call_id: &str, content: &str) -> serde_json::Value {
     json!({ "role": "tool", "tool_call_id": tool_call_id, "content": content })
+}
+
+/// 一条工具调用上端点挂的 `extra_content`：是对象才算，别的形状不猜。
+fn extra_content_of(call: &serde_json::Value) -> Option<serde_json::Value> {
+    call.get("extra_content").filter(|v| v.is_object()).cloned()
 }
 
 /// 带工具的流式回合事件。
@@ -346,6 +386,9 @@ pub struct Reply {
     pub finish_reason: Option<String>,
     /// 端点报的用量（最后一帧）。不报就是 `None`——账上不编数字
     pub usage: Option<Usage>,
+    /// 回复在复读，是我们停了读（#1301），不是端点收的尾。与 `finish_reason` 分开记：
+    /// 记成 `length` 的话丢弃行会说「撞上了 token 上限」，看的人就去查那个上限了
+    pub repeating: bool,
 }
 
 /// 一次调用的 token 用量，端点自己报的
@@ -468,6 +511,28 @@ fn strip_reasoning(reply: &str) -> &str {
         Some(pos) => &reply[pos + "</think>".len()..],
         None => reply,
     }
+}
+
+/// 回复的尾巴是不是同一段在复读（#1301）。
+///
+/// 温度 0 的小模型会掉进复读：同一行陈述一遍遍写下去，直到撞上
+/// [`MAX_COMPLETION_TOKENS`]。本地 qwen3-8b 上约 3% 的抽取调用如此，每次占一个槽
+/// 一个多小时，吃掉六成的生成量。上限本身不能降（开推理的端点上它是思考预算），
+/// 所以看尾巴：同一段（至少 30 字节）一字不差连着出现五次，就不是在答题了——
+/// 真实的陈述行彼此不同。按字节比，多字节字符切在哪都不影响。
+///
+/// 只算**最短周期**也有 30 字节的尾巴：每条陈述以原文引文开头，一段 150 字节以上的
+/// 短周期串照样能拆成 30 字节以上的段——目录行 200 个点的引导线、一排二十个空
+/// `<td></td>`，不加这一条就可能被当成复读截断（看每 256 字节的检查落在哪），引文之后
+/// 的全丢了。真复读是整行在重复；短于 30 字节的行复读时这里不截（一夜 57 次截断里有
+/// 4 次是这种），宁可让它跑到上限，也不截断引文
+fn repeats_at_tail(text: &[u8]) -> bool {
+    const REPEATS: usize = 5;
+    (30..=600.min(text.len() / REPEATS)).any(|span| {
+        let tail = &text[text.len() - span * REPEATS..];
+        tail.chunks(span).all(|piece| piece == &tail[..span])
+            && !(1..30).any(|shift| tail[shift..] == tail[..tail.len() - shift])
+    })
 }
 
 impl LlmClient {
@@ -658,7 +723,8 @@ impl LlmClient {
         let (mut saw_frame, mut ended) = (false, false);
         let mut finish_reason: Option<String> = None;
         let mut usage: Option<Usage> = None;
-        while let Some(part) = bytes.next().await {
+        let (mut checked, mut repeating) = (0, false);
+        'read: while let Some(part) = bytes.next().await {
             let part = part.map_err(Unreachable)?;
             // 网络片段可能断在 UTF-8 字符中间，等完整 SSE 帧到齐再解码。
             buf.push(&part);
@@ -672,6 +738,24 @@ impl LlmClient {
                     &mut finish_reason,
                     &mut usage,
                 );
+                // 复读了就不再读，回复记成 `repeating`：抽取当它是半截的，前面完整的陈述照收，
+                // 不再等它写到 65,536 个 token。丢掉响应流，连接一关，端点那边也就停了。按帧看
+                // 而不是按网络片段看：一个片段可能装着整段复读。每多 256 字节看一次
+                if !ended && answer.len() >= checked + 256 {
+                    checked = answer.len();
+                    if repeats_at_tail(answer.as_bytes()) {
+                        tracing::warn!(
+                            model = %self.model,
+                            call = %call_label(messages),
+                            chars = answer.len(),
+                            "回复在复读，按截断收下"
+                        );
+                        repeating = true;
+                        ended = true;
+                        buf = SseBuffer::default();
+                        break 'read;
+                    }
+                }
             }
         }
         // **收尾那一帧也算**：末尾不跟空行的实现有的是，丢掉它就是丢掉答案的尾巴
@@ -709,6 +793,7 @@ impl LlmClient {
             text: strip_reasoning(&answer).to_string(),
             finish_reason,
             usage,
+            repeating,
         })
     }
 
@@ -842,6 +927,7 @@ impl LlmClient {
                                 .as_str()
                                 .unwrap_or("{}")
                                 .to_string(),
+                            extra_content: extra_content_of(c),
                         })
                     })
                     .collect()
@@ -849,6 +935,7 @@ impl LlmClient {
             .unwrap_or_default();
         Ok(AssistantTurn {
             content,
+            reasoning_content: msg["reasoning_content"].as_str().map(String::from),
             tool_calls,
             finish_reason: body["choices"][0]["finish_reason"]
                 .as_str()
@@ -890,6 +977,7 @@ impl LlmClient {
         let stream = async_stream::try_stream! {
             let mut buf = SseBuffer::default();
             let mut content = String::new();
+            let mut reasoning_content: Option<String> = None;
             let mut calls: Vec<ToolCall> = Vec::new();
             let mut finish_reason = None;
             let mut done = false;
@@ -914,6 +1002,9 @@ impl LlmClient {
                             done = true;
                         }
                         let delta = &v["choices"][0]["delta"];
+                        if let Some(text) = delta["reasoning_content"].as_str() {
+                            reasoning_content.get_or_insert_default().push_str(text);
+                        }
                         if let Some(text) = delta["content"].as_str() {
                             if !text.is_empty() {
                                 content.push_str(text);
@@ -922,15 +1013,19 @@ impl LlmClient {
                         }
                         if let Some(tcs) = delta["tool_calls"].as_array() {
                             for tc in tcs {
-                                let idx = tc["index"].as_u64().unwrap_or(0) as usize;
+                                let idx = tool_call_slot(tc, calls.len());
                                 while calls.len() <= idx {
                                     calls.push(ToolCall {
                                         id: String::new(),
                                         name: String::new(),
                                         arguments: String::new(),
+                                        extra_content: None,
                                     });
                                 }
                                 let slot = &mut calls[idx];
+                                if let Some(extra) = extra_content_of(tc) {
+                                    slot.extra_content = Some(extra);
+                                }
                                 if let Some(id) = tc["id"].as_str() {
                                     slot.id.push_str(id);
                                 }
@@ -952,7 +1047,7 @@ impl LlmClient {
             }
             calls.retain(|c| !c.name.is_empty());
             let content = if content.is_empty() { None } else { Some(content) };
-            yield ToolStreamItem::Turn(AssistantTurn { content, tool_calls: calls, finish_reason });
+            yield ToolStreamItem::Turn(AssistantTurn { content, reasoning_content, tool_calls: calls, finish_reason });
         };
         Ok(stream)
     }
@@ -1044,38 +1139,7 @@ impl LlmClient {
         let data = body["data"]
             .as_array()
             .ok_or_else(|| anyhow::anyhow!("Unexpected embedding response shape"))?;
-        // 调用方把这些向量和输入的文本按位置配对。响应里写了 index，那它才是配对的
-        // 依据——网关把条目打乱了顺序也认得回来。
-        //
-        // **看值，不看键**：`get("index")` 对 `"index": null` 也返回 Some，而兼容端点
-        // 写个空值、写成字符串的都有。按键判断会把它们送进索引分支，再在 `as_u64` 上
-        // 报错，于是今天能用的响应明天整批失败。取不出数就当它没有索引，照旧按位置配。
-        let items: Vec<&serde_json::Value> = if data.iter().any(|item| {
-            item.get("index")
-                .and_then(serde_json::Value::as_u64)
-                .is_some()
-        }) {
-            let mut ordered = vec![None; texts.len()];
-            for item in data {
-                let index = item["index"]
-                    .as_u64()
-                    .and_then(|i| usize::try_from(i).ok())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("Embedding response has a missing or invalid index")
-                    })?;
-                let slot = ordered
-                    .get_mut(index)
-                    .ok_or_else(|| anyhow::anyhow!("Embedding response index is out of range"))?;
-                anyhow::ensure!(slot.is_none(), "Embedding response has a duplicate index");
-                *slot = Some(item);
-            }
-            ordered
-                .into_iter()
-                .collect::<Option<Vec<_>>>()
-                .ok_or_else(|| anyhow::anyhow!("Embedding response is missing an input index"))?
-        } else {
-            data.iter().collect()
-        };
+        let items = ordered_by_index(data, texts.len())?;
         let mut out = Vec::with_capacity(items.len());
         for item in items {
             let v = item["embedding"]
@@ -1088,6 +1152,43 @@ impl LlmClient {
         }
         Ok(out)
     }
+}
+
+/// 把返回的向量和输入的文本配对。响应里写了数字 `index` 的条目归到那个输入；
+/// 取不出数的（没写、`null`、字符串、浮点、负数）按它到达的位置配——网关打乱了
+/// 顺序也认得回来，不写索引的端点也照旧能用。
+///
+/// **两种形状可以混在一批里。** Gemini 的 OpenAI 兼容端点只在第一条上省掉 `index`
+/// （零是它的默认值，默认值不写），三条输入回来是 `[{embedding}, {index: 1},
+/// {index: 2}]`。混合不是矛盾：每条要么说了自己是谁，要么站在自己的位置上。真正的
+/// 矛盾是两条认领同一个输入、索引超出这一批、或条数和输入对不上——那是端点在说谎，
+/// 拒绝，不猜。
+fn ordered_by_index(
+    data: &[serde_json::Value],
+    expected: usize,
+) -> anyhow::Result<Vec<&serde_json::Value>> {
+    anyhow::ensure!(
+        data.len() == expected,
+        "Embedding response has {} items for {expected} inputs",
+        data.len()
+    );
+    let mut ordered = vec![None; expected];
+    for (position, item) in data.iter().enumerate() {
+        let index = item
+            .get("index")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|i| usize::try_from(i).ok())
+            .unwrap_or(position);
+        let slot = ordered
+            .get_mut(index)
+            .ok_or_else(|| anyhow::anyhow!("Embedding response index {index} is out of range"))?;
+        anyhow::ensure!(
+            slot.is_none(),
+            "Embedding response has a duplicate index {index}"
+        );
+        *slot = Some(item);
+    }
+    Ok(ordered.into_iter().flatten().collect())
 }
 
 /// 记一次调用的 token 开销。**缓存命中数是这里最重要的一列**：抽取靠
@@ -1942,6 +2043,55 @@ mod tests {
         }
     }
 
+    fn content_frame(text: &str) -> String {
+        format!(
+            "data: {}\n\n",
+            json!({"choices": [{"delta": {"content": text}}]})
+        )
+    }
+
+    async fn streamed_reply(sse: &str) -> Reply {
+        let (addr, server) = an_http_response("200 OK", "text/event-stream", sse).await;
+        let user = ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+        };
+        let reply = client_at(addr)
+            .chat_at_streaming(&[user], Some(0.0))
+            .await
+            .unwrap();
+        server.await.unwrap();
+        reply
+    }
+
+    /// 复读的回复按截断收下（#1301）：这条流没有收尾，没有护栏就是「流断在半路」
+    #[tokio::test]
+    async fn a_reply_that_keeps_repeating_comes_back_cut() {
+        let row = r#"[null,"a","is on","b",null,{},null,null],"#;
+        let sse =
+            content_frame(r#"{"e":[["a","thing",true]],"s":["#) + &content_frame(row).repeat(200);
+        let reply = streamed_reply(&sse).await;
+        assert!(reply.repeating);
+        assert!(!reply.hit_token_ceiling(), "the endpoint never said length");
+        assert!(
+            reply.text.len() < row.len() * 20,
+            "read {} bytes past the loop",
+            reply.text.len()
+        );
+    }
+
+    /// 引文里一条 200 个点的目录引导线不是复读：周期是一个点，不是一整行
+    #[tokio::test]
+    async fn a_quoted_dot_leader_comes_back_whole() {
+        let sse = content_frame(r#"{"e":[["Introduction","section",true]],"s":[["Introduction "#)
+            + &content_frame(&".".repeat(200))
+            + &content_frame(r#" 3","Introduction","is on page",null,"3",{},null,null]],"n":[]}"#)
+            + "data: [DONE]\n\n";
+        let reply = streamed_reply(&sse).await;
+        assert!(!reply.repeating);
+        assert!(reply.text.ends_with(r#""n":[]}"#), "{}", reply.text);
+    }
+
     #[tokio::test]
     async fn a_raw_stream_cut_before_its_finish_is_an_error() {
         use futures_util::TryStreamExt;
@@ -2015,6 +2165,66 @@ mod tests {
             };
             assert_eq!(turn.finish_reason.as_deref(), reason);
         }
+    }
+
+    #[tokio::test]
+    async fn tool_turns_preserve_reasoning_for_continuation_without_showing_it() {
+        for reasoning in [Some("先查找🦀"), Some(""), None] {
+            let body = json!({"choices":[{"message":{
+                "content":"Searching now",
+                "reasoning_content":reasoning,
+                "tool_calls":[{"id":"call_1","type":"function","function":{"name":"search","arguments":"{}"}}]
+            },"finish_reason":"tool_calls"}]}).to_string();
+            let (addr, server) = an_http_response("200 OK", "application/json", &body).await;
+            let turn = client_at(addr)
+                .chat_tools_with(&[], None, None)
+                .await
+                .unwrap();
+            server.await.unwrap();
+            let message = turn.to_message();
+            assert_eq!(turn.content.as_deref(), Some("Searching now"));
+            assert_eq!(message["content"], "Searching now");
+            assert_eq!(
+                message.get("reasoning_content"),
+                reasoning.map(|s| json!(s)).as_ref()
+            );
+            assert_eq!(message["tool_calls"][0]["id"], "call_1");
+        }
+    }
+
+    #[tokio::test]
+    async fn streamed_tool_turns_join_reasoning_across_frames_and_utf8_chunks() {
+        use futures_util::TryStreamExt;
+        let frames = [
+            json!({"choices":[{"delta":{"reasoning_content":"先查找"}}]}),
+            json!({"choices":[{"delta":{"reasoning_content":"🦀"}}]}),
+            json!({"choices":[{"delta":{
+                "content":"Searching now",
+                "tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"search","arguments":"{}"}}]
+            },"finish_reason":"tool_calls"}]}),
+        ];
+        let sse = frames
+            .iter()
+            .map(|frame| format!("data: {frame}\n\n"))
+            .collect::<String>()
+            + "data: [DONE]\n\n";
+        let (addr, server) = bytewise_sse(&sse).await;
+        let items: Vec<ToolStreamItem> = client_at(addr)
+            .chat_tools_stream_with(&[], None, None)
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        server.await.unwrap();
+        let [ToolStreamItem::Delta(delta), ToolStreamItem::Turn(turn)] = items.as_slice() else {
+            panic!("expected only the visible content delta and completed turn: {items:?}");
+        };
+        assert_eq!(delta, "Searching now");
+        assert_eq!(turn.content.as_deref(), Some("Searching now"));
+        let message = turn.to_message();
+        assert_eq!(message["reasoning_content"], "先查找🦀");
+        assert_eq!(message["tool_calls"][0]["id"], "call_1");
     }
 
     #[tokio::test]
@@ -2867,14 +3077,44 @@ data: [DONE]
         assert_eq!(out, vec![vec![1.0, 10.0], vec![2.0, 20.0]]);
     }
 
+    /// Gemini 的兼容端点只省掉第一条的 `index`（零是默认值）：三条输入回来是
+    /// `[{embedding}, {index: 1}, {index: 2}]`。没写索引的那条站在自己的位置上
+    #[tokio::test]
+    async fn an_item_without_an_index_takes_its_position_beside_indexed_ones() {
+        let body = json!({ "data": [
+            {"embedding": [1.0]},
+            {"index": 1, "embedding": [2.0]},
+            {"index": 2, "embedding": [3.0]}
+        ]})
+        .to_string();
+        let (addr, server) = an_http_response("200 OK", "application/json", &body).await;
+        let out = client_at(addr)
+            .embed(&["one".into(), "two".into(), "three".into()])
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(out, vec![vec![1.0], vec![2.0], vec![3.0]]);
+    }
+
+    /// 负数取不出 `u64`，和 `null`、字符串一样按位置算——哪怕同一批里别的条目写了索引
+    #[tokio::test]
+    async fn a_negative_index_falls_back_to_position_beside_indexed_ones() {
+        let out = embeddings_from(json!([
+            {"index": 0, "embedding": [1.0]}, {"index": -1, "embedding": [2.0]}
+        ]))
+        .await
+        .unwrap();
+        assert_eq!(out, vec![vec![1.0], vec![2.0]]);
+    }
+
     #[tokio::test]
     async fn ambiguous_embedding_indices_are_rejected() {
         for data in [
             json!([{"index": 0, "embedding": [1.0]}, {"index": 0, "embedding": [2.0]}]),
             json!([{"index": 0, "embedding": [1.0]}, {"index": 2, "embedding": [2.0]}]),
-            json!([{"index": 0, "embedding": [1.0]}, {"embedding": [2.0]}]),
-            json!([{"index": 0, "embedding": [1.0]}, {"index": -1, "embedding": [2.0]}]),
+            json!([{"index": 1, "embedding": [1.0]}, {"embedding": [2.0]}]),
             json!([{"index": 0, "embedding": [1.0]}]),
+            json!([{"embedding": [1.0]}, {"embedding": [2.0]}, {"embedding": [3.0]}]),
         ] {
             assert!(
                 embeddings_from(data.clone()).await.is_err(),
@@ -2891,5 +3131,138 @@ data: [DONE]
         .await
         .unwrap();
         assert_eq!(out, vec![vec![1.0, 10.0], vec![2.0, 20.0]]);
+    }
+
+    /// Gemini 3 的形状：tool_call 不带 `index`，带 `extra_content.google.thought_signature`，
+    /// finish_reason 说 `stop`。两种传输都要把 `extra_content` 留住，回灌时原样带回
+    #[tokio::test]
+    async fn a_tool_call_keeps_its_extra_content_in_both_transports() {
+        use futures_util::TryStreamExt;
+        let extra = json!({"google": {"thought_signature": "Eq0CCqoC"}});
+        let call = json!({
+            "id": "call_170866", "type": "function",
+            "function": {"name": "search_kb", "arguments": "{\"query\":\"lore\"}"},
+            "extra_content": extra
+        });
+        let body = json!({"choices":[{"message":{"role":"assistant","tool_calls":[call]},"finish_reason":"stop"}]})
+            .to_string();
+        let (addr, server) = an_http_response("200 OK", "application/json", &body).await;
+        let turn = client_at(addr)
+            .chat_tools_with(&[], None, None)
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(turn.tool_calls[0].extra_content, Some(extra.clone()));
+        assert_eq!(turn.to_message()["tool_calls"][0]["extra_content"], extra);
+
+        let frame =
+            json!({"choices":[{"delta":{"role":"assistant","tool_calls":[call]},"index":0}]});
+        let done =
+            json!({"choices":[{"delta":{"role":"assistant"},"finish_reason":"stop","index":0}]});
+        let sse = format!("data: {frame}\n\ndata: {done}\n\ndata: [DONE]\n\n");
+        let (addr, server) = an_http_response("200 OK", "text/event-stream", &sse).await;
+        let stream = client_at(addr)
+            .chat_tools_stream_with(&[], None, None)
+            .await
+            .unwrap();
+        let items: Vec<ToolStreamItem> = stream.try_collect().await.unwrap();
+        server.await.unwrap();
+        let [ToolStreamItem::Turn(turn)] = items.as_slice() else {
+            panic!("expected one completed turn: {items:?}");
+        };
+        assert_eq!(turn.tool_calls[0].extra_content, Some(extra.clone()));
+        assert_eq!(turn.to_message()["tool_calls"][0]["extra_content"], extra);
+    }
+
+    /// 没有 `extra_content`、或它不是对象的调用，回灌时也不长出这个键
+    #[tokio::test]
+    async fn a_tool_call_without_extra_content_echoes_none() {
+        for call in [
+            json!({"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}}),
+            json!({"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}, "extra_content": null}),
+            json!({"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}, "extra_content": "sig"}),
+        ] {
+            let body = json!({"choices":[{"message":{"role":"assistant","tool_calls":[call]},"finish_reason":"tool_calls"}]})
+                .to_string();
+            let (addr, server) = an_http_response("200 OK", "application/json", &body).await;
+            let turn = client_at(addr)
+                .chat_tools_with(&[], None, None)
+                .await
+                .unwrap();
+            server.await.unwrap();
+            assert_eq!(turn.tool_calls[0].extra_content, None, "{call}");
+            assert!(
+                turn.to_message()["tool_calls"][0]
+                    .get("extra_content")
+                    .is_none(),
+                "{call}"
+            );
+        }
+    }
+
+    /// Gemini 的并行调用：一块一个，块上没有 `index`，各带自己的 `id`。两个调用，
+    /// 名字和参数各归各
+    #[tokio::test]
+    async fn parallel_tool_calls_without_an_index_stay_separate() {
+        use futures_util::TryStreamExt;
+        let first = json!({"choices":[{"delta":{"role":"assistant","tool_calls":[{
+            "function":{"arguments":"{\"name\":\"lore\"}","name":"find_entities"},
+            "id":"call_266956","type":"function"}]},"index":0}]});
+        let second = json!({"choices":[{"delta":{"role":"assistant","tool_calls":[{
+            "function":{"arguments":"{\"query\":\"what's next\"}","name":"search_chunks"},
+            "id":"call_266959","type":"function"}]},"index":0}]});
+        let done =
+            json!({"choices":[{"delta":{"role":"assistant"},"finish_reason":"stop","index":0}]});
+        let sse = format!("data: {first}\n\ndata: {second}\n\ndata: {done}\n\ndata: [DONE]\n\n");
+        let (addr, server) = an_http_response("200 OK", "text/event-stream", &sse).await;
+        let stream = client_at(addr)
+            .chat_tools_stream_with(&[], None, None)
+            .await
+            .unwrap();
+        let items: Vec<ToolStreamItem> = stream.try_collect().await.unwrap();
+        server.await.unwrap();
+        let [ToolStreamItem::Turn(turn)] = items.as_slice() else {
+            panic!("expected one completed turn: {items:?}");
+        };
+        let calls: Vec<(&str, &str, &str)> = turn
+            .tool_calls
+            .iter()
+            .map(|c| (c.id.as_str(), c.name.as_str(), c.arguments.as_str()))
+            .collect();
+        assert_eq!(
+            calls,
+            vec![
+                ("call_266956", "find_entities", "{\"name\":\"lore\"}"),
+                (
+                    "call_266959",
+                    "search_chunks",
+                    "{\"query\":\"what's next\"}"
+                ),
+            ]
+        );
+    }
+
+    /// 没有 `index` 也没有 `id` 的增量是上一个调用的续篇：参数碎片接在后面
+    #[tokio::test]
+    async fn an_unindexed_delta_without_an_id_continues_the_last_call() {
+        use futures_util::TryStreamExt;
+        let head = json!({"choices":[{"delta":{"tool_calls":[{
+            "id":"call_1","function":{"name":"lookup","arguments":"{\"name\":"}}]}}]});
+        let tail = json!({"choices":[{"delta":{"tool_calls":[{
+            "function":{"arguments":"\"Acme\"}"}}]}}]});
+        let done = json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]});
+        let sse = format!("data: {head}\n\ndata: {tail}\n\ndata: {done}\n\ndata: [DONE]\n\n");
+        let (addr, server) = an_http_response("200 OK", "text/event-stream", &sse).await;
+        let stream = client_at(addr)
+            .chat_tools_stream_with(&[], None, None)
+            .await
+            .unwrap();
+        let items: Vec<ToolStreamItem> = stream.try_collect().await.unwrap();
+        server.await.unwrap();
+        let [ToolStreamItem::Turn(turn)] = items.as_slice() else {
+            panic!("expected one completed turn: {items:?}");
+        };
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].arguments, "{\"name\":\"Acme\"}");
     }
 }

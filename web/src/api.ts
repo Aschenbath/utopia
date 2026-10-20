@@ -1,5 +1,5 @@
 import type { SourceKind } from "./sourceKinds";
-import { S, lang } from "./i18n";
+import { S } from "./i18n";
 import { createParser } from "eventsource-parser";
 
 export class ApiError extends Error {
@@ -359,6 +359,8 @@ export interface SyncRun {
 export interface ChunkFact {
   chunk_id: string;
   fact_id: string;
+  /** A live open-layer statement with a usable phrase, eligible for a regression case. */
+  is_open_statement: boolean;
   subject_id: string;
   subject: string;
   /** 本体没认下这条关系时是原文说法；两者都拿不出时为 null */
@@ -660,15 +662,12 @@ export interface ReviewItem {
 }
 
 /** agent 的一笔（0025）：看了哪一对、想怎么办、凭什么、人怎么答的 */
-export type ConflictAction = "close_old" | "retime_new" | "keep_both" | "reject_new";
-export type AgentAnswerAction = "merge" | "keep" | "revert" | ConflictAction;
-
 export interface AgentDecision {
   id: string;
   run_id: string;
-  target_kind: "review" | "conflict";
+  target_kind: "review";
   target_id: string;
-  action: "merge" | "keep" | "unsure" | ConflictAction;
+  action: "merge" | "keep" | "unsure";
   confidence: number;
   reason: string | null;
   /** 它被给看的先例：同对 / 同名 / 撤回各一条一条，类型对的习惯是一条汇总 */
@@ -686,15 +685,9 @@ export interface AgentDecision {
   decided_by_name: string | null;
   left: string | null;
   right: string | null;
-  summary?: string | null;
-  detail?: {
-    params?: { date?: string | null; precision?: string | null };
-    snapshot?: { new?: { valid_from?: string | null; valid_from_precision?: string | null } };
-  };
 }
 
 export type AgentPrecedent =
-  | { family: "conflict"; event_id: string; action: string; detail: Record<string, unknown>; at: string }
   | {
       family: "same_pair" | "same_name" | "revert";
       event_id: string;
@@ -1078,6 +1071,8 @@ export interface GraphEdge {
   blocked: boolean;
   /** 边上的属性（0037） */
   qualifiers: FactQualifier[];
+  /** 文档的角色词（0044）：不是本体属性，另放一处 */
+  statement_qualifiers: StatementQualifier[];
 }
 
 /** 实体的一个名字（0041）。`canonical` 是面板标题上那个；曾用名在世界轴上有结束 */
@@ -1092,6 +1087,14 @@ export interface NameView {
   valid_to_precision: string | null;
   document_ids: string[];
   evidence_count: number;
+}
+
+/** 开放陈述按文档角色词记的限定（0044）：值或实体 */
+export interface StatementQualifier {
+  role: string;
+  value: unknown | null;
+  entity_id: string | null;
+  entity_name: string | null;
 }
 
 export interface EntityFact {
@@ -1113,6 +1116,8 @@ export interface EntityFact {
   object_value: Record<string, unknown> | null;
   /** 边上的属性（0037） */
   qualifiers: FactQualifier[];
+  /** 文档的角色词（0044）：不是本体属性，另放一处 */
+  statement_qualifiers: StatementQualifier[];
   valid_from: string | null;
   valid_to: string | null;
   /** 读出来的区间（0022），与 GraphEdge 同义：「此刻成立」按它判 */
@@ -1181,6 +1186,38 @@ export interface EntityHistoryEvent {
   /** 改类事件的两端。起点为 null = 从「未分类」改过来（0009 之后最常见的一种） */
   from_type_label: string | null;
   to_type_label: string | null;
+}
+
+/** Stored comparisons against the regular phrase-alignment decisions. */
+export interface OntologyRegressionCase {
+  id: string;
+  kb_id: string;
+  statement_id: string;
+  expected_property_id: string;
+  expected_direction: "forward" | "reverse";
+  created_by: string | null;
+  created_at: string;
+  origin: "adoption" | "person";
+  last_checked_at: string | null;
+  last_result: {
+    passed: boolean;
+    human_bound: boolean;
+    actual_property_id: string | null;
+    actual_direction: "forward" | "reverse" | null;
+    status: "bound" | "none" | "undecided";
+    decided_at: string | null;
+  } | null;
+  subject_id: string;
+  subject_label: string;
+  phrase: string;
+  object_id: string | null;
+  object_label: string | null;
+  object_value: Record<string, unknown> | null;
+  expected_property_label: string;
+  expected_property_key: string;
+  actual_property_label: string | null;
+  actual_property_key: string | null;
+  created_by_label: string | null;
 }
 
 export interface Evidence {
@@ -1302,12 +1339,6 @@ export interface QuestionReport {
   uncovered: { kind_words: number; phrases: number };
 }
 
-export interface OntologyMiss {
-  kind: "entity_type" | "relation_type";
-  key: string;
-  example: string | null;
-  count: number;
-}
 
 /** 一条谓词的一端挂着两个以上开放值（#341）。
  *
@@ -1422,12 +1453,6 @@ export interface OntologyProposals {
   })[];
 }
 
-/** 原文说过、本体里没有、因而事实没有谓词的说法。 */
-export interface ProposedPredicate {
-  form: string;
-  fact_count: number;
-  example: string | null;
-}
 
 /** 一个类/属性在这次导入里的去向。key_taken = key 被另一个 IRI 占着，报告但不动 */
 export interface PlannedItem {
@@ -1826,6 +1851,12 @@ export const api = {
   adminDeactivateUser: (userId: string) =>
     request<{ ok: boolean }>(`/api/v1/admin/users/${userId}`, {
       method: "DELETE",
+    }),
+  /** 授予或收回系统管理员（#1233） */
+  adminSetSystemAdmin: (userId: string, isAdmin: boolean) =>
+    request<{ ok: boolean }>(`/api/v1/admin/users/${userId}`, {
+      method: "PUT",
+      body: JSON.stringify({ is_admin: isAdmin }),
     }),
   adminDataSources: () =>
     request<{ data_sources: DataSourceView[] }>("/api/v1/admin/data-sources"),
@@ -2227,10 +2258,23 @@ export const api = {
     request<{
       entity_types: EntityTypeView[];
       relation_types: RelationTypeView[];
-      misses: OntologyMiss[];
-      /** 已忽略的，连同它此后继续累积的计数。抑制照旧，只是看得见 */
-      dismissed_misses: OntologyMiss[];
     }>(`/api/v1/kbs/${kbId}/ontology`),
+  ontologyRegressions: (kbId: string) =>
+    request<{ cases: OntologyRegressionCase[] }>(
+      `/api/v1/kbs/${kbId}/ontology/regressions`,
+    ),
+  addOntologyRegression: (
+    kbId: string,
+    body: {
+      statement_id: string;
+      relation_type_id: string;
+      direction: "forward" | "reverse";
+    },
+  ) =>
+    request<{ id: string }>(`/api/v1/kbs/${kbId}/ontology/regressions`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
   createEntityType: (kbId: string, body: Record<string, unknown>) =>
     request<{ id: string }>(`/api/v1/kbs/${kbId}/ontology/entity-types`, {
       method: "POST",
@@ -2298,12 +2342,13 @@ export const api = {
   /** 上次算出来、还没人表态的提案（0049）。刷新页面靠它，不必重跑模型 */
   storedProposals: (kbId: string) =>
     request<OntologyProposals>(`/api/v1/kbs/${kbId}/ontology/proposals`),
-  /** 一条提案有人表态了。改状态不删行——拒绝留痕，下一轮 Suggest 不再刷回待看 */
+  /** 一条提案有人拒绝了。改状态不删行——拒绝留痕，下一轮 Suggest 不再刷回待看。
+   *  只收拒绝：采纳走 adoptProposal，元素和采纳的状态一起提交（0061 决定 3） */
   decideProposal: (
     kbId: string,
     section: string,
     key: string,
-    status: "adopted" | "rejected",
+    status: "rejected",
     /** 拒绝的理由（0061）：下一轮代理读得到 */
     reason?: string,
   ) =>
@@ -2317,7 +2362,7 @@ export const api = {
       method: "POST",
       body: "{}",
     }),
-  /** 采纳代理的一条提案（0061 决定 3）：服务端建元素、标记、排对齐 */
+  /** 采纳代理的一条提案（0061 决定 3）：元素、回归用例、采纳的状态和后续任务一次提交 */
   adoptProposal: (
     kbId: string,
     section: string,
@@ -2331,7 +2376,11 @@ export const api = {
       parents?: string[];
     },
   ) =>
-    request<{ id: string }>(`/api/v1/kbs/${kbId}/ontology/proposals/adopt`, {
+    request<{
+      id: string;
+      /** 复用时留着没写的形状或类别词，各带人定成了什么：代理读过之后人另定了、和提案不一样的 */
+      skipped: ({ phrase: string } | { kind_word: string })[];
+    }>(`/api/v1/kbs/${kbId}/ontology/proposals/adopt`, {
       method: "POST",
       body: JSON.stringify({ section, key, ...(edits ?? {}) }),
     }),
@@ -2372,23 +2421,6 @@ export const api = {
   /** 两个数（0061 决定 5） */
   questionReport: (kbId: string) =>
     request<QuestionReport>(`/api/v1/kbs/${kbId}/questions/report`),
-  dismissMiss: (kbId: string, kind: string, key: string) =>
-    request<{ ok: boolean }>(`/api/v1/kbs/${kbId}/ontology/misses/dismiss`, {
-      method: "POST",
-      body: JSON.stringify({ kind, key }),
-    }),
-  restoreMiss: (kbId: string, kind: string, key: string) =>
-    request<{ ok: boolean }>(`/api/v1/kbs/${kbId}/ontology/misses/restore`, {
-      method: "POST",
-      body: JSON.stringify({ kind, key }),
-    }),
-  /** reason 只给人看，而人就在这次请求的另一端——所以语言由调用方说，
-      不是后端的设置（docs/decisions/0004）。description 的语言跟知识库走，服务端自己知道 */
-  suggestOntology: (kbId: string) =>
-    request<OntologyProposals>(`/api/v1/kbs/${kbId}/ontology/suggest`, {
-      method: "POST",
-      body: JSON.stringify({ locale: lang }),
-    }),
 
   /** 上传本体文件只算出计划，一个字节都不写库 */
   previewOntologyImport: (kbId: string, file: File) => {
@@ -2411,57 +2443,6 @@ export const api = {
   ontologyImports: (kbId: string) =>
     request<{ imports: OntologyImportView[] }>(
       `/api/v1/kbs/${kbId}/ontology/imports`,
-    ),
-
-  proposedPredicates: (kbId: string) =>
-    request<{ forms: ProposedPredicate[] }>(
-      `/api/v1/kbs/${kbId}/ontology/proposed-predicates`,
-    ),
-  /** 最近一次自动扩本体做了什么，以及还能不能撤销（撤干净了返回 null） */
-  lastAutoExtension: (kbId: string) =>
-    request<{
-      run: {
-        at: string;
-        relations: string[] | null;
-        classes: string[] | null;
-        facts_remapped: number | null;
-        batches: string[];
-      } | null;
-    }>(`/api/v1/kbs/${kbId}/ontology/auto-extension`),
-  /** 建关系 **并**把等着它的无谓词事实认过去——后半句才是收益 */
-  adoptPredicate: (
-    kbId: string,
-    body: {
-      key: string;
-      /** true = key 指的是已有的关系/属性，只改写事实，不建新类型 */
-      existing?: boolean;
-      /** attribute 走另一条改写路径：值要按 datatype 换算 */
-      kind?: "relation" | "attribute";
-      datatype?: string;
-      unit?: string;
-      label?: string;
-      temporal?: string;
-      functional?: boolean;
-      description?: string;
-      forms: string[];
-    },
-  ) =>
-    request<{
-      id: string;
-      remapped: number;
-      batch: string;
-      /** 值换不动那个 datatype、因而没被改写的条数。改写了 3 条丢下 2 条，
-          只报前半句就是报喜不报忧 */
-      unconvertible?: number;
-    }>(`/api/v1/kbs/${kbId}/ontology/adopt-predicate`, {
-      method: "POST",
-      body: JSON.stringify(body),
-    }),
-  /** 撤销一次采纳：新写的行作废、旧行复活。关系类型留着 */
-  unadoptPredicate: (kbId: string, batchId: string) =>
-    request<{ reverted: number }>(
-      `/api/v1/kbs/${kbId}/ontology/adopt-predicate/${batchId}`,
-      { method: "DELETE" },
     ),
 
   sources: (kbId: string) =>
@@ -2738,14 +2719,12 @@ export const api = {
   agentAnswer: (
     kbId: string,
     decisionId: string,
-    action: AgentAnswerAction,
+    action: "merge" | "keep" | "revert",
     rationale?: string,
-    date?: string,
-    datePrecision?: string,
   ) =>
     request<{ ok: boolean }>(`/api/v1/kbs/${kbId}/review/agent/${decisionId}`, {
       method: "POST",
-      body: JSON.stringify({ action, rationale: rationale || null, date, date_precision: datePrecision }),
+      body: JSON.stringify({ action, rationale: rationale || null }),
     }),
   reviewHistory: (kbId: string, page: number, per = 20) =>
     request<{ events: ReviewHistoryEvent[]; total: number }>(
@@ -2799,7 +2778,8 @@ export const api = {
 
   /** 是否配置了单点登录（0056）。四项环境变量缺一个都是 false——
    *  登录页据此决定要不要露出那个按钮 */
-  oidcStatus: () => request<{ enabled: boolean }>("/api/v1/auth/oidc/status"),
+  oidcStatus: () =>
+    request<{ enabled: boolean; password_login: boolean }>("/api/v1/auth/oidc/status"),
   /** 谁的哪个身份提供方 subject 绑定到了这个部署的哪个账号（只读 + 解绑） */
   oidcIdentities: () =>
     request<{

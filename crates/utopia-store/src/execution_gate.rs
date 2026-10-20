@@ -153,15 +153,6 @@ pub async fn impact_of(pool: &PgPool, kb_id: Uuid, a: Uuid, b: Uuid) -> AppResul
 /// 派生；把它的主语认下过的回答（回答记的是它认下的东西，不是引的事实——主语被问过，
 /// 关于它的一条事实就可能进过答案；与合并同一个口径）。矛盾一栏空着：撤掉一条不会开出违规
 pub async fn impact_of_fact(pool: &PgPool, kb_id: Uuid, fact_id: Uuid) -> AppResult<Impact> {
-    impact_of_fact_in(&mut *pool.acquire().await?, kb_id, fact_id).await
-}
-
-/// A conflict decision checks the same gate inside its write transaction.
-pub(crate) async fn impact_of_fact_in(
-    conn: &mut sqlx::PgConnection,
-    kb_id: Uuid,
-    fact_id: Uuid,
-) -> AppResult<Impact> {
     let derived: i64 = sqlx::query_scalar(
         "SELECT count(DISTINCT d.id) FROM fact_derivations fd
            JOIN derived_facts d ON d.id = fd.derived_fact_id
@@ -169,7 +160,7 @@ pub(crate) async fn impact_of_fact_in(
     )
     .bind(kb_id)
     .bind(fact_id)
-    .fetch_one(&mut *conn)
+    .fetch_one(pool)
     .await?;
     let answered: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM conversation_messages m
@@ -180,7 +171,7 @@ pub(crate) async fn impact_of_fact_in(
     )
     .bind(kb_id)
     .bind(fact_id)
-    .fetch_one(conn)
+    .fetch_one(pool)
     .await?;
     Ok(Impact {
         contradictions: vec![],

@@ -37,6 +37,7 @@ import {
   Th,
   THead,
   Tr,
+  localDate,
 } from "../ui";
 import { toast } from "../toast";
 import { expressionText, metadataOnly, metadataPatch } from "./ruleExpressions";
@@ -94,19 +95,26 @@ function operandText(op: string, operand: unknown, attributes: RelationTypeView[
 }
 
 /** 输入框文本 → 操作数。**解析不出来就返回 undefined**，由调用方拦在保存之前 */
-function parseOperand(op: string, text: string): unknown | undefined {
+export function parseOperand(op: string, text: string): unknown | undefined {
   const kind = operandKind(op);
   if (kind === "none") return undefined;
   const t = text.trim();
+  if (!t) return undefined;
   if (kind === "set") {
+    // **全角逗号也是分隔符**：中文输入法敲出来的逗号是「，」。从前只认半角，
+    // 「气测异常，气测异常后效」存成了一个成员——「属于」永不成立，
+    // 「不属于」对任何值都成立。metadataOnly 故意不锁含「，」的成员，好让
+    // 这样存下的旧规则打开再保存一次就修好；代价是经 API 写进的也会被拆开
     const set = t
-      .split(",")
+      .split(/[,，]/)
       .map((s) => s.trim())
       .filter(Boolean);
     return set.length ? set : undefined;
   }
   if (kind === "range") {
-    const parts = t.split(/[-~]/).map((s) => Number(s.trim()));
+    const number = "[+-]?(?:\\d+(?:\\.\\d*)?|\\.\\d+)(?:[eE][+-]?\\d+)?";
+    const match = new RegExp(`^(${number})\\s*[-~]\\s*(${number})$`).exec(t);
+    const parts = match ? [Number(match[1]), Number(match[2])] : [];
     return parts.length === 2 && parts.every((n) => Number.isFinite(n))
       ? parts
       : undefined;
@@ -300,7 +308,7 @@ function History({ kbId, ruleId, attributes }: { kbId: string; ruleId: string; a
               <span className="u-num text-small text-ink">{S.ontology.ruleVersion(v.seq)}</span>
               {!v.superseded_at && <Chip tone="success">{S.ontology.ruleVersionCurrent}</Chip>}
               <span className="u-num text-fine text-ink-2">
-                {S.ontology.ruleVersionSince(v.recorded_at.slice(0, 10), v.superseded_at ? v.superseded_at.slice(0, 10) : null)}
+                {S.ontology.ruleVersionSince(localDate(v.recorded_at), v.superseded_at ? localDate(v.superseded_at) : null)}
               </span>
               <span className="u-num text-fine text-ink-2">{S.ontology.ruleVersionStanding(v.derived_count)}</span>
             </div>

@@ -993,6 +993,36 @@ async fn entity_fact_qualifier_text_preserves_the_stored_string() -> anyhow::Res
 }
 
 #[tokio::test]
+async fn entity_facts_reads_back_a_statements_role_words() -> anyhow::Result<()> {
+    let Some(f) = Fixture::new().await? else {
+        return Ok(());
+    };
+    sqlx::query(
+        "INSERT INTO statement_qualifiers(fact_id,role,value)
+         VALUES ($1,'lines','{\"value\":\"10-42\"}'::jsonb)",
+    )
+    .bind(f.corrected)
+    .execute(&f.state.pool)
+    .await?;
+    let result = f
+        .call("entity_facts", json!({"entity_id":f.subject}))
+        .await?;
+    let text = result["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("lines: 10-42]"), "{text}");
+    let fact = result["structuredContent"]["facts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|fact| uuid(&fact["id"]) == f.corrected)
+        .unwrap();
+    assert_eq!(
+        fact["statement_qualifiers"],
+        json!([{"role":"lines","value":{"value":"10-42"},"entity_id":null,"entity_name":null}])
+    );
+    f.clean().await
+}
+
+#[tokio::test]
 async fn entity_facts_keeps_identity_values_filters_and_both_clocks() -> anyhow::Result<()> {
     let Some(f) = Fixture::new().await? else {
         return Ok(());
@@ -1912,6 +1942,205 @@ async fn failed_reads_do_not_become_successful_empty_results() -> anyhow::Result
 }
 
 #[tokio::test]
+async fn document_reads_continue_past_the_budget_in_chat_and_mcp() -> anyhow::Result<()> {
+    let Some(f) = Fixture::new().await? else {
+        return Ok(());
+    };
+    let ctx = ToolCtx {
+        state: &f.state,
+        kb_id: f.kb,
+        workspace_id: f.ws,
+        mounted_sources: &[],
+        can_write: false,
+        actor: None,
+        via_token: None,
+        question: None,
+    };
+    let schema = super::super::chat::tools_schema(false, &[]);
+    let listed = f
+        .request(f.kb, "tools/list", json!({}))
+        .await
+        .map_err(|e| e.0)?
+        .0;
+    let document_tool = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "get_document")
+        .unwrap();
+    assert_eq!(
+        document_tool["inputSchema"]["properties"]["offset"]["type"],
+        "integer"
+    );
+    assert_eq!(
+        document_tool["inputSchema"]["properties"]["offset"]["minimum"],
+        0
+    );
+    assert_eq!(
+        document_tool["inputSchema"]["required"],
+        json!(["document_id"])
+    );
+
+    // One oversized table row, then a page boundary inside the next chunk.
+    for (first_body, second_body) in [
+        (
+            format!("| Case | {} | CHECKSUM-TAIL |", "界🦀".repeat(16_000)),
+            "LAST-SECTION",
+        ),
+        ("界".repeat(23_999), "🦀CHECKSUM-TAIL"),
+    ] {
+        sqlx::query(
+            "UPDATE chunks SET text=CASE WHEN seq=0 THEN $2 ELSE $3 END WHERE document_id=$1",
+        )
+        .bind(f.document)
+        .bind(format!(" \n{first_body}\n "))
+        .bind(format!(" \n{second_body}\n "))
+        .execute(&f.state.pool)
+        .await?;
+        let first_len = first_body.chars().count();
+        for over_mcp in [false, true] {
+            let mut sink = ToolSink::default();
+            let mut args = json!({"document_id":f.document});
+            for page in 0..2 {
+                let read = if over_mcp {
+                    f.call("get_document", args.clone()).await?
+                } else {
+                    let checked =
+                        super::super::chat::check_call(&schema, "get_document", &args.to_string())
+                            .map_err(|(message, _)| anyhow::anyhow!(message))?;
+                    tool_result(tools::dispatch(&ctx, &mut sink, "get_document", &checked).await)
+                };
+                assert_eq!(read["isError"], false, "{read}");
+                let text = read["content"][0]["text"].as_str().unwrap();
+                if page == 0 {
+                    assert!(!text.contains("CHECKSUM-TAIL"), "{text}");
+                    assert!(text.contains(&format!(
+                        "{} chars omitted",
+                        first_len + second_body.chars().count() - 24_000
+                    )));
+                    let next_offset: usize = text
+                        .rsplit_once("offset: ")
+                        .unwrap()
+                        .1
+                        .split_whitespace()
+                        .next()
+                        .unwrap()
+                        .parse()?;
+                    assert_eq!(next_offset, 24_000);
+                    args["offset"] = json!(next_offset);
+                } else {
+                    assert!(text.contains("CHECKSUM-TAIL"), "{text}");
+                    assert!(!text.contains("truncated"), "{text}");
+                    if first_len > 24_000 {
+                        let tail: String = first_body.chars().skip(24_000).collect();
+                        assert!(text.contains(&format!("section 1:\n{tail}")));
+                        assert!(text.contains(second_body));
+                    } else {
+                        assert!(!text.contains("section 1:"));
+                        assert!(text.contains("section 2:\nCHECKSUM-TAIL"));
+                    }
+                }
+            }
+            if !over_mcp {
+                assert_eq!(sink.sources.len(), 2);
+                assert_eq!(sink.source_ids[0], f.chunk.to_string());
+            }
+        }
+    }
+    f.clean().await
+}
+
+#[tokio::test]
+async fn document_offsets_preserve_defaults_and_report_invalid_or_finished_reads(
+) -> anyhow::Result<()> {
+    let Some(f) = Fixture::new().await? else {
+        return Ok(());
+    };
+    let default = f
+        .call("get_document", json!({"document_id":f.document}))
+        .await?;
+    let zero = f
+        .call("get_document", json!({"document_id":f.document,"offset":0}))
+        .await?;
+    assert_eq!(default, zero);
+    for offset in [
+        json!(-1),
+        json!(1.5),
+        json!("24000"),
+        json!(true),
+        Value::Null,
+        json!([]),
+        json!({}),
+    ] {
+        let read = f
+            .call(
+                "get_document",
+                json!({"document_id":f.document,"offset":offset}),
+            )
+            .await?;
+        assert_eq!(read["isError"], true, "{read}");
+        assert!(read["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("non-negative integer"));
+    }
+    let step = step_of(
+        &f,
+        &[],
+        "get_document",
+        json!({"document_id":f.document,"offset":-1}),
+    )
+    .await;
+    assert_eq!(step["status"], "invalid");
+    assert_eq!(step["param"], "offset");
+    let total: i64 = sqlx::query_scalar(
+        "SELECT sum(char_length(trim(text)))::bigint FROM chunks WHERE document_id=$1",
+    )
+    .bind(f.document)
+    .fetch_one(&f.state.pool)
+    .await?;
+    let total = u64::try_from(total)?;
+    for offset in [total, total + 1, usize::MAX as u64] {
+        let read = f
+            .call(
+                "get_document",
+                json!({"document_id":f.document,"offset":offset}),
+            )
+            .await?;
+        assert_eq!(read["isError"], false, "{read}");
+        assert!(read["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!("(no text remaining at offset {offset})")));
+    }
+    let boundary = f
+        .call(
+            "get_document",
+            json!({"document_id":f.document,"offset":959}),
+        )
+        .await?;
+    let text = boundary["content"][0]["text"].as_str().unwrap();
+    assert!(!text.contains("section 1:"));
+    assert!(text.contains("section 2:\nAlice works for Acme."));
+    // An empty trailing chunk must not turn an exhausted read into an empty citation.
+    sqlx::query("UPDATE chunks SET text=' \n ' WHERE document_id=$1 AND seq=1")
+        .bind(f.document)
+        .execute(&f.state.pool)
+        .await?;
+    let finished = f
+        .call(
+            "get_document",
+            json!({"document_id":f.document,"offset":959}),
+        )
+        .await?;
+    assert!(finished["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .ends_with("(no text remaining at offset 959)"));
+    f.clean().await
+}
+
+#[tokio::test]
 async fn document_reads_preserve_text_empty_and_unavailable_results() -> anyhow::Result<()> {
     let Some(f) = Fixture::new().await? else {
         return Ok(());
@@ -1951,13 +2180,17 @@ async fn document_reads_preserve_text_empty_and_unavailable_results() -> anyhow:
     // Missing, foreign and deleted IDs remain indistinguishable; a read failure
     // must not change that boundary or turn a genuinely empty document into an error.
     for id in [Uuid::now_v7(), foreign, f.document] {
-        let result = f.call("get_document", json!({"document_id":id})).await?;
-        assert_eq!(result["isError"], false);
-        assert_eq!(
-            result["content"][0]["text"],
-            "No document with that id in this knowledge base."
-        );
-        assert!(result.get("structuredContent").is_none());
+        for offset in [0, 24_000] {
+            let result = f
+                .call("get_document", json!({"document_id":id,"offset":offset}))
+                .await?;
+            assert_eq!(result["isError"], false);
+            assert_eq!(
+                result["content"][0]["text"],
+                "No document with that id in this knowledge base."
+            );
+            assert!(result.get("structuredContent").is_none());
+        }
     }
     f.clean().await
 }
@@ -2282,100 +2515,6 @@ async fn computed_rule_descriptions_keep_the_expression_tree_and_identity() -> a
         assert!(!text.contains("Foreign secret"));
     }
     f.clean().await
-}
-
-#[tokio::test]
-async fn written_magnitudes_keep_fractions_through_authenticated_adoption() -> anyhow::Result<()> {
-    use axum::body::{to_bytes, Body};
-    use axum::http::{Request, StatusCode};
-    use tower::ServiceExt;
-
-    let Some(f) = Fixture::new().await? else {
-        return Ok(());
-    };
-    async fn check(f: &Fixture) -> anyhow::Result<()> {
-        let auth = utopia_store::tokens::authenticate(&f.state.pool, &f.token).await?;
-        sqlx::query("UPDATE kb_members SET role='editor' WHERE kb_id=$1 AND user_id=$2")
-            .bind(f.kb)
-            .bind(auth.user_id)
-            .execute(&f.state.pool)
-            .await?;
-        let jwt = crate::auth::issue_token(&f.state, auth.user_id)?;
-        let app = crate::api::router(f.state.clone(), &Default::default());
-        for (index, input) in ["1.00000025 million", "100.000025万"]
-            .into_iter()
-            .enumerate()
-        {
-            let form = format!("fractional_amount_{index}");
-            let raw = json!({"value":input,"unit":"$"});
-            // This endpoint adopts unbound typed value facts. Open statements are
-            // intentionally not used: their alignment is a different write path.
-            let (old, _) = utopia_store::graph::insert_value_fact(
-                &f.state.pool,
-                f.kb,
-                f.subject,
-                None,
-                &raw,
-                utopia_store::graph::Validity::default(),
-                0.9,
-            )
-            .await?;
-            sqlx::query("INSERT INTO fact_evidence(fact_id,chunk_id,document_id,doc_version,quote,proposed_predicate)
-                         VALUES ($1,$2,$3,1,$4,$5)")
-                .bind(old).bind(f.chunk).bind(f.document).bind(input).bind(&form).execute(&f.state.pool).await?;
-            let waiting = utopia_store::graph::value_facts_for_forms(
-                &f.state.pool,
-                f.kb,
-                std::slice::from_ref(&form),
-            )
-            .await?;
-            anyhow::ensure!(
-                waiting.len() == 1 && waiting[0].0 == old,
-                "fixture is not supported by adoption"
-            );
-            let response = app.clone().oneshot(Request::builder().method("POST")
-                .uri(format!("/api/v1/kbs/{}/ontology/adopt-predicate",f.kb))
-                .header("authorization",format!("Bearer {jwt}"))
-                .header("content-type","application/json")
-                .body(Body::from(json!({"key":form,"label":form,"forms":[form],"kind":"attribute","datatype":"number"}).to_string()))?).await?;
-            let status = response.status();
-            let bytes = to_bytes(response.into_body(), 1024 * 1024).await?;
-            anyhow::ensure!(
-                status == StatusCode::OK,
-                "adoption rejected: {}",
-                String::from_utf8_lossy(&bytes)
-            );
-            let result: Value = serde_json::from_slice(&bytes)?;
-            anyhow::ensure!(result["remapped"] == 1, "no fact adopted: {result}");
-            let attribute = uuid(&result["id"]);
-            let (new, stored, supersedes): (Uuid,Value,Option<Uuid>) = sqlx::query_as(
-                "SELECT id,object_value,supersedes FROM facts WHERE kb_id=$1 AND predicate_id=$2 AND invalidated_at IS NULL")
-                .bind(f.kb).bind(attribute).fetch_one(&f.state.pool).await?;
-            anyhow::ensure!(
-                stored["value"].as_f64() == Some(1000000.25),
-                "adoption rounded away .25: {stored}"
-            );
-            anyhow::ensure!(
-                stored["unit"] == "$" && supersedes == Some(old),
-                "unit or history lost"
-            );
-            let original: Value = sqlx::query_scalar("SELECT object_value FROM facts WHERE id=$1")
-                .bind(old)
-                .fetch_one(&f.state.pool)
-                .await?;
-            anyhow::ensure!(original == raw, "historical value rewritten");
-            let evidence: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM fact_evidence WHERE fact_id=$1 AND quote=$2 AND document_id=$3)")
-                .bind(new).bind(input).bind(f.document).fetch_one(&f.state.pool).await?;
-            anyhow::ensure!(evidence, "adopted fact lost source evidence");
-            let audit: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_events WHERE kb_id=$1 AND action='ontology.attribute_adopted' AND target_id=$2")
-                .bind(f.kb).bind(attribute).fetch_one(&f.state.pool).await?;
-            anyhow::ensure!(audit == 1, "missing adoption audit");
-        }
-        Ok(())
-    }
-    let result = check(&f).await;
-    let cleanup = f.clean().await;
-    result.and(cleanup)
 }
 
 #[tokio::test]

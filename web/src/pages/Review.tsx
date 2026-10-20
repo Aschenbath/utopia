@@ -1,4 +1,4 @@
-import { alignmentErrorMessage, agentErrorMessage } from "./reviewErrors";
+import { alignmentErrorMessage } from "./reviewErrors";
 import { asksMarks, phraseStart } from "./alignmentPhrase";
 import { useEffect, useState } from "react";
 import { LayoutDashboard } from "lucide-react";
@@ -7,7 +7,6 @@ import { useNavigate, useSearch } from "@tanstack/react-router";
 import {
   api,
   type AgentDecision,
-  type AgentAnswerAction,
   type AgentPrecedent,
   type AxiomViolation,
   type ReviewQueue,
@@ -27,7 +26,7 @@ import {
   type ReviewSide,
   type ViolationResolution,
 } from "../api";
-import { fmtTime, parseDateInput } from "../time";
+import { parseDateInput } from "../time";
 import { PendingFactRow, useCanDecide } from "./PendingFacts";
 import { ReviewOverview } from "./ReviewOverview";
 import { S } from "../i18n";
@@ -49,6 +48,7 @@ import {
   SearchSelect,
   Status,
   cn,
+  localDate,
   type ChipTone,
 } from "../ui";
 
@@ -479,7 +479,7 @@ function MergeRow({
             ? S.review.mergedBy(merge.merged_by_name)
             : S.review.mergedByAi}
           {" · "}
-          {merge.created_at.slice(0, 10)}
+          {localDate(merge.created_at)}
           {merge.reason ? ` · ${escalationText(merge.reason)}` : ""}
         </div>
       </div>
@@ -503,10 +503,6 @@ const AGENT_ACTION_TONE: Record<AgentDecision["action"], ChipTone> = {
   merge: "violet",
   keep: "neutral",
   unsure: "warn",
-  close_old: "info",
-  retime_new: "info",
-  keep_both: "neutral",
-  reject_new: "danger",
 };
 
 const AGENT_STATUS_TONE: Record<AgentDecision["status"], ChipTone> = {
@@ -520,11 +516,6 @@ const AGENT_STATUS_TONE: Record<AgentDecision["status"], ChipTone> = {
 
 /** 一条先例写成一句话；类型对的习惯是汇总，单独一句 */
 function precedentText(p: AgentPrecedent): string {
-  if (p.family === "conflict") {
-    const text = (key: string) => typeof p.detail[key] === "string" ? p.detail[key] as string : "";
-    const action = S.review.decisionActions[p.action] ?? p.action;
-    return `${text("old_subject")} — ${text("predicate")} → ${text("old_object")} / ${text("new_subject")} → ${text("new_object")} · ${action} · ${p.at.slice(0, 10)}${text("why") ? ` · “${text("why")}”` : ""}`;
-  }
   if (p.family === "type_pair")
     return S.review.agentPrecedentHabit(p.merged, p.kept, p.reverted);
   const verb =
@@ -533,7 +524,7 @@ function precedentText(p: AgentPrecedent): string {
       : p.action === "review.keep"
         ? S.review.agentPrecedentKept
         : S.review.agentPrecedentMerged;
-  const line = `${p.left} ≟ ${p.right} · ${verb} · ${p.at.slice(0, 10)}`;
+  const line = `${p.left} ≟ ${p.right} · ${verb} · ${localDate(p.at)}`;
   // 人写的那一句（0026）跟在后面：先例不只是结果
   return p.why ? `${line} · “${p.why}”` : line;
 }
@@ -545,33 +536,20 @@ function AgentRow({
 }: {
   d: AgentDecision;
   busy: boolean;
-  onAnswer: (action: AgentAnswerAction, rationale?: string, date?: string, datePrecision?: string) => void;
+  onAnswer: (action: "merge" | "keep" | "revert", rationale?: string) => void;
 }) {
   const [open, setOpen] = useState(false);
   const [why, setWhy] = useState("");
-  const isConflict = d.target_kind === "conflict";
-  const [date, setDate] = useState(() => fmtTime(
-    d.detail?.params?.date ?? d.detail?.snapshot?.new?.valid_from ?? null,
-    d.detail?.params?.precision ?? d.detail?.snapshot?.new?.valid_from_precision ?? null,
-  ) ?? "");
-  const parsedDate = parseDateInput(date);
   const precedents = d.precedents ?? [];
   const trace = d.trace ?? [];
   const hasDetail = precedents.length > 0 || trace.length > 0;
   return (
     <div className="glass rounded-panel px-4 py-3">
-      <div className="flex flex-wrap items-center gap-3">
-        <Status tone={AGENT_ACTION_TONE[d.action]} className="shrink-0">{S.review.agentActions[d.action]}</Status>
-        {!isConflict && (
-          <span className="text-body text-ink-2 truncate min-w-0">
-            {d.left ?? "?"} ≟ {d.right ?? "?"}
-          </span>
-        )}
-        {isConflict && d.detail?.params?.date && (
-          <span className="u-num text-small text-ink-2 shrink-0">
-            {fmtTime(d.detail.params.date, d.detail.params.precision ?? null)}
-          </span>
-        )}
+      <div className="flex items-center gap-3">
+        <Status tone={AGENT_ACTION_TONE[d.action]}>{S.review.agentActions[d.action]}</Status>
+        <span className="text-body text-ink-2 truncate min-w-0">
+          {d.left ?? "?"} ≟ {d.right ?? "?"}
+        </span>
         <span className="u-num text-small text-ink-2 shrink-0">
           {Math.round(d.confidence * 100)}%
         </span>
@@ -579,7 +557,6 @@ function AgentRow({
           {S.review.agentStatus[d.status]}
         </Status>
       </div>
-      {isConflict && <p className="mt-1 text-body text-ink break-words">{d.summary}</p>}
       {/* defer 留下的问题（第二刀）：这是给人看的正文，不是注脚 */}
       {d.question && (
         <p className="mt-1 text-body text-ink">
@@ -589,7 +566,7 @@ function AgentRow({
       )}
       {(d.reason || hasDetail) && (
         <div className="mt-1 flex items-center gap-3 text-small text-ink-2">
-          {d.reason && <span className={isConflict ? "min-w-0 break-words" : "truncate min-w-0"}>{d.reason}</span>}
+          {d.reason && <span className="truncate min-w-0">{d.reason}</span>}
           {hasDetail && (
             <LinkButton className="shrink-0" onClick={() => setOpen((v) => !v)}>
               {[
@@ -617,13 +594,13 @@ function AgentRow({
           ))}
         </ul>
       )}
-      <div className="mt-2 flex flex-wrap items-center gap-2">
+      <div className="mt-2 flex items-center gap-2">
         <span className="text-fine text-ink-2">
           {d.decided_by_name
-            ? S.review.agentAnsweredBy(d.decided_by_name, (d.decided_at ?? d.created_at).slice(0, 10))
-            : d.created_at.slice(0, 10)}
+            ? S.review.agentAnsweredBy(d.decided_by_name, localDate(d.decided_at ?? d.created_at))
+            : localDate(d.created_at)}
         </span>
-        <div className="ml-auto flex flex-wrap items-center justify-end gap-2">
+        <div className="ml-auto flex items-center gap-2 shrink-0">
           {/* 回答 agent 也能带一句理由（0026）——它走的正是人的裁决路径 */}
           {(d.status === "proposed" || d.status === "applied") && (
             <Input
@@ -635,22 +612,7 @@ function AgentRow({
               onChange={(e) => setWhy(e.target.value)}
             />
           )}
-          {d.status === "proposed" && isConflict && (
-            <>
-              <Input size="sm" className="u-num w-32" aria-label={S.review.agentConflictDate}
-                placeholder={S.review.closeAtPlaceholder} value={date} disabled={busy}
-                onChange={(e) => setDate(e.target.value)} />
-              <Button variant="secondary" size="sm" disabled={busy}
-                onClick={() => onAnswer("keep_both", why)}>{S.review.keepBoth}</Button>
-              <Button variant="secondary" size="sm" disabled={busy || !parsedDate}
-                onClick={() => onAnswer("close_old", why, parsedDate?.iso, parsedDate?.precision)}>{S.review.closeOld}</Button>
-              <Button variant="secondary" size="sm" disabled={busy || !parsedDate}
-                onClick={() => onAnswer("retime_new", why, parsedDate?.iso, parsedDate?.precision)}>{S.review.agentActions.retime_new}</Button>
-              <Button variant="danger" size="sm" disabled={busy}
-                onClick={() => onAnswer("reject_new", why)}>{S.review.rejectNew}</Button>
-            </>
-          )}
-          {d.status === "proposed" && !isConflict && (
+          {d.status === "proposed" && (
             <>
               <Button variant="secondary" size="sm" disabled={busy} onClick={() => onAnswer("keep", why)}>
                 {S.review.keep}
@@ -660,12 +622,12 @@ function AgentRow({
               </Button>
             </>
           )}
-          {d.status === "applied" && (isConflict || d.action === "merge") && (
+          {d.status === "applied" && d.action === "merge" && (
             <Button variant="secondary" size="sm" disabled={busy} onClick={() => onAnswer("revert", why)}>
               {S.review.revert}
             </Button>
           )}
-          {d.status === "applied" && !isConflict && d.action === "keep" && (
+          {d.status === "applied" && d.action === "keep" && (
             <Button variant="secondary" size="sm" disabled={busy} onClick={() => onAnswer("merge", why)}>
               {S.review.merge}
             </Button>
@@ -688,8 +650,6 @@ const DECISION_TONE: Record<string, ChipTone> = {
   "fact.close": "info",
   "conflict.close_old": "info",
   "conflict.keep_both": "neutral",
-  "conflict.retime_new": "info",
-  "conflict.revert": "warn",
   "merge.revert": "warn",
 };
 
@@ -729,15 +689,10 @@ function DecisionRow({ e }: { e: ReviewHistoryEvent }) {
           → {d.valid_to.slice(0, 10)}
         </span>
       )}
-      {e.action.startsWith("conflict.") && typeof d.date === "string" && (
-        <span className="u-num text-small text-ink-2">
-          → {fmtTime(d.date, typeof d.date_precision === "string" ? d.date_precision : null)}
-        </span>
-      )}
       <span className="ml-auto shrink-0 text-small text-ink-2">
         {e.actor_name ?? S.review.aiActor}
         {" · "}
-        <span className="u-num">{e.created_at.slice(0, 10)}</span>
+        <span className="u-num">{localDate(e.created_at)}</span>
       </span>
     </div>
   );
@@ -1478,16 +1433,12 @@ export function Review() {
       id,
       action,
       rationale,
-      date,
-      datePrecision,
     }: {
       id: string;
-      action: AgentAnswerAction;
+      action: "merge" | "keep" | "revert";
       rationale?: string;
-      date?: string;
-      datePrecision?: string;
-    }) => api.agentAnswer(kb!.id, id, action, rationale, date, datePrecision),
-    onError: (e) => toast.error(agentErrorMessage(e)),
+    }) => api.agentAnswer(kb!.id, id, action, rationale),
+    onError: (e) => toast.error((e as Error).message),
     onSettled: invalidate,
   });
   // 批量裁决：一批一个动作，回来逐条说成没成；没成的留在列表里，成了的消失
@@ -1600,6 +1551,7 @@ export function Review() {
       resolution: ViolationResolution;
       opts?: DecideOpts;
     }) => api.decideViolation(kb!.id, id, resolution, opts),
+    onError: (e) => toast.error(e instanceof Error ? e.message : String(e)),
     onSettled: invalidate,
   });
   // 检查是同步的纯计算,所以直接 mutate 不排队。跑完把报告留在按钮旁边——
@@ -1629,6 +1581,7 @@ export function Review() {
         close_at: closeAt,
         close_at_precision: closeAtPrecision,
       }),
+    onError: (e) => toast.error(e instanceof Error ? e.message : String(e)),
     onSettled: invalidate,
   });
 
@@ -1642,6 +1595,7 @@ export function Review() {
       validTo: string;
       precision: string;
     }) => api.closeFact(kb!.id, id, validTo, precision),
+    onError: (e) => toast.error(e instanceof Error ? e.message : String(e)),
     onSettled: invalidate,
   });
 
@@ -2284,8 +2238,8 @@ export function Review() {
                         key={d.id}
                         d={d}
                         busy={agentAnswer.isPending && agentAnswer.variables?.id === d.id}
-                        onAnswer={(action, rationale, date, datePrecision) =>
-                          agentAnswer.mutate({ id: d.id, action, rationale, date, datePrecision })
+                        onAnswer={(action, rationale) =>
+                          agentAnswer.mutate({ id: d.id, action, rationale })
                         }
                       />
                     ))}

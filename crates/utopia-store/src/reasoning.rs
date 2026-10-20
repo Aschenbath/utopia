@@ -137,9 +137,9 @@ async fn axioms(conn: &mut PgConnection, kb_id: Uuid) -> AppResult<HashMap<Uuid,
 
 /// 主语不在谓词声明的 domain 里、或宾语不在 range 里的活事实（#190 / #196）。
 ///
-/// 这是签名检查在**账本层**的那一半：抽取与采纳在写入时按 `ontology::judge_direction`
-/// 掰正或留空，但合并会换掉主语、本体会事后改 domain，写入时的守卫挡不住写入之后
-/// 的改动。所以这里对着库量一遍，任何一条路写反了都在 Review 里看得见。
+/// 签名检查在**账本层**：对齐只给结构对得上的候选（0053），但合并会换掉主语、本体会
+/// 事后改 domain，写入时的把关挡不住写入之后的改动。所以这里对着库量一遍，任何一条路
+/// 写反了都在 Review 里看得见。
 ///
 /// **没有类型的实体不算**：它没有类型可比，「不知道」不是「不符合」——按 0009，
 /// 未分类是一种诚实的状态，不该因此被报成矛盾。声明了 domain / range 的谓词才查，
@@ -1694,7 +1694,7 @@ async fn attribute_rules(conn: &mut PgConnection, kb_id: Uuid) -> AppResult<Load
                 let (Some(p), Some(e)) = (conclude_pred, conclude_expr) else {
                     continue;
                 };
-                let Some(expr) = parse_expr(&e, 0) else {
+                let Ok(expr) = utopia_reason::rules::Expr::from_json(&e) else {
                     continue;
                 };
                 (Conclusion::Computed { predicate: p, expr }, p)
@@ -1746,34 +1746,6 @@ async fn attribute_rules(conn: &mut PgConnection, kb_id: Uuid) -> AppResult<Load
     })
 }
 
-/// 算式的 JSON 形状 → 树（0032）。
-///
-/// `{"attr": "<uuid>"} | {"const": 12.5} | {"op": "sub", "l": {…}, "r": {…}}`
-///
-/// **认不出来返回 None**，调用方整条规则跳过——一棵读不懂的算式算不出数，
-/// 而算不出数的规则不该带着半棵树去求值。深度也在这里拦：太深的树是
-/// 「有人在这里写程序」的信号（0032）。
-fn parse_expr(raw: &serde_json::Value, depth: usize) -> Option<utopia_reason::rules::Expr> {
-    use utopia_reason::rules::{Arith, Expr, MAX_EXPR_DEPTH};
-    if depth > MAX_EXPR_DEPTH {
-        return None;
-    }
-    let obj = raw.as_object()?;
-    if let Some(a) = obj.get("attr") {
-        return Some(Expr::Attr(a.as_str()?.parse().ok()?));
-    }
-    if let Some(c) = obj.get("const") {
-        let n = c.as_f64().or_else(|| c.as_str()?.trim().parse().ok())?;
-        return n.is_finite().then_some(Expr::Const(n));
-    }
-    let op = Arith::parse(obj.get("op")?.as_str()?)?;
-    Some(Expr::Arith {
-        op,
-        l: Box::new(parse_expr(obj.get("l")?, depth + 1)?),
-        r: Box::new(parse_expr(obj.get("r")?, depth + 1)?),
-    })
-}
-
 /// 操作数按 op 解析。形状不对返回 None，调用方整条规则跳过。
 fn parse_operand(
     op: utopia_reason::rules::Op,
@@ -1807,7 +1779,9 @@ fn parse_operand(
         _ => {
             let raw = raw?;
             if raw.is_object() {
-                return parse_expr(raw, 0).map(Operand::Calc);
+                return utopia_reason::rules::Expr::from_json(raw)
+                    .ok()
+                    .map(Operand::Calc);
             }
             Some(Operand::Num(raw.as_f64().or_else(|| {
                 raw.as_str().and_then(|s| s.trim().parse().ok())
@@ -1833,8 +1807,7 @@ async fn descendants_of(conn: &mut PgConnection, kb_id: Uuid, root: Uuid) -> App
     Ok(rows.into_iter().map(|(id,)| id).collect())
 }
 
-/// 属性事实查询回来的一行：事实、主语、谓词、字面值、区间两端与精度、置信度，
-/// 以及主语当下的断言类型（规则要按主类过滤）
+/// 属性事实查询回来的一行：事实、主语、谓词、字面值、区间两端与精度、置信度和证据日期。
 type AttrFactRow = (
     Uuid,
     Uuid,
@@ -1845,7 +1818,6 @@ type AttrFactRow = (
     Option<String>,
     Option<String>,
     f32,
-    Option<Uuid>,
     Option<chrono::DateTime<chrono::Utc>>,
     Option<chrono::DateTime<chrono::Utc>>,
 );
@@ -1861,12 +1833,11 @@ async fn attribute_facts(
     Vec<utopia_reason::rules::AttrFact>,
     HashMap<Uuid, (Option<i64>, Option<i64>)>,
     HashMap<Uuid, PremiseMeta>,
-    HashMap<Uuid, Option<Uuid>>,
 )> {
     let rows: Vec<AttrFactRow> = sqlx::query_as(
         "SELECT f.id, f.subject_id, f.predicate_id, f.object_value,
                 f.valid_from, f.valid_to, f.valid_from_precision, f.valid_to_precision,
-                f.confidence, e.type_id, f.attested_from, f.attested_to
+                f.confidence, f.attested_from, f.attested_to
            FROM facts f
            JOIN entities e ON e.id = f.subject_id
           WHERE f.kb_id = $1
@@ -1882,21 +1853,7 @@ async fn attribute_facts(
     let mut facts = Vec::with_capacity(rows.len());
     let mut spans = HashMap::new();
     let mut meta = HashMap::new();
-    let mut type_of = HashMap::new();
-    for (
-        id,
-        subject,
-        predicate,
-        value,
-        from,
-        to,
-        fp,
-        tp,
-        conf,
-        type_id,
-        attested_from,
-        attested_to,
-    ) in rows
+    for (id, subject, predicate, value, from, to, fp, tp, conf, attested_from, attested_to) in rows
     {
         // 与公理那一路同一种读法（0022）：读数没日期就从它的文档起算。
         // 属性一律是状态（建属性时固定 state，界面也不给改）
@@ -1920,9 +1877,8 @@ async fn attribute_facts(
         });
         spans.insert(id, (f, t));
         meta.insert(id, (fp, tp, conf, fa, ta));
-        type_of.insert(subject, type_id);
     }
-    Ok((facts, spans, meta, type_of))
+    Ok((facts, spans, meta))
 }
 
 /// 推一遍，把派生事实落进账本。
@@ -2131,7 +2087,16 @@ async fn resolve(conn: &mut PgConnection, kb_id: Uuid) -> AppResult<Resolved> {
     // 落库那边的陈旧对账扫的是整张 `derived_facts`，两趟各做各的 diff 会把对方
     // 落的行每一轮都判成陈旧
     if !loaded.rules.is_empty() {
-        let (asserted, attr_spans, attr_meta, type_of) = attribute_facts(&mut *conn, kb_id).await?;
+        let (asserted, attr_spans, attr_meta) = attribute_facts(&mut *conn, kb_id).await?;
+        // 只读 Y 的连接规则不要求 X 有属性；主类范围必须独立从实体读取。
+        let entity_types: Vec<(Uuid, Uuid)> = sqlx::query_as(
+            "SELECT id, type_id FROM entities
+              WHERE kb_id = $1 AND merged_into IS NULL AND type_id IS NOT NULL",
+        )
+        .bind(kb_id)
+        .fetch_all(&mut *conn)
+        .await?;
+        let type_of: HashMap<Uuid, Uuid> = entity_types.into_iter().collect();
         asserted_ids.extend(asserted.iter().map(|f| f.id));
         // 前提的精度与置信度：落地那一段与不动点这一段共用，所以两份 meta 先合起来；
         // 区间也要——认出派生的哪一端是被前提的锚点顶上来的，靠的就是它
@@ -2212,16 +2177,17 @@ async fn resolve(conn: &mut PgConnection, kb_id: Uuid) -> AppResult<Resolved> {
             let mut fresh: Vec<(usize, utopia_reason::rules::RuleHit)> = Vec::new();
             capped_by_rule.clear();
             for (ri, lr) in loaded.rules.iter().enumerate() {
+                let matches_asserted_scope = |subject: &Uuid| {
+                    type_of
+                        .get(subject)
+                        .is_some_and(|t| lr.subject_types.contains(t))
+                };
                 // 主类是断言的：范围是个筛子，不带区间、不进前提
                 let mut by_assertion: Vec<utopia_reason::rules::AttrFact> = Vec::new();
                 // 只靠派生归类够得着的：范围变成一个条件（下面那段）
                 let mut by_conclusion: Vec<utopia_reason::rules::AttrFact> = Vec::new();
                 for f in &fact_pool {
-                    if type_of
-                        .get(&f.subject)
-                        .and_then(|t| *t)
-                        .is_some_and(|t| lr.subject_types.contains(&t))
-                    {
+                    if matches_asserted_scope(&f.subject) {
                         by_assertion.push(f.clone());
                     } else if derived_types
                         .get(&f.subject)
@@ -2230,12 +2196,24 @@ async fn resolve(conn: &mut PgConnection, kb_id: Uuid) -> AppResult<Resolved> {
                         by_conclusion.push(f.clone());
                     }
                 }
+                // X 从连接边枚举，只筛属性挡不住一组全部读取 Y 的条件。
+                let assertion_edges: Vec<_> = if let Some(join_predicate) = lr.rule.join_predicate {
+                    evaluation_edges
+                        .iter()
+                        .filter(|e| {
+                            e.predicate == join_predicate && matches_asserted_scope(&e.subject)
+                        })
+                        .cloned()
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 let (hits, rr) = utopia_reason::rules::evaluate_with_pool(
                     std::slice::from_ref(&lr.rule),
                     &by_assertion,
                     &fact_pool,
                     &spans,
-                    &evaluation_edges,
+                    &assertion_edges,
                 );
                 let mut capped = rr.capped;
                 fresh.extend(hits.into_iter().map(|h| (ri, h)));
@@ -2339,14 +2317,11 @@ async fn resolve(conn: &mut PgConnection, kb_id: Uuid) -> AppResult<Resolved> {
                     utopia_reason::rules::Conclusion::Attribute { value, .. } => {
                         (serde_json::json!({ "value": value }), value.clone())
                     }
-                    // 算出来的结论：值在命中里，**每个组合各一个**（0032）。
-                    // 求值器算不出数的组合根本不会产出命中，所以这里不会没有值
+                    // The evaluator has already rejected failed conversions.
+                    // Preserve its scalar type when this result feeds another rule.
                     utopia_reason::rules::Conclusion::Computed { .. } => {
-                        let Some(n) = h.value else { continue };
-                        let Some(v) = serde_json::Number::from_f64(n) else {
-                            continue;
-                        };
-                        let v = serde_json::Value::Number(v);
+                        let Some(ref result) = h.value else { continue };
+                        let v = result.to_json();
                         (serde_json::json!({ "value": v }), v)
                     }
                     // The relation arm above stores an entity edge and returns
@@ -2808,6 +2783,26 @@ pub async fn due_for_inference(pool: &PgPool) -> AppResult<Vec<Uuid>> {
     .await?)
 }
 
+/// 定时扫描的一拍：到期的库各排一份推理任务，已经排着一份的不再排。
+///
+/// 只跳过排着的就够（#1304）：处理器先 `mark_inference_ran` 再推，任务一开始跑这个库就
+/// 不再到期；还到期的只有任务排着、`last_inference_at` 还没动的那段，而那段正是这里挡住的。
+/// 一个库排不进去不拦着别的库
+pub async fn queue_due_inferences(pool: &PgPool) -> AppResult<()> {
+    for kb_id in due_for_inference(pool).await? {
+        if let Err(e) = crate::jobs::enqueue_unless_queued(
+            pool,
+            "materialize_inferences",
+            json!({ "kb_id": kb_id }),
+        )
+        .await
+        {
+            tracing::warn!(kb_id = %kb_id, error = %e, "推理任务入队失败");
+        }
+    }
+    Ok(())
+}
+
 /// 记下这一轮推完的时间。
 ///
 /// **推完就记，哪怕什么都没变**：这一列答的是「上次看过没有」，不是「上次改过
@@ -2836,7 +2831,7 @@ pub async fn proof(
     let Some(derived) = derived_one(pool, kb_id, derived_id).await? else {
         return Ok(None);
     };
-    let steps = premise_steps(pool, derived_id, 0).await?;
+    let steps = premise_steps(pool, kb_id, derived_id, 0).await?;
     Ok(Some(utopia_core::models::Proof { derived, steps }))
 }
 
@@ -2846,6 +2841,7 @@ pub async fn proof(
 /// 到底了就停在那一步上——它自己的三元组还是列出来的，只是不再往下问。
 fn premise_steps<'a>(
     pool: &'a PgPool,
+    kb_id: Uuid,
     derived_id: Uuid,
     depth: usize,
 ) -> std::pin::Pin<
@@ -2865,11 +2861,12 @@ fn premise_steps<'a>(
         .await?;
         // 断言那几步一次取完（每一步还要各取一次证据），派生那几步逐条问
         let asserted: Vec<Uuid> = rows.iter().filter_map(|(_, f, _)| *f).collect();
-        let mut by_fact: HashMap<Uuid, utopia_core::models::ProofStep> = steps_for(pool, &asserted)
-            .await?
-            .into_iter()
-            .map(|s| (s.fact_id, s))
-            .collect();
+        let mut by_fact: HashMap<Uuid, utopia_core::models::ProofStep> =
+            steps_for(pool, kb_id, &asserted)
+                .await?
+                .into_iter()
+                .map(|s| (s.fact_id, s))
+                .collect();
 
         let mut steps = Vec::with_capacity(rows.len());
         for (seq, fact, derived) in rows {
@@ -2885,7 +2882,7 @@ fn premise_steps<'a>(
                 };
                 step.seq = seq;
                 if depth + 1 < utopia_reason::MAX_DEPTH {
-                    step.premises = premise_steps(pool, d, depth + 1).await?;
+                    step.premises = premise_steps(pool, kb_id, d, depth + 1).await?;
                 }
                 steps.push(step);
             }
@@ -2973,6 +2970,7 @@ async fn derived_step(
 /// 走——前提是同一种东西，证明链没有理由长两个样
 async fn steps_for(
     pool: &PgPool,
+    kb_id: Uuid,
     premises: &[Uuid],
 ) -> AppResult<Vec<utopia_core::models::ProofStep>> {
     #[allow(clippy::type_complexity)]
@@ -3021,7 +3019,7 @@ async fn steps_for(
     ) in rows
     {
         // 一条链最多 MAX_DEPTH 步，逐条取证据是可数的几次往返
-        let evidence = crate::graph::fact_evidence(pool, fact_id).await?;
+        let evidence = crate::graph::fact_evidence(pool, kb_id, fact_id).await?;
         steps.push(utopia_core::models::ProofStep {
             seq: seq as i32,
             fact_id,
@@ -3107,7 +3105,7 @@ pub async fn blocked_proof(
     .await?;
     match path {
         None => Ok(None),
-        Some((p,)) => Ok(Some(steps_for(pool, &p).await?)),
+        Some((p,)) => Ok(Some(steps_for(pool, kb_id, &p).await?)),
     }
 }
 

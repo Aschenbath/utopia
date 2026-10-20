@@ -4,8 +4,8 @@ use pgvector::Vector;
 use sqlx::{PgConnection, PgPool};
 use std::collections::HashSet;
 use utopia_core::models::{
-    EntityInstance, EntityTypeView, OntologyImportView, OntologyMiss, RelationAxioms,
-    RelationTypeView, TypeCandidate,
+    EntityInstance, EntityTypeView, OntologyImportView, RelationAxioms, RelationTypeView,
+    TypeCandidate,
 };
 use utopia_core::{AppError, AppResult};
 use uuid::Uuid;
@@ -34,37 +34,173 @@ pub async fn entity_type_views(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<Enti
     .await?)
 }
 
+/// 「缺这条关系」看实体在哪一端：Out = 它是主语，In = 它是宾语，Either = 哪端都算。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkEnd {
+    Out,
+    In,
+    Either,
+}
+
+/// 一个谓词在库里能以哪些样子出现，按「实体是关系的主语」这一端说。
+///
+/// 类型化行写的是属性；开放陈述写的是文档的短语，绑定（`phrase_bindings`）说哪些短语
+/// 算这个属性、哪个方向。逆关系与对称关系把「主语」翻成「宾语」：`A parentOf B` 就是
+/// `B childOf A`，所以缺 parentOf 的 A 也得没有一条「X childOf A」。
+#[derive(Debug, Clone)]
+pub struct LinkPredicate {
+    /// 谓词是本体里某个属性的 key 时，那个属性
+    pub relation_type_id: Option<Uuid>,
+    along: Vec<Uuid>,
+    against: Vec<Uuid>,
+    phrases_along: Vec<String>,
+    phrases_against: Vec<String>,
+}
+
+impl LinkPredicate {
+    /// 认作这个谓词的全部短语（归一过的），两个方向合在一起
+    pub fn phrases(&self) -> Vec<String> {
+        let mut all = [self.phrases_along.clone(), self.phrases_against.clone()].concat();
+        all.sort();
+        all.dedup();
+        all
+    }
+}
+
+/// 把一个谓词（属性的 key，或者一个开放短语）解析成它在库里的各种写法。
+pub async fn link_predicate(
+    pool: &PgPool,
+    kb_id: Uuid,
+    predicate: &str,
+) -> AppResult<LinkPredicate> {
+    let (relation_type_id, against, mut phrases_along, phrases_against): (
+        Option<Uuid>,
+        Vec<Uuid>,
+        Vec<String>,
+        Vec<String>,
+    ) = sqlx::query_as(
+        "WITH r AS (SELECT id, inverse_of, is_symmetric FROM relation_types
+                     WHERE kb_id = $1 AND key = $2),
+              inv AS (SELECT x.id FROM relation_types x, r
+                       WHERE x.kb_id = $1 AND (x.id = r.inverse_of OR x.inverse_of = r.id)
+                      UNION SELECT id FROM r WHERE is_symmetric),
+              b AS (SELECT phrase, direction = 'forward' AS fwd,
+                           relation_type_id IN (SELECT id FROM r) AS on_r,
+                           relation_type_id IN (SELECT id FROM inv) AS on_inv
+                      FROM phrase_bindings
+                     WHERE kb_id = $1 AND status = 'bound')
+         SELECT (SELECT id FROM r),
+                ARRAY(SELECT id FROM inv),
+                ARRAY(SELECT DISTINCT phrase FROM b
+                       WHERE (on_r AND fwd) OR (on_inv AND NOT fwd)),
+                ARRAY(SELECT DISTINCT phrase FROM b
+                       WHERE (on_r AND NOT fwd) OR (on_inv AND fwd))",
+    )
+    .bind(kb_id)
+    .bind(predicate)
+    .fetch_one(pool)
+    .await?;
+    phrases_along.push(crate::phrase_bindings::normalize(predicate));
+    Ok(LinkPredicate {
+        relation_type_id,
+        along: relation_type_id.into_iter().collect(),
+        against,
+        phrases_along,
+        phrases_against,
+    })
+}
+
+/// 只列缺某条关系的成员（#1269）：没有一条活着的事实（断言、陈述或派生）按这个谓词连着它。
+#[derive(Debug, Clone, Copy)]
+pub struct Lacking<'a> {
+    pub predicate: &'a LinkPredicate,
+    pub end: LinkEnd,
+}
+
+impl Lacking<'_> {
+    /// 实体当主语时认哪些 (属性, 短语)，当宾语时认哪些
+    fn arms(&self) -> [(Vec<Uuid>, Vec<String>); 2] {
+        let p = self.predicate;
+        let along = (p.along.clone(), p.phrases_along.clone());
+        let against = (p.against.clone(), p.phrases_against.clone());
+        match self.end {
+            LinkEnd::Out => [along, against],
+            LinkEnd::In => [against, along],
+            LinkEnd::Either => {
+                let both = ([along.0, against.0].concat(), [along.1, against.1].concat());
+                [both.clone(), both]
+            }
+        }
+    }
+}
+
+/// 一端一个 NOT EXISTS，各自走 (kb_id, subject_id) / (kb_id, object_id) 的活行索引
+fn lacking_sql() -> String {
+    let phrase = crate::phrase_bindings::phrase_sql("f.phrase");
+    ["subject", "object"]
+        .iter()
+        .zip([("$3", "$4"), ("$5", "$6")])
+        .map(|(end, (ids, phrases))| {
+            format!(
+                " AND NOT EXISTS (SELECT 1 FROM facts f
+                    WHERE f.kb_id = e.kb_id AND f.{end}_id = e.id AND f.invalidated_at IS NULL
+                      AND (f.predicate_id = ANY({ids})
+                           OR (f.layer = 'open' AND {phrase} = ANY({phrases}))))
+                  AND NOT EXISTS (SELECT 1 FROM derived_facts d
+                    WHERE d.kb_id = e.kb_id AND d.{end}_id = e.id AND d.invalidated_at IS NULL
+                      AND d.predicate_id = ANY({ids}))"
+            )
+        })
+        .collect()
+}
+
 /// 某个类下的实体实例（按名称序，分页）。返回 (rows, total)。
+/// 给了 `lacking` 就只留缺那条关系的成员，页与总数按同一个条件数。
 pub async fn entity_instances(
     pool: &PgPool,
     kb_id: Uuid,
     type_id: Uuid,
+    lacking: Option<Lacking<'_>>,
     limit: i64,
     offset: i64,
 ) -> AppResult<(Vec<EntityInstance>, i64)> {
-    let rows: Vec<EntityInstance> = sqlx::query_as(
+    // 没给 lacking 时 $3..$6 是空数组，条件里不引用它们
+    let [(subject_ids, subject_phrases), (object_ids, object_phrases)] =
+        lacking.map(|l| l.arms()).unwrap_or_default();
+    let condition = format!(
+        "e.kb_id = $1 AND e.type_id = $2 AND e.merged_into IS NULL{}",
+        lacking.map(|_| lacking_sql()).unwrap_or_default()
+    );
+    let rows: Vec<EntityInstance> = sqlx::query_as(&format!(
         "SELECT e.id, e.canonical_name AS name,
                 (SELECT count(*) FROM facts f
                   WHERE f.kb_id = e.kb_id
                     AND (f.subject_id = e.id OR f.object_id = e.id)
                     AND f.invalidated_at IS NULL) AS fact_count
          FROM entities e
-         WHERE e.kb_id = $1 AND e.type_id = $2 AND e.merged_into IS NULL
+         WHERE {condition}
          ORDER BY lower(e.canonical_name), e.id
-         LIMIT $3 OFFSET $4",
-    )
+         LIMIT $7 OFFSET $8"
+    ))
     .bind(kb_id)
     .bind(type_id)
+    .bind(&subject_ids)
+    .bind(&subject_phrases)
+    .bind(&object_ids)
+    .bind(&object_phrases)
     .bind(limit)
     .bind(offset)
     .fetch_all(pool)
     .await?;
-    let (total,): (i64,) = sqlx::query_as(
-        "SELECT count(*) FROM entities e
-         WHERE e.kb_id = $1 AND e.type_id = $2 AND e.merged_into IS NULL",
-    )
+    let (total,): (i64,) = sqlx::query_as(&format!(
+        "SELECT count(*) FROM entities e WHERE {condition}"
+    ))
     .bind(kb_id)
     .bind(type_id)
+    .bind(&subject_ids)
+    .bind(&subject_phrases)
+    .bind(&object_ids)
+    .bind(&object_phrases)
     .fetch_one(pool)
     .await?;
     Ok((rows, total))
@@ -137,6 +273,16 @@ pub fn lower_camel(label: &str) -> String {
     out
 }
 
+/// `temporal` 只有三个值（0031）：单条建、单条改、批量建、重导入更新都走这一句
+fn validate_temporal(temporal: &str) -> AppResult<()> {
+    if !matches!(temporal, "state" | "event" | "eternal") {
+        return Err(AppError::Validation(
+            "temporal must be state / event / eternal".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_key(key: &str) -> AppResult<()> {
     let ok = !key.is_empty()
         && key.len() <= 40
@@ -153,8 +299,8 @@ fn validate_key(key: &str) -> AppResult<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn create_entity_type(
-    pool: &PgPool,
+pub async fn create_entity_type<'a>(
+    pool: impl sqlx::Acquire<'a, Database = sqlx::Postgres>,
     kb_id: Uuid,
     key: &str,
     label: &str,
@@ -165,6 +311,7 @@ pub async fn create_entity_type(
 ) -> AppResult<Uuid> {
     validate_key(key)?;
     validate_shape(shape)?;
+    let mut tx = pool.begin().await?;
     let id = Uuid::now_v7();
     sqlx::query(
         "INSERT INTO entity_types (id, kb_id, key, label, color, shape, description)
@@ -177,7 +324,7 @@ pub async fn create_entity_type(
     .bind(color)
     .bind(shape)
     .bind(description)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| match &e {
         sqlx::Error::Database(db) if db.is_unique_violation() => {
@@ -185,7 +332,8 @@ pub async fn create_entity_type(
         }
         _ => AppError::Db(e),
     })?;
-    set_parents(&mut *pool.acquire().await?, kb_id, id, parents).await?;
+    set_parents(&mut tx, kb_id, id, parents).await?;
+    tx.commit().await?;
     Ok(id)
 }
 
@@ -455,8 +603,8 @@ async fn validate_property_links(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn create_relation_type(
-    pool: &PgPool,
+pub async fn create_relation_type<'a>(
+    pool: impl sqlx::Acquire<'a, Database = sqlx::Postgres>,
     kb_id: Uuid,
     key: &str,
     label: &str,
@@ -470,15 +618,12 @@ pub async fn create_relation_type(
     unit: Option<&str>,
 ) -> AppResult<Uuid> {
     validate_key(key)?;
-    if !matches!(temporal, "state" | "event" | "eternal") {
-        return Err(AppError::Validation(
-            "temporal must be state / event / eternal".into(),
-        ));
-    }
+    validate_temporal(temporal)?;
     validate_attribute_fields(kind, domains, datatype)?;
+    let mut tx = pool.begin().await?;
     let label = &lower_camel(label);
     // 新建的行 id 还不存在，指向自己无从谈起——所以 self_id 传 None
-    validate_property_links(&mut *pool.acquire().await?, kb_id, None, kind, ax).await?;
+    validate_property_links(&mut tx, kb_id, None, kind, ax).await?;
     let is_attr = kind == "attribute";
     let id = Uuid::now_v7();
     sqlx::query(
@@ -509,7 +654,7 @@ pub async fn create_relation_type(
     // 属性不带这两条（上面已经拦了非空的情况，这里是兜底）
     .bind(if is_attr { None } else { ax.inverse_of })
     .bind(if is_attr { None } else { ax.sub_property_of })
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| match &e {
         sqlx::Error::Database(db) if db.is_unique_violation() => {
@@ -518,13 +663,8 @@ pub async fn create_relation_type(
         _ => AppError::Db(e),
     })?;
     // attribute 不写 range：它的值域是字面量类型，落在 datatype 上
-    set_domains_ranges(
-        &mut *pool.acquire().await?,
-        id,
-        domains,
-        if is_attr { &[] } else { ranges },
-    )
-    .await?;
+    set_domains_ranges(&mut tx, id, domains, if is_attr { &[] } else { ranges }).await?;
+    tx.commit().await?;
     Ok(id)
 }
 
@@ -692,11 +832,7 @@ pub async fn update_relation_type(
     }
     // 改名也归一：不然界面上改一次就能把小驼峰改回 "access to"
     let label = &lower_camel(label);
-    if !matches!(temporal, "state" | "event" | "eternal") {
-        return Err(AppError::Validation(
-            "temporal must be state / event / eternal".into(),
-        ));
-    }
+    validate_temporal(temporal)?;
     if datatype.is_some() && !matches!(datatype, Some("text" | "number" | "date" | "bool")) {
         return Err(AppError::Validation(
             "datatype must be text / number / date / bool".into(),
@@ -881,112 +1017,6 @@ pub async fn delete_relation_type(pool: &PgPool, kb_id: Uuid, id: Uuid) -> AppRe
 
 /* ---- 未匹配统计 ---- */
 
-pub async fn record_miss(
-    pool: &PgPool,
-    kb_id: Uuid,
-    kind: &str,
-    key: &str,
-    example: Option<&str>,
-) -> AppResult<()> {
-    sqlx::query(
-        // **被拒绝过的照样累加。**
-        //
-        // 从前这里带着 `WHERE dismissed_at IS NULL`，理由是"否则计数会把'不要'
-        // 重新顶成一个待处理信号"。那个理由针对的是**呈现**，用的手段却是
-        // **停止计数**——两件事被绑在一起了，代价是一次点击变成永久失明：
-        // 第一篇里出现一次的说法被忽略掉，后面二十篇都在用它，计数仍停在 1，
-        // 谁也不知道当初那个判断已经不成立，那批事实永远没有谓词。
-        //
-        // 用户是对**当时看得见的证据**做的判断，不是对所有时间。所以计数照记，
-        // 抑制交给读取侧：`list_misses` 仍然只返回未忽略的，提案与自动扩本体
-        // 一步没变；已忽略的连同更新后的计数走 `list_dismissed_misses`，
-        // 在面板上单列一处，人看见涨到 40 了可以自己撤回
-        "INSERT INTO ontology_misses (kb_id, kind, key, example)
-         VALUES ($1, $2, left($3, 80), left($4, 200))
-         ON CONFLICT (kb_id, kind, key)
-         DO UPDATE SET count = ontology_misses.count + 1,
-                       example = COALESCE(EXCLUDED.example, ontology_misses.example),
-                       updated_at = now()",
-    )
-    .bind(kb_id)
-    .bind(kind)
-    .bind(key)
-    .bind(example)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-pub async fn list_misses(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<OntologyMiss>> {
-    Ok(sqlx::query_as(
-        "SELECT kind, key, example, count FROM ontology_misses
-         WHERE kb_id = $1 AND dismissed_at IS NULL
-         ORDER BY count DESC, updated_at DESC LIMIT 50",
-    )
-    .bind(kb_id)
-    .fetch_all(pool)
-    .await?)
-}
-
-/// 已被忽略的说法，连同**它此后继续累积的计数**。
-///
-/// 存在的理由是忽略这个动作曾经是单向门：点下去之后既不再呈现、也不再计数，
-/// 于是"当时只出现过一次"这个判断依据一旦过期，没有任何人看得见。
-/// 这个列表是那扇门上的窗——抑制照旧，但看得见抑制掉的是什么、现在有多重。
-pub async fn list_dismissed_misses(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<OntologyMiss>> {
-    Ok(sqlx::query_as(
-        "SELECT kind, key, example, count FROM ontology_misses
-         WHERE kb_id = $1 AND dismissed_at IS NOT NULL
-         ORDER BY count DESC, updated_at DESC LIMIT 50",
-    )
-    .bind(kb_id)
-    .fetch_all(pool)
-    .await?)
-}
-
-/// 撤回一次忽略：这个说法重新进入提案与自动扩本体。
-pub async fn restore_miss(pool: &PgPool, kb_id: Uuid, kind: &str, key: &str) -> AppResult<()> {
-    sqlx::query(
-        "UPDATE ontology_misses SET dismissed_at = NULL, updated_at = now()
-         WHERE kb_id = $1 AND kind = $2 AND key = $3 AND dismissed_at IS NOT NULL",
-    )
-    .bind(kb_id)
-    .bind(kind)
-    .bind(key)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-/// 用户说"不要这个"。**标记而非删除**——删掉的话下一次抽取遇到同一个词
-/// 原样插回来，用户的拒绝活不过一轮抽取。自动扩展路径也据此绕开。
-///
-/// 可撤回（见 [`restore_miss`]），且撤回之后计数是连续的——忽略期间照样在记。
-pub async fn dismiss_miss(pool: &PgPool, kb_id: Uuid, kind: &str, key: &str) -> AppResult<()> {
-    sqlx::query(
-        "UPDATE ontology_misses SET dismissed_at = now()
-         WHERE kb_id = $1 AND kind = $2 AND key = $3 AND dismissed_at IS NULL",
-    )
-    .bind(kb_id)
-    .bind(kind)
-    .bind(key)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-/// 本体已经覆盖了这个说法（采纳时调用）：与"用户拒绝"不同，这条真的可以清掉，
-/// 下次抽取它会命中本体，不再是未匹配。
-pub async fn clear_miss(pool: &PgPool, kb_id: Uuid, kind: &str, key: &str) -> AppResult<()> {
-    sqlx::query("DELETE FROM ontology_misses WHERE kb_id = $1 AND kind = $2 AND key = $3")
-        .bind(kb_id)
-        .bind(kind)
-        .bind(key)
-        .execute(pool)
-        .await?;
-    Ok(())
-}
-
 /* ---- OWL 导入 ---- */
 
 /// 建一个带 IRI 的类。IRI 是全局身份，重导入据它匹配（见 0001 P2）。
@@ -1105,6 +1135,11 @@ pub async fn create_relation_with_iri(
 ///
 /// **key 不动**（它可能已被事实引用），**空描述不覆盖**（人写过的比上游的准），
 /// **domain/range 整体重写**——它们是上游声明的结构，不是人调过的措辞。
+/// **`temporal` 只在本体说了才写**（`Some`）：没写 `utopia:temporal` 的本体不动它，
+/// 人在页面上改过的就留着；写了的照本体，与 domain/range 同一个道理。
+/// 真改了就推 `updated_at`，与页面上改一样：0053 的短语绑定依据读它，
+/// state 与非 state 决定短语怎么绑，旧值下做的决定要能被重审。
+#[allow(clippy::too_many_arguments)]
 pub async fn update_relation_from_import(
     pool: &PgPool,
     kb_id: Uuid,
@@ -1113,11 +1148,17 @@ pub async fn update_relation_from_import(
     description: &str,
     domains: &[Uuid],
     ranges: &[Uuid],
+    temporal: Option<&str>,
 ) -> AppResult<bool> {
+    if let Some(t) = temporal {
+        validate_temporal(t)?;
+    }
     let row: Option<(Uuid,)> = sqlx::query_as(
         "UPDATE relation_types
             SET label = $3,
-                description = CASE WHEN $4 = '' THEN description ELSE $4 END
+                description = CASE WHEN $4 = '' THEN description ELSE $4 END,
+                temporal = COALESCE($5::text, temporal),
+                updated_at = CASE WHEN $5::text <> temporal THEN now() ELSE updated_at END
           WHERE kb_id = $1 AND iri = $2
           RETURNING id",
     )
@@ -1125,6 +1166,7 @@ pub async fn update_relation_from_import(
     .bind(iri)
     .bind(label)
     .bind(description)
+    .bind(temporal)
     .fetch_optional(pool)
     .await?;
     let Some((id,)) = row else {
@@ -1499,109 +1541,6 @@ pub async fn nearest_relation_types(
         .collect())
 }
 
-/// 按 key 找关系/属性的 id。给"映射到已有类型"那条路用。
-///
-/// 不区分 kind：属性与关系同住一张表且共用 key 命名空间，调用方拿到 id 之后
-/// 该怎么用它自己清楚（改写事实时谓词就是谓词）。
-///
-/// 名字属性找不到（0041）：把一批「简称」「former_name」的值事实归并到 `known_as`
-/// 上，等于绕开了名字的核对与配对，所以这条路不给它
-pub async fn relation_type_id_by_key(
-    pool: &PgPool,
-    kb_id: Uuid,
-    key: &str,
-) -> AppResult<Option<Uuid>> {
-    let row: Option<(Uuid,)> = sqlx::query_as(
-        "SELECT id FROM relation_types
-              WHERE kb_id = $1 AND key = $2 AND NOT (builtin AND key = 'known_as')",
-    )
-    .bind(kb_id)
-    .bind(key)
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.map(|(id,)| id))
-}
-
-/// 一个**从没当关系用过**的关系，改判成属性。改成了返回 true。
-///
-/// 冷启动认出某个说法该是属性、去建的时候，键可能已经被一个同名关系占着
-/// （实测：`Relation key 'valuation' already exists`，然后整批放弃，那些数
-/// 永远拿不到谓词）。可占着这个键的关系常常是空的——本体包带进来的、或者
-/// 早先按票数建的，一条事实都没挂上。空的关系改判不破坏任何东西：
-/// 没有边会因此断，撤销也只是再改回去。
-///
-/// **有事实的一律不动**。`invested`、`raised` 这类既连实体又带数额的，
-/// 改判会把已有的边连根拔起；那是本体与语料的真分歧，该留给人看，
-/// 不该由冷启动替人决定。
-pub async fn attribute_from_unused_relation(
-    pool: &PgPool,
-    kb_id: Uuid,
-    key: &str,
-    domains: &[Uuid],
-    datatype: &str,
-    unit: Option<&str>,
-) -> AppResult<Option<Uuid>> {
-    validate_attribute_fields("attribute", domains, Some(datatype))?;
-    let mut tx = pool.begin().await?;
-    // 零事实不等于零判据：公理旗标与 inverse_of/sub_property_of 会让这条关系
-    // 成为派生目标（违规的 detail.predicate_id 指到它）。改判清了那些贡献，
-    // 按同一条对账规矩走（0062）——先记旧判据下的检出，写完再对账
-    let candidate: Option<(Uuid,)> = sqlx::query_as(
-        "SELECT id FROM relation_types
-          WHERE kb_id = $1 AND key = $2 AND kind = 'relation'
-            AND NOT EXISTS (SELECT 1 FROM facts f WHERE f.predicate_id = relation_types.id)",
-    )
-    .bind(kb_id)
-    .bind(key)
-    .fetch_optional(&mut *tx)
-    .await?;
-    let Some((id,)) = candidate else {
-        tx.rollback().await?;
-        return Ok(None);
-    };
-    let was_detected = crate::reasoning::detection_keys(&mut tx, kb_id).await?;
-    // 属性不声明判据：旗标与双向链接都清掉（axioms() 不按 kind 过滤，
-    // 留着它们等於留着一套无人问的公理）
-    sqlx::query(
-        "UPDATE relation_types SET kind = 'attribute', datatype = $2, unit = $3,
-                inverse_of = NULL, sub_property_of = NULL,
-                is_transitive = false, is_symmetric = false, is_asymmetric = false,
-                is_irreflexive = false, functional = false, inverse_functional = false
-         WHERE id = $1",
-    )
-    .bind(id)
-    .bind(datatype)
-    .bind(unit)
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query("UPDATE relation_types SET inverse_of = NULL WHERE inverse_of = $1")
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("UPDATE relation_types SET sub_property_of = NULL WHERE sub_property_of = $1")
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
-    // domain / range 在各自的表里，不是列。属性没有 range——值域落在 datatype 上
-    set_domains_ranges(&mut tx, id, domains, &[]).await?;
-    crate::reasoning::reconcile_ontology(&mut tx, kb_id, &was_detected).await?;
-    tx.commit().await?;
-    Ok(Some(id))
-}
-
-/// 一个属性声明的 datatype。改写字面值事实时要按它换算。
-///
-/// 以**库里这一条**为准而不是以请求为准：指向已有属性时请求里根本没有
-/// datatype，而即便有，本体说了算。
-pub async fn relation_type_datatype(pool: &PgPool, id: Uuid) -> AppResult<Option<String>> {
-    let row: Option<(Option<String>,)> =
-        sqlx::query_as("SELECT datatype FROM relation_types WHERE id = $1")
-            .bind(id)
-            .fetch_optional(pool)
-            .await?;
-    Ok(row.and_then(|(d,)| d))
-}
-
 /// 把一个 IRI 认到已有的**本地**类上（原本没有 IRI 的那种）。
 ///
 /// **只写 IRI 与形状，不动 label、description、颜色。** 认领要解决的是
@@ -1758,13 +1697,16 @@ pub struct BulkRelation {
     pub symmetric: bool,
     pub asymmetric: bool,
     pub irreflexive: bool,
+    /// `state` / `event` / `eternal`（0031）。OWL 自己没有这个概念，标准词表里的对象
+    /// 属性全是 `state`；只有本体用 `utopia:temporal` 说了的才不是——导出端写的那一条
+    pub temporal: String,
 }
 
 /// 一次插完一批关系或属性，返回 key → id。语义同 [`create_entity_types_bulk`]。
 ///
 /// `kind` 决定走关系通道还是属性通道；`datatype` 只对属性有意义，关系传 `None`。
-/// `temporal` 固定 `state`——OWL 里没有对应概念，猜 event 或 eternal 都更差
-/// （与单条版的判断一致）。
+/// `temporal` 照每一行写：没有 `utopia:temporal` 注解的本体一律 `state`
+///（与单条版的默认一致），写了的按它说的。
 pub async fn create_relation_types_bulk(
     pool: &PgPool,
     kb_id: Uuid,
@@ -1775,6 +1717,7 @@ pub async fn create_relation_types_bulk(
     }
     for r in rows {
         validate_key(&r.key)?;
+        validate_temporal(&r.temporal)?;
     }
     let keys: Vec<&str> = rows.iter().map(|r| r.key.as_str()).collect();
     // 导入来的词表自己就可能不一致（unece.org 里 `brandName` 与
@@ -1791,16 +1734,18 @@ pub async fn create_relation_types_bulk(
     let syms: Vec<bool> = rows.iter().map(|r| r.symmetric).collect();
     let asyms: Vec<bool> = rows.iter().map(|r| r.asymmetric).collect();
     let irrefs: Vec<bool> = rows.iter().map(|r| r.irreflexive).collect();
+    let temporals: Vec<&str> = rows.iter().map(|r| r.temporal.as_str()).collect();
     let out: Vec<(Uuid, String)> = sqlx::query_as(
         "INSERT INTO relation_types
              (id, kb_id, key, label, temporal, functional, inverse_functional,
               description, kind, datatype, iri,
               is_transitive, is_symmetric, is_asymmetric, is_irreflexive)
-         SELECT gen_random_uuid(), $1, k, l, 'state', fu, iv, d, kind, dt, i,
+         SELECT gen_random_uuid(), $1, k, l, tm, fu, iv, d, kind, dt, i,
                 tr, sy, asym, irr
          FROM UNNEST($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[],
-                     $8::bool[], $9::bool[], $10::bool[], $11::bool[], $12::bool[], $13::bool[])
-              AS t(k, l, d, i, kind, dt, fu, iv, tr, sy, asym, irr)
+                     $8::bool[], $9::bool[], $10::bool[], $11::bool[], $12::bool[], $13::bool[],
+                     $14::text[])
+              AS t(k, l, d, i, kind, dt, fu, iv, tr, sy, asym, irr, tm)
          ON CONFLICT (kb_id, key) DO NOTHING
          RETURNING id, key",
     )
@@ -1817,6 +1762,7 @@ pub async fn create_relation_types_bulk(
     .bind(&syms)
     .bind(&asyms)
     .bind(&irrefs)
+    .bind(&temporals)
     .fetch_all(pool)
     .await?;
     Ok(out.into_iter().map(|(id, k)| (k, id)).collect())
@@ -2026,7 +1972,10 @@ pub async fn signatures_already_proposed(
     .await?)
 }
 
-/// 一条提案被拒了，连理由。改状态不删行（同 `decide_proposal`）
+/// 一条提案被拒了，连理由（没写就空着）。
+///
+/// **改状态而不是删行**：拒绝发生过，跟 `fact_adoptions`、`entity_retypes` 同一条路。
+/// 留痕还有个当下就用得着的作用——代理下一轮不会把它刷回待看。
 pub async fn reject_proposal(
     pool: &PgPool,
     kb_id: Uuid,
@@ -2050,7 +1999,7 @@ pub async fn reject_proposal(
     Ok(())
 }
 
-/// 一条还开着的提案，按键取（采纳时要读它的 payload）
+/// 一条还开着的提案，按键取（代理把这一轮的 map_to 并进上一轮的时候读它）
 pub async fn open_proposal(
     pool: &PgPool,
     kb_id: Uuid,
@@ -2068,35 +2017,6 @@ pub async fn open_proposal(
     .await?)
 }
 
-/// 把一轮 Suggest 的结果写下来。
-///
-/// **已经有人表过态的不动。** `WHERE status = 'open'` 那一句是这个函数的全部要点：
-/// 重跑 Suggest 会再次算出被拒绝过的那条提案（原材料还在 `ontology_misses` 里），
-/// 不加这句它就会被刷回 open——等于每跑一次都把人的否决抹掉一次。
-pub async fn save_proposals(
-    pool: &PgPool,
-    kb_id: Uuid,
-    items: &[(String, String, serde_json::Value)],
-) -> AppResult<()> {
-    for (section, key, payload) in items {
-        sqlx::query(
-            "INSERT INTO ontology_proposals (id, kb_id, section, key, payload)
-             VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT (kb_id, section, key) DO UPDATE
-               SET payload = EXCLUDED.payload, created_at = now()
-               WHERE ontology_proposals.status = 'open'",
-        )
-        .bind(Uuid::now_v7())
-        .bind(kb_id)
-        .bind(section)
-        .bind(key)
-        .bind(payload)
-        .execute(pool)
-        .await?;
-    }
-    Ok(())
-}
-
 /// 还等着人看的提案。新的排前面——旧的那批已经被看过好几眼了。
 pub async fn open_proposals(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<StoredProposal>> {
     Ok(sqlx::query_as(
@@ -2107,71 +2027,6 @@ pub async fn open_proposals(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<StoredP
     .bind(kb_id)
     .fetch_all(pool)
     .await?)
-}
-
-/// 一条提案被采纳或拒绝了。
-///
-/// **改状态而不是删行**：采纳发生过、拒绝也发生过。跟 `fact_adoptions`、
-/// `entity_retypes` 同一条路。拒绝留痕还有个当下就用得着的作用——下一轮
-/// Suggest 不会把它刷回待看。
-pub async fn decide_proposal(
-    pool: &PgPool,
-    kb_id: Uuid,
-    section: &str,
-    key: &str,
-    status: &str,
-    actor: Uuid,
-) -> AppResult<()> {
-    sqlx::query(
-        "UPDATE ontology_proposals
-            SET status = $4, decided_by = $5, decided_at = now()
-          WHERE kb_id = $1 AND section = $2 AND key = $3 AND status = 'open'",
-    )
-    .bind(kb_id)
-    .bind(section)
-    .bind(key)
-    .bind(status)
-    .bind(actor)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-/// 主语的类型合不合这个关系声明的 domain。沿继承链往上找。
-///
-/// **只回答，不动数据。** 0001 已经判过：签名是提示不是闸门，
-/// 「用可能错的声明驱动自动动作风险高」。而实体类型本身也是模型判出来的
-/// （实测里 Elon Musk 被判成 `researcher`），拿它去翻转事实方向，
-/// 是两层不确定叠在一起还静默改写。所以这里的结果只用来落一条信号。
-///
-/// 三种回答，别混成两种：
-/// - `Some(true)`  合
-/// - `Some(false)` 不合——**这才是信号**
-/// - `None`        没得判（关系没声明 domain，或实体还没有类型）
-pub async fn subject_fits_domain(
-    pool: &PgPool,
-    relation_type_id: Uuid,
-    subject_type_id: Option<Uuid>,
-) -> AppResult<Option<bool>> {
-    let Some(subject_type_id) = subject_type_id else {
-        return Ok(None);
-    };
-    let (declared, ok): (i64, i64) = sqlx::query_as(
-        "WITH RECURSIVE up(id) AS (
-             SELECT $2::uuid
-             UNION
-             SELECT p.parent_id FROM entity_type_parents p JOIN up ON p.child_id = up.id
-         )
-         SELECT (SELECT count(*) FROM relation_type_domains WHERE relation_type_id = $1),
-                (SELECT count(*) FROM relation_type_domains d
-                   JOIN up ON up.id = d.entity_type_id
-                  WHERE d.relation_type_id = $1)",
-    )
-    .bind(relation_type_id)
-    .bind(subject_type_id)
-    .fetch_one(pool)
-    .await?;
-    Ok((declared > 0).then_some(ok > 0))
 }
 
 /// 这些类的全部祖先（不含自己）。沿 `subClassOf` 上溯，多继承与菱形都走得通。
@@ -2197,109 +2052,6 @@ pub async fn ancestors_of(pool: &PgPool, ids: &[Uuid]) -> AppResult<Vec<Uuid>> {
     .fetch_all(pool)
     .await?;
     Ok(rows.into_iter().map(|(id,)| id).collect())
-}
-
-/// 同 [`subject_fits_domain`]，但类型**从库里的实体读**，不靠调用方手上那份。
-///
-/// 抽取器手上的 `entity_type_of` 只覆盖模型在这一块里声明过的实体；宾语常常
-/// 是别处已经存在的实体，这一块没重新声明它的类型，于是查不到、判不了。
-/// 而消解已经把它连到了库里那一行——那里有类型，用它才判得全。
-pub async fn entity_fits_domain(
-    pool: &PgPool,
-    relation_type_id: Uuid,
-    entity_id: Uuid,
-) -> AppResult<Option<bool>> {
-    let (declared, ok): (i64, i64) = sqlx::query_as(
-        "WITH RECURSIVE up(id) AS (
-             SELECT type_id FROM entities WHERE id = $2
-             UNION
-             SELECT p.parent_id FROM entity_type_parents p JOIN up ON p.child_id = up.id
-         )
-         SELECT (SELECT count(*) FROM relation_type_domains WHERE relation_type_id = $1),
-                (SELECT count(*) FROM relation_type_domains d
-                   JOIN up ON up.id = d.entity_type_id
-                  WHERE d.relation_type_id = $1)",
-    )
-    .bind(relation_type_id)
-    .bind(entity_id)
-    .fetch_one(pool)
-    .await?;
-    Ok((declared > 0).then_some(ok > 0))
-}
-
-/// 一条 (主语, 谓词, 宾语) 对着谓词的 domain 签名该怎么落。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Fit {
-    /// 谓词没声明 domain——没有判据，照原样落
-    Unchecked,
-    /// 主语符合
-    Keep,
-    /// 主语不符合、宾语符合：按签名对调主宾
-    Swap,
-    /// 两边都不符合：这个关系不适用于这对实体，谓词该留空
-    Neither,
-}
-
-/// **三条写谓词的路共用的那一道判断**（#190 / #196）：抽取落新事实、采纳把谓词
-/// 挂回旧事实、合并换掉主语——从前只有抽取查，另外两条各自绕了过去。
-///
-/// 判据刻意窄（0012）：只看签名，只在**正向违反而反向成立**时对调，两个方向都
-/// 对不上就留空谓词。参数顺序不是关于世界的断言，是这个 key 的编码约定，所以本体
-/// 在这一处是执法的；哪些类型能参与仍是引导，不在这里裁。
-///
-/// **range 也算进来**（#222）。从前只看 domain：`headOf` 的 domain 是 Agent，
-/// schema.org 里 Project 也是 Organization 也是 Agent，于是 `Project Aurora head_of
-/// Li Ting` 主语过关就 Keep，宾语是个人、range 要 Organization 这件事没人看。
-/// 现在两端各看各的：正向两端都不违反才 Keep；否则反过来两端都不违反才 Swap。
-/// 没判出类型的实体在 range 这一端不算违反（"不知道"不是"不符合"，与
-/// `signature_breaks` 同一条纪律）；domain 那一端沿用旧规矩，那是 0012 定下的
-pub async fn judge_direction(
-    pool: &PgPool,
-    relation_type_id: Uuid,
-    subject_id: Uuid,
-    object_id: Uuid,
-) -> AppResult<Fit> {
-    let subject_in_domain = entity_fits_domain(pool, relation_type_id, subject_id).await?;
-    let object_in_range = entity_fits_range(pool, relation_type_id, object_id).await?;
-    if subject_in_domain.is_none() && object_in_range.is_none() {
-        return Ok(Fit::Unchecked);
-    }
-    if subject_in_domain != Some(false) && object_in_range != Some(false) {
-        return Ok(Fit::Keep);
-    }
-    let object_in_domain = entity_fits_domain(pool, relation_type_id, object_id).await?;
-    let subject_in_range = entity_fits_range(pool, relation_type_id, subject_id).await?;
-    if object_in_domain != Some(false) && subject_in_range != Some(false) {
-        return Ok(Fit::Swap);
-    }
-    Ok(Fit::Neither)
-}
-
-/// [`entity_fits_domain`] 的 range 版。多一条规矩：实体还没判出类型 → None，
-/// 不当违反——range 这一端是新加的判据（#222），不该让未分类实体的事实因此
-/// 丢掉谓词
-pub async fn entity_fits_range(
-    pool: &PgPool,
-    relation_type_id: Uuid,
-    entity_id: Uuid,
-) -> AppResult<Option<bool>> {
-    let (declared, typed, ok): (i64, bool, i64) = sqlx::query_as(
-        "WITH RECURSIVE up(id) AS (
-             SELECT type_id FROM entities WHERE id = $2
-             UNION
-             SELECT p.parent_id FROM entity_type_parents p JOIN up ON p.child_id = up.id
-         )
-         SELECT (SELECT count(*) FROM relation_type_ranges WHERE relation_type_id = $1),
-                (SELECT type_id IS NOT NULL FROM entities WHERE id = $2),
-                (SELECT count(*) FROM relation_type_ranges g
-                   JOIN up ON up.id = g.entity_type_id
-                  WHERE g.relation_type_id = $1)",
-    )
-    .bind(relation_type_id)
-    .bind(entity_id)
-    .fetch_one(pool)
-    .await?;
-    Ok((declared > 0 && typed).then_some(ok > 0))
 }
 
 /// 把 `owl:inverseOf` / `rdfs:subPropertyOf` 从 IRI 解析成 id。
@@ -2439,23 +2191,4 @@ pub async fn agent_proposal_report(pool: &PgPool, kb_id: Uuid) -> AppResult<Agen
     .bind(kb_id)
     .fetch_one(pool)
     .await?)
-}
-
-/// 采纳时人改过：记下来，占比才算得出
-pub async fn mark_proposal_edited(
-    pool: &PgPool,
-    kb_id: Uuid,
-    section: &str,
-    key: &str,
-) -> AppResult<()> {
-    sqlx::query(
-        "UPDATE ontology_proposals SET edited = true
-          WHERE kb_id = $1 AND section = $2 AND key = $3",
-    )
-    .bind(kb_id)
-    .bind(section)
-    .bind(key)
-    .execute(pool)
-    .await?;
-    Ok(())
 }
