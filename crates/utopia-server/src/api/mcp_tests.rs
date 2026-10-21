@@ -1186,6 +1186,60 @@ async fn entity_facts_keeps_identity_values_filters_and_both_clocks() -> anyhow:
 }
 
 #[tokio::test]
+async fn changes_shows_the_superseded_value_even_outside_the_window() -> anyhow::Result<()> {
+    let Some(f) = Fixture::new().await? else {
+        return Ok(());
+    };
+    let previous_employer = Uuid::now_v7();
+    sqlx::query("INSERT INTO entities(id,kb_id,canonical_name) VALUES ($1,$2,'Former employer')")
+        .bind(previous_employer)
+        .bind(f.kb)
+        .execute(&f.state.pool)
+        .await?;
+    sqlx::query("UPDATE facts SET object_id=$1 WHERE id=$2")
+        .bind(previous_employer)
+        .bind(f.fact)
+        .execute(&f.state.pool)
+        .await?;
+
+    // The March 10 assertion is outside this window and excluded by kinds too.
+    let args = json!({"since":"2026-03-20","until":"2026-03-20","kinds":["corrected"]});
+    let result = f.call("changes", args.clone()).await?;
+    assert_eq!(
+        result["structuredContent"]["changes"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let text = result["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("Alice works for old: Former employer → new: Acme"),
+        "{text}"
+    );
+
+    // Attribute corrections use the same ledger link and retain the unit on both sides.
+    sqlx::query(
+        "UPDATE facts SET object_id=NULL,
+             predicate_id=(SELECT predicate_id FROM facts WHERE id=$3),
+             object_value=jsonb_build_object('value',CASE WHEN id=$1 THEN 7 ELSE 8 END,'unit','kg')
+         WHERE id IN ($1,$2)",
+    )
+    .bind(f.fact)
+    .bind(f.corrected)
+    .bind(f.attribute)
+    .execute(&f.state.pool)
+    .await?;
+    let result = f.call("changes", args).await?;
+    let text = result["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("Alice weight old: 7 kg → new: 8 kg"),
+        "{text}"
+    );
+    f.clean().await
+}
+
+#[tokio::test]
 async fn changes_returns_fact_ids_and_a_reusable_correction_timestamp() -> anyhow::Result<()> {
     let Some(f) = Fixture::new().await? else {
         return Ok(());

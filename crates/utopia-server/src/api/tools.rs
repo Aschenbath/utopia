@@ -1280,10 +1280,20 @@ fn changes_window(
 fn change_line(c: &GraphChange) -> String {
     // 字面值宾语与 `fact_line` 同一条规则（`literal_text`）：两个工具看到的
     // 不能是两种写法，否则 `{value, unit}` 在这里会印成一段 JSON
-    let object = match (&c.object_name, &c.object_value) {
+    let object_text = |name: &Option<String>, value: &Option<serde_json::Value>| match (name, value)
+    {
         (Some(name), _) => name.clone(),
         (None, Some(v)) => literal_text(v).unwrap_or_else(|| "?".to_string()),
         (None, None) => "?".to_string(),
+    };
+    let object = object_text(&c.object_name, &c.object_value);
+    let object = if c.kind == "corrected" {
+        format!(
+            "old: {} → new: {object}",
+            object_text(&c.previous_object_name, &c.previous_object_value)
+        )
+    } else {
+        object
     };
     // 世界轴两端按自己的精度写（time_text）；事件行上没有锚点，结束未知只能写成话
     let range = crate::time_text::span(crate::time_text::Span {
@@ -1395,6 +1405,25 @@ mod tests {
 
     // --- change_line --------------------------------------------------------
 
+    #[test]
+    fn a_correction_labels_the_old_value_before_the_new_value() {
+        let mut c = change("corrected");
+        c.subject_name = "acme-api".into();
+        c.predicate_label = Some("owned by".into());
+        c.previous_object_name = Some("team-a".into());
+        c.object_name = Some("team-b".into());
+        assert_eq!(
+            change_line(&c),
+            "2026-08-28T10:00:00Z corrected: acme-api owned by old: team-a → new: team-b"
+        );
+
+        c.previous_object_name = None;
+        c.object_name = None;
+        c.previous_object_value = Some(serde_json::json!({"value": 7, "unit": "kg"}));
+        c.object_value = Some(serde_json::json!({"value": 8, "unit": "kg"}));
+        assert!(change_line(&c).ends_with("old: 7 kg → new: 8 kg"));
+    }
+
     /// 年精度的起点写成年，不再印成 1 月 1 日；结束了不知哪天绝不写 now
     #[test]
     fn a_change_line_shows_each_end_at_its_precision() {
@@ -1435,6 +1464,8 @@ mod tests {
             predicate_label: Some("founded in".to_string()),
             object_name: None,
             object_value: None,
+            previous_object_name: None,
+            previous_object_value: None,
             valid_from: None,
             valid_to: None,
             // 两端都没日期就没有精度——夹具也得守这条不变量（见 `facts.valid_from_precision`）
