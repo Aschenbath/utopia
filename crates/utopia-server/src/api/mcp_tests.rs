@@ -2518,6 +2518,144 @@ async fn computed_rule_descriptions_keep_the_expression_tree_and_identity() -> a
 }
 
 #[tokio::test]
+async fn rule_reads_include_active_ontology_axioms_without_compiling_them() -> anyhow::Result<()> {
+    let Some(f) = Fixture::new().await? else {
+        return Ok(());
+    };
+    let result: anyhow::Result<()> = async {
+        let (employs, connected, mentors, foreign) = (
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+        );
+        sqlx::raw_sql(&format!(
+            "INSERT INTO relation_types(id,kb_id,key,label,is_transitive,is_symmetric,sub_property_of)
+             VALUES ('{employs}','{kb}','employs','employs',false,false,NULL),
+                    ('{connected}','{kb}','connected_to','connected to',true,true,NULL),
+                    ('{mentors}','{kb}','mentors','mentors',false,false,'{connected}'),
+                    ('{foreign}','{other_kb}','foreign_axiom','Other base',true,false,NULL);
+             UPDATE relation_types SET inverse_of='{employs}'
+              WHERE kb_id='{kb}' AND key='works_for';",
+            kb = f.kb,
+            other_kb = f.other_kb,
+        ))
+        .execute(&f.state.pool)
+        .await?;
+        let expected = [
+            "inverse of works_for: X works_for Y ⇒ Y employs X",
+            "inverse of employs: X employs Y ⇒ Y works_for X",
+            "symmetric of connected_to: X connected_to Y ⇒ Y connected_to X",
+            "transitive of connected_to: X connected_to Y AND Y connected_to Z ⇒ X connected_to Z",
+            "sub_property of mentors: X mentors Y ⇒ X connected_to Y",
+        ];
+        let listed = f.call("list_rules", json!({})).await?;
+        assert_eq!(listed["isError"], false);
+        let text = listed["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("Weight rule"), "{text}");
+        assert!(text.contains("Ontology axioms"), "{text}");
+        for line in expected {
+            assert!(text.contains(line), "{line} missing from {text}");
+        }
+        assert!(!text.contains("foreign_axiom"), "{text}");
+        // The fixture retains an old symmetric rule whose declaration is gone.
+        assert!(!text.contains("symmetric of works_for"), "{text}");
+        step_has(
+            &step_of(&f, &[], "list_rules", json!({})).await,
+            json!({"count":6}),
+        )?;
+        let compiled: i64 = sqlx::query_scalar("SELECT count(*) FROM rules WHERE kb_id=$1")
+            .bind(f.kb)
+            .fetch_one(&f.state.pool)
+            .await?;
+        assert_eq!(compiled, 1, "Reading must not compile the new axioms");
+
+        sqlx::query("DELETE FROM attribute_rules WHERE kb_id=$1")
+            .bind(f.kb)
+            .execute(&f.state.pool)
+            .await?;
+        let listed = f.call("list_rules", json!({})).await?;
+        let text = listed["content"][0]["text"].as_str().unwrap();
+        for line in expected {
+            assert!(text.contains(line), "{line} missing from {text}");
+        }
+        sqlx::query(
+            "UPDATE relation_types SET is_transitive=false,is_symmetric=false,
+                    inverse_of=NULL,sub_property_of=NULL WHERE kb_id=$1",
+        )
+        .bind(f.kb)
+        .execute(&f.state.pool)
+        .await?;
+        let empty = f.call("list_rules", json!({})).await?;
+        assert_eq!(
+            empty["content"][0]["text"],
+            "This base has no business rules or active ontology axioms."
+        );
+        Ok(())
+    }
+    .await;
+    f.clean().await?;
+    result
+}
+
+#[tokio::test]
+async fn derived_axioms_name_the_source_property_even_after_retirement() -> anyhow::Result<()> {
+    let Some(f) = Fixture::new().await? else {
+        return Ok(());
+    };
+    let result: anyhow::Result<()> = async {
+        sqlx::query("DELETE FROM attribute_rules WHERE kb_id=$1")
+            .bind(f.kb)
+            .execute(&f.state.pool)
+            .await?;
+        let employs = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO relation_types(id,kb_id,key,label) VALUES ($1,$2,'employs','employs')",
+        )
+        .bind(employs)
+        .bind(f.kb)
+        .execute(&f.state.pool)
+        .await?;
+        sqlx::query("UPDATE relation_types SET inverse_of=$2 WHERE kb_id=$1 AND key='works_for'")
+            .bind(f.kb)
+            .bind(employs)
+            .execute(&f.state.pool)
+            .await?;
+        utopia_store::reasoning::materialize(&f.state.pool, f.kb).await?;
+        let recorded: chrono::DateTime<chrono::Utc> =
+            sqlx::query_scalar("SELECT clock_timestamp()")
+                .fetch_one(&f.state.pool)
+                .await?;
+        let current = f
+            .call("entity_facts", json!({"entity_id":f.object}))
+            .await?;
+        sqlx::query("UPDATE relation_types SET inverse_of=NULL WHERE kb_id=$1")
+            .bind(f.kb)
+            .execute(&f.state.pool)
+            .await?;
+        utopia_store::reasoning::materialize(&f.state.pool, f.kb).await?;
+        let historical = f
+            .call(
+                "entity_facts",
+                json!({"entity_id":f.object,"as_of":recorded}),
+            )
+            .await?;
+        for response in [current, historical] {
+            assert_eq!(response["isError"], false, "{response}");
+            let text = response["content"][0]["text"].as_str().unwrap();
+            assert!(
+                text.contains("Acme · employs · Alice [rule: inverse of works_for]"),
+                "{text}"
+            );
+        }
+        Ok(())
+    }
+    .await;
+    f.clean().await?;
+    result
+}
+
+#[tokio::test]
 async fn rule_reads_preserve_matches_and_empty_results() -> anyhow::Result<()> {
     let Some(f) = Fixture::new().await? else {
         return Ok(());
@@ -2555,7 +2693,7 @@ async fn rule_reads_preserve_matches_and_empty_results() -> anyhow::Result<()> {
     assert_eq!(empty["isError"], false);
     assert_eq!(
         empty["content"][0]["text"],
-        "This base has no business rules."
+        "This base has no business rules or active ontology axioms."
     );
     f.clean().await
 }

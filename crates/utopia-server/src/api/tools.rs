@@ -558,9 +558,19 @@ pub async fn list_rules(ctx: &ToolCtx<'_>) -> ToolResult {
         )
         .error();
     };
-    if rules.is_empty() {
+    let Ok(axioms) = utopia_store::reasoning::active_axiom_rules(&ctx.state.pool, ctx.kb_id).await
+    else {
         return ToolResult::new(
-            "This base has no business rules.".to_string(),
+            "Could not read the rules.".to_string(),
+            Step::new("tool", "list_rules", "failed")
+                .status("failed")
+                .json(),
+        )
+        .error();
+    };
+    if rules.is_empty() && axioms.is_empty() {
+        return ToolResult::new(
+            "This base has no business rules or active ontology axioms.".to_string(),
             Step::new("tool", "list_rules", "none").count(0).json(),
         );
     }
@@ -585,7 +595,7 @@ pub async fn list_rules(ctx: &ToolCtx<'_>) -> ToolResult {
         .error();
     };
     let mut descriptions = descriptions.into_iter();
-    let text = rules
+    let mut text = rules
         .iter()
         .map(|r| {
             let conditions = r["conditions"]
@@ -668,7 +678,26 @@ pub async fn list_rules(ctx: &ToolCtx<'_>) -> ToolResult {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let n = rules.len();
+    if rules.is_empty() {
+        text = "This base has no business rules.".to_string();
+    }
+    if !axioms.is_empty() {
+        text.push_str("\n\nOntology axioms (from property declarations):\n");
+        let lines: Vec<_> = axioms
+            .iter()
+            .map(|a| {
+                let (p, q) = (&a.predicate, &a.target);
+                let conclusion = match a.kind {
+                    "transitive" => format!("X {p} Y AND Y {p} Z ⇒ X {p} Z"),
+                    "symmetric" | "inverse" => format!("X {p} Y ⇒ Y {q} X"),
+                    _ => format!("X {p} Y ⇒ X {q} Y"),
+                };
+                format!("{} of {p}: {conclusion}", a.kind)
+            })
+            .collect();
+        text.push_str(&lines.join("\n"));
+    }
+    let n = rules.len() + axioms.len();
     ToolResult::new(
         text,
         Step::new("tool", "list_rules", format!("{n} rules"))

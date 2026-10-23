@@ -748,6 +748,26 @@ pub async fn entity_facts(ctx: &ToolCtx<'_>, sink: &mut ToolSink, args: &Value) 
                     Step::new("facts", node.name, "failed").status("failed").json()).error();
             }
         };
+    let rule_ids: Vec<_> = derived.iter().filter_map(|d| d.rule_id).collect();
+    let rule_names = match utopia_store::reasoning::axiom_rule_names(
+        &ctx.state.pool,
+        ctx.kb_id,
+        &rule_ids,
+    )
+    .await
+    {
+        Ok(names) => names,
+        Err(e) => {
+            tracing::warn!(error = %e, "Derived rule lookup failed");
+            return ToolResult::new(
+                "Could not read the derived facts.".into(),
+                Step::new("facts", node.name, "failed")
+                    .status("failed")
+                    .json(),
+            )
+            .error();
+        }
+    };
     let derived_lines: Vec<String> = derived
         .iter()
         .map(|d| {
@@ -756,7 +776,12 @@ pub async fn entity_facts(ctx: &ToolCtx<'_>, sink: &mut ToolSink, args: &Value) 
                 d.subject,
                 d.predicate,
                 d.object,
-                d.rule_name.as_deref().unwrap_or(&d.rule),
+                d.rule_name
+                    .as_deref()
+                    .or_else(|| d
+                        .rule_id
+                        .and_then(|id| rule_names.get(&id).map(String::as_str)))
+                    .unwrap_or(&d.rule),
             )
         })
         .collect();

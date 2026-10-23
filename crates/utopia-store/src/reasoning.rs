@@ -1448,19 +1448,7 @@ fn coarsest(a: Option<&str>, b: Option<&str>) -> Option<String> {
     }
 }
 
-/// 按本体公理重编译规则，返回 `(谓词, 种类) → 规则 id`。
-///
-/// **幂等**：身份取 `(kb, 谓词, 种类)`，重编译认得出「还是那条规则」——否则每跑
-/// 一次 `derived_facts.rule_id` 就指向一个新 id，历史全断。
-///
-/// **公理撤了的规则不删。** 已失效的派生行仍指着它，解释「当时是靠哪条规则推的」
-/// 需要它还在；而它不再出现在返回值里，据它推出来的事实由下面的对账作废。
-/// 规则一个库也就几条，留着不占地方。
-async fn compile_rules(
-    conn: &mut PgConnection,
-    kb_id: Uuid,
-    ax: &HashMap<Uuid, Axioms>,
-) -> AppResult<HashMap<(Uuid, RuleKind), Uuid>> {
+fn axiom_rule_keys(ax: &HashMap<Uuid, Axioms>) -> Vec<(Uuid, RuleKind)> {
     let mut want: Vec<(Uuid, RuleKind)> = Vec::new();
     for (&pred, a) in ax {
         if a.transitive {
@@ -1480,8 +1468,24 @@ async fn compile_rules(
         }
     }
     want.sort();
+    want
+}
+
+/// 按本体公理重编译规则，返回 `(谓词, 种类) → 规则 id`。
+///
+/// **幂等**：身份取 `(kb, 谓词, 种类)`，重编译认得出「还是那条规则」——否则每跑
+/// 一次 `derived_facts.rule_id` 就指向一个新 id，历史全断。
+///
+/// **公理撤了的规则不删。** 已失效的派生行仍指着它，解释「当时是靠哪条规则推的」
+/// 需要它还在；而它不再出现在返回值里，据它推出来的事实由下面的对账作废。
+/// 规则一个库也就几条，留着不占地方。
+async fn compile_rules(
+    conn: &mut PgConnection,
+    kb_id: Uuid,
+    ax: &HashMap<Uuid, Axioms>,
+) -> AppResult<HashMap<(Uuid, RuleKind), Uuid>> {
     let mut out = HashMap::new();
-    for (pred, kind) in want {
+    for (pred, kind) in axiom_rule_keys(ax) {
         sqlx::query(
             "INSERT INTO rules (id, kb_id, predicate_id, kind) VALUES ($1, $2, $3, $4)
              ON CONFLICT (kb_id, predicate_id, kind) DO NOTHING",
@@ -1503,6 +1507,69 @@ async fn compile_rules(
         out.insert((pred, kind), id);
     }
     Ok(out)
+}
+
+pub struct AxiomRule {
+    pub kind: &'static str,
+    pub predicate: String,
+    pub target: String,
+}
+
+/// Read the declarations the compiler uses, including normalized inverse pairs.
+/// Stored rules also contain retired declarations, and new ones need not have
+/// been compiled yet; listing them must not run materialization or write rules.
+pub async fn active_axiom_rules(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<AxiomRule>> {
+    let mut conn = pool.acquire().await?;
+    let ax = axioms(&mut conn, kb_id).await?;
+    let names: HashMap<Uuid, String> =
+        sqlx::query_as("SELECT id, key FROM relation_types WHERE kb_id=$1")
+            .bind(kb_id)
+            .fetch_all(&mut *conn)
+            .await?
+            .into_iter()
+            .collect();
+    let mut rules = Vec::new();
+    for (predicate, kind) in axiom_rule_keys(&ax) {
+        let target = match kind {
+            "inverse" => ax[&predicate].inverse_of,
+            "sub_property" => ax[&predicate].sub_property_of,
+            _ => Some(predicate),
+        };
+        if let (Some(predicate), Some(target)) =
+            (names.get(&predicate), target.and_then(|id| names.get(&id)))
+        {
+            rules.push(AxiomRule {
+                kind,
+                predicate: predicate.clone(),
+                target: target.clone(),
+            });
+        }
+    }
+    rules.sort_by(|a, b| a.predicate.cmp(&b.predicate).then(a.kind.cmp(b.kind)));
+    Ok(rules)
+}
+
+/// A proof names the property the rule was declared on, which can differ from
+/// its conclusion's property. Retired rules still explain historical facts.
+pub async fn axiom_rule_names(
+    pool: &PgPool,
+    kb_id: Uuid,
+    ids: &[Uuid],
+) -> AppResult<HashMap<Uuid, String>> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    Ok(sqlx::query_as(
+        "SELECT r.id, r.kind || ' of ' || p.key
+           FROM rules r JOIN relation_types p ON p.id=r.predicate_id
+          WHERE r.kb_id=$1 AND p.kb_id=$1 AND r.id=ANY($2)",
+    )
+    .bind(kb_id)
+    .bind(ids)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .collect())
 }
 
 /// 取边时一并拿回来的随行信息（精度与置信度，落库要用）。

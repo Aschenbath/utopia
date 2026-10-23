@@ -45,10 +45,16 @@ Three methods are served:
 | `timeline` | One entity's dated facts in world-time order; `since` / `until` narrow the window |
 | `paths_between` | The chains of facts joining two entities, up to three hops, shortest first. With `at`, every edge must hold at that moment; with `as_of`, the chains as the base held them then |
 | `changes` | What the graph learned or revised in a window of **record** time: asserted, corrected, rejected, merged. Needs no entity; use it when the question names a period, not a subject |
+| `list_rules` | Business rules with their conditions and conclusions, followed by active ontology axioms (transitive, symmetric, inverse and sub-property) with the properties and relations they imply |
+| `rule_matches` | The entities a business rule currently marks, with its premises. Takes a business rule ID from `list_rules` |
 | `search_docs` | Utopia's own manual, for questions about how the platform works. Never the user's documents |
 | `remember` | Record one sentence into the base's memory. **Needs a `write` token held by an editor**; a token without it does not see this tool in `tools/list`, and calling it anyway says why |
 
 The two time axes matter here. `at` reads **world time** (when something was true); `as_of` reads **record time** (what Utopia held at that moment, before it revised it), and `changes` lists what moved on that axis in a window. They are separate parameters on purpose: folded into one they would answer "what happened in March" with "what we learned in March", and both look plausible.
+
+A derived fact returned by `entity_facts` names the rule that produced it. For an ontology
+axiom, the text includes its defining property, such as `[rule: inverse of works_at]`.
+That property can differ from the relation in the derived fact itself.
 
 ## The external read contract
 
