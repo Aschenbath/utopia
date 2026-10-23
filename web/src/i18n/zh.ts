@@ -218,7 +218,7 @@ export const zh: Strings = {
     copied: "已复制",
     mcpTitle: "MCP 客户端配置",
     mcpHint:
-      "适用于 Claude Code、Claude Desktop 及其它 Streamable HTTP 客户端。每个库有自己的端点，选 agent 要对话的那个库。别的客户端键名可能不同。",
+      "适用于 Claude Code、Claude Desktop 及其它 Streamable HTTP 客户端。即使令牌允许访问全部库，这段配置也只连接一个知识库，复制前请确认选中的库。别的客户端键名可能不同。",
     mcpBase: "库",
     yourTokens: "你的令牌",
     noTokens: "还没有令牌。",
