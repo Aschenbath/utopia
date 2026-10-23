@@ -98,7 +98,7 @@ enum Cut {
 /// `Err` has two causes: no chat model, or an empty balance (#1095). An empty balance
 /// stops the document, and the error keeps its chain for `alerting::hopeless`.
 ///
-/// 被接管的检查（epoch）留在主循环顶上，不在这里：它要在调模型之前
+/// Ownership checks stay in the caller, before requesting and before applying.
 #[allow(clippy::too_many_arguments)]
 async fn call_and_parse_one_chunk(
     state: &AppState,
@@ -1100,6 +1100,12 @@ pub(crate) async fn run_open(
             Some(p) => p,
             None => continue,
         };
+        // Rebuild can purge our cached entities while the model answers (#1361).
+        // A superseded reply must not write facts or mark its chunk extracted.
+        if utopia_store::documents::extract_epoch(pool, document_id).await? != my_epoch {
+            tracing::info!(%document_id, "抽取任务已被新一轮接管，落库前退出");
+            return Ok(());
+        }
         let ChunkParsed {
             extraction,
             name_vecs,
