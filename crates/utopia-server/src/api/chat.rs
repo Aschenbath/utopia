@@ -434,8 +434,8 @@ pub(super) fn base_tools() -> serde_json::Value {
                     marked `[rule: <name>]`; an axiom names its defining property. \
                     The readings that made them true are included — take \
                     those as given rather than re-deriving them from the readings yourself. \
-                    Output is grouped by predicate and cut at `limit`; narrow with predicate, \
-                    object_type, since / until, or use timeline / neighbors / paths_between.",
+                    Output is grouped by predicate and cut at `limit`; use `offset` to continue. \
+                    Narrow with predicate, object_type, since / until, or use timeline / neighbors / paths_between.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -445,6 +445,7 @@ pub(super) fn base_tools() -> serde_json::Value {
                         "since": { "type": "string", "description": "Optional WORLD-time window start: facts still holding after it." },
                         "until": { "type": "string", "description": "Optional WORLD-time window end: facts that had started by it." },
                         "limit": { "type": "integer", "description": "How many facts to return (default 80, max 300); the reply says when it is cut." },
+                        "offset": { "type": "integer", "minimum": 0, "description": "Zero-based position in the filtered facts (default 0). Use the reply's next_offset to continue, keeping the entity, filters and time parameters unchanged." },
                         "at": {
                             "type": "string",
                             "description": "Optional as-of moment on the WORLD axis (YYYY, YYYY-MM, \
@@ -571,7 +572,7 @@ pub(super) fn base_tools() -> serde_json::Value {
                     fractional seconds. \
                     For 'before a correction arrived', find that event here and pass its \
                     timestamp, exactly as printed, to entity_facts as `before`. Keep at for the \
-                    world date asked about.",
+                    world date asked about. Returns up to 40 events; use `offset` to continue.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -598,7 +599,8 @@ pub(super) fn base_tools() -> serde_json::Value {
                             "description": "Optional filter. A freshly ingested corpus is nearly \
                                 all 'asserted'; pass [\"corrected\", \"rejected\"] to isolate \
                                 the places we actually changed our mind."
-                        }
+                        },
+                        "offset": { "type": "integer", "minimum": 0, "description": "Zero-based position in the matching events (default 0). Use the reply's next_offset to continue, keeping the window and filters unchanged." }
                     },
                     "required": ["since"]
                 }
