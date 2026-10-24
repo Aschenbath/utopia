@@ -1196,6 +1196,39 @@ async fn entity_facts_keeps_identity_values_filters_and_both_clocks() -> anyhow:
 }
 
 #[tokio::test]
+async fn changes_shows_the_superseded_value_even_outside_the_window() -> anyhow::Result<()> {
+    let Some(f) = Fixture::new().await? else {
+        return Ok(());
+    };
+    let previous_employer = Uuid::now_v7();
+    sqlx::query("INSERT INTO entities(id,kb_id,canonical_name) VALUES ($1,$2,'Former employer')")
+        .bind(previous_employer)
+        .bind(f.kb)
+        .execute(&f.state.pool)
+        .await?;
+    sqlx::query("UPDATE facts SET object_id=$1 WHERE id=$2")
+        .bind(previous_employer)
+        .bind(f.fact)
+        .execute(&f.state.pool)
+        .await?;
+
+    // 3 月 10 日的前一次断言既在窗口外，也被 kinds 排除，不能靠相邻事件找前值。
+    let args = json!({"since":"2026-03-20","until":"2026-03-20","kinds":["corrected"]});
+    let result = f.call("changes", args).await?;
+    let changes = result["structuredContent"]["changes"].as_array().unwrap();
+    assert_eq!(changes.len(), 1);
+    let text = result["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("Alice works for old: Former employer → new: Acme"),
+        "{text}"
+    );
+    assert_eq!(changes[0]["previous_object_name"], "Former employer");
+    assert_eq!(changes[0]["object_name"], "Acme");
+    assert_eq!(changes[0].get("previous_object_value"), Some(&Value::Null));
+    f.clean().await
+}
+
+#[tokio::test]
 async fn entity_facts_pages_filtered_rows_without_repeating_time_ties() -> anyhow::Result<()> {
     let Some(f) = Fixture::new().await? else {
         return Ok(());

@@ -967,6 +967,9 @@ pub struct GraphChange {
     pub predicate_label: Option<String>,
     pub object_name: Option<String>,
     pub object_value: Option<serde_json::Value>,
+    /// corrected 事件的前值，来自 supersedes 指向的行；那次断言可能在查询窗口之外。
+    pub previous_object_name: Option<String>,
+    pub previous_object_value: Option<serde_json::Value>,
     /// 这条断言说的是**世界轴**上的哪一段——与 `at` 正交，别读混
     pub valid_from: Option<DateTime<Utc>>,
     pub valid_to: Option<DateTime<Utc>>,
