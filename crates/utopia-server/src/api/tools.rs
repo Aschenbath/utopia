@@ -893,6 +893,8 @@ pub async fn changes(ctx: &ToolCtx<'_>, args: &serde_json::Value) -> ToolResult 
             "subject_id": r.subject_id, "subject_name": r.subject_name,
             "predicate_label": r.predicate_label, "object_name": r.object_name,
             "object_value": r.object_value, "confidence": r.confidence,
+            "previous_object_name": r.previous_object_name,
+            "previous_object_value": r.previous_object_value,
             "valid_from": r.valid_from, "valid_to": r.valid_to,
             "valid_from_precision": r.valid_from_precision,
             "valid_to_precision": r.valid_to_precision,

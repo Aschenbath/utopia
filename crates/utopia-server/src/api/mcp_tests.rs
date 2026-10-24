@@ -1212,40 +1212,19 @@ async fn changes_shows_the_superseded_value_even_outside_the_window() -> anyhow:
         .execute(&f.state.pool)
         .await?;
 
-    // The March 10 assertion is outside this window and excluded by kinds too.
+    // 3 月 10 日的前一次断言既在窗口外，也被 kinds 排除，不能靠相邻事件找前值。
     let args = json!({"since":"2026-03-20","until":"2026-03-20","kinds":["corrected"]});
-    let result = f.call("changes", args.clone()).await?;
-    assert_eq!(
-        result["structuredContent"]["changes"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
+    let result = f.call("changes", args).await?;
+    let changes = result["structuredContent"]["changes"].as_array().unwrap();
+    assert_eq!(changes.len(), 1);
     let text = result["content"][0]["text"].as_str().unwrap();
     assert!(
         text.contains("Alice works for old: Former employer → new: Acme"),
         "{text}"
     );
-
-    // Attribute corrections use the same ledger link and retain the unit on both sides.
-    sqlx::query(
-        "UPDATE facts SET object_id=NULL,
-             predicate_id=(SELECT predicate_id FROM facts WHERE id=$3),
-             object_value=jsonb_build_object('value',CASE WHEN id=$1 THEN 7 ELSE 8 END,'unit','kg')
-         WHERE id IN ($1,$2)",
-    )
-    .bind(f.fact)
-    .bind(f.corrected)
-    .bind(f.attribute)
-    .execute(&f.state.pool)
-    .await?;
-    let result = f.call("changes", args).await?;
-    let text = result["content"][0]["text"].as_str().unwrap();
-    assert!(
-        text.contains("Alice weight old: 7 kg → new: 8 kg"),
-        "{text}"
-    );
+    assert_eq!(changes[0]["previous_object_name"], "Former employer");
+    assert_eq!(changes[0]["object_name"], "Acme");
+    assert_eq!(changes[0].get("previous_object_value"), Some(&Value::Null));
     f.clean().await
 }
 

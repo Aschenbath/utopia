@@ -115,7 +115,13 @@ is a successful read, not an error.
 | `find_entities` | `matched_entities`, `truncated`, `entities[]`, in the same ranked order as the text: `id`, `name`, `type_key`, `type_label`, `disambiguator`, `fact_count`. The count is for the partial-name lookup, or `null` when the fallback combined individual words without counting all matches. `truncated` reports the partial-name cap; this is a candidate list, not an exhaustive entity export |
 | `search_chunks` | `as_of`, `limit`, `limit_reached`, `chunks[]`. Each chunk has `chunk_id`, `document_id`, zero-based `seq`, `filename`, `text`, `truncated`. The text uses the same 800-character cutoff as the prose |
 | `entity_facts` | `entity` (`id`, `name`, `type_key`, `type_label`), effective `at`/`as_of`/`before`, `total_facts`, `matched_facts`, `limit`, `offset`, `next_offset`, `truncated`, `facts[]`, `derived_facts[]` |
-| `changes` | Effective `since` (inclusive) and `until` (exclusive), `limit`, `offset`, `next_offset`, `limit_reached`, `changes[]`. Events carry `fact_id`, `at`, `kind`, `subject_id`, `subject_name`, `predicate_label`, `object_name`, `object_value`, `confidence`, `valid_from`, `valid_to`, both validity precisions, `document_id`, `filename`, `quote` |
+| `changes` | Effective `since` (inclusive) and `until` (exclusive), `limit`, `offset`, `next_offset`, `limit_reached`, `changes[]`. Events carry `fact_id`, `at`, `kind`, `subject_id`, `subject_name`, `predicate_label`, `object_name`, `object_value`, `previous_object_name`, `previous_object_value`, `confidence`, `valid_from`, `valid_to`, both validity precisions, `document_id`, `filename`, `quote` |
+
+For a `corrected` event, `object_name` / `object_value` describe the new object;
+`previous_object_name` / `previous_object_value` describe the superseded one,
+even when that assertion lies outside the requested window. For other event
+kinds, both previous fields are `null`. Value fields retain raw JSON, including
+units.
 
 An asserted `facts[]` entry contains `id`, `direction`, `predicate_key`,
 `predicate_label`, `inferred`, `temporal`, `other_id`, `other_name`, `object_value`,
