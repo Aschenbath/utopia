@@ -446,8 +446,7 @@ pub struct LlmClient {
     /// 上限后记在这里，同一个客户端（含它的克隆）此后都按它发，一个进程只吃一次拒绝
     /// （#891，#892 评审）。只降不升
     completion_ceiling: std::sync::Arc<std::sync::atomic::AtomicU32>,
-    /// A refusal teaches all clones the endpoint's request shape, so each chunk
-    /// does not pay the same 400 again (#1376).
+    /// 端点拒绝过的参数记在客户端上，克隆也共用；下一块不再为同一种请求吃一次 400（#1376）。
     use_max_completion_tokens: std::sync::Arc<std::sync::atomic::AtomicBool>,
     suppress_temperature: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// 端点报过的上下文窗口（token），起初是 `u32::MAX`。同一个客户端（含它的克隆）此后
@@ -716,8 +715,7 @@ impl LlmClient {
         // paying the 400 again (extraction calls once per chunk).
         let mut ceiling = self.completion_ceiling.load(Ordering::Relaxed);
         let mut lowered = false;
-        // Each adjustment is tried once per call: a gateway may reinsert a
-        // rejected parameter even after we have removed it (#1232).
+        // 每种调整每次调用只试一次：网关可能把我们已删掉的参数重新加回来（#1232）。
         let mut renamed = self.use_max_completion_tokens.load(Ordering::Relaxed);
         let resp = loop {
             let limit_key = if renamed {
@@ -725,6 +723,7 @@ impl LlmClient {
             } else {
                 "max_tokens"
             };
+            // 上限归我们，不归端点的默认值（[`MAX_COMPLETION_TOKENS`]）；改字段名也不能丢掉它。
             body[limit_key] = json!(ceiling);
             let resp = self
                 .request("/chat/completions")
@@ -1351,8 +1350,7 @@ fn err_detail(body: &serde_json::Value, raw: &str) -> String {
         .unwrap_or_else(|| "unknown error".to_string())
 }
 
-/// Prefer the parameter and code; Azure may omit them and return a flat message.
-/// A generic invalid temperature is not enough to discard the caller's setting.
+/// 先认参数名和错误码；Azure 可能只给一段消息。笼统的温度无效不足以丢掉调用方的设置。
 fn says_temperature_unsupported(body: &serde_json::Value, raw: &str) -> bool {
     if let Some(parameter) = body["error"]["param"].as_str() {
         if parameter != "temperature" {
@@ -2810,7 +2808,7 @@ data: {\"choices\":[{\"delta\":{\"content\":\"tail\"},\"finish_reason\":\"stop\"
                     "param": parameter, "code": "unsupported_parameter",
                     "message": "Repeated refusal"
                 }})))
-                // A third attempt gets 404, so an unbounded retry fails promptly.
+                // 第三次会拿到 404，让没有次数上限的重试立即暴露。
                 .up_to_n_times(2)
                 .expect(2)
                 .mount(&server)
