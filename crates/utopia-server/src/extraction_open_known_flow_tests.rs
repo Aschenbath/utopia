@@ -243,13 +243,48 @@ async fn with_known_left_out_of_the_prompt_a_later_chunk_still_lands_on_the_same
     Ok(())
 }
 
-/// The first chunk leaves a cached Acme id. Rebuild deletes it while the second
-/// reply is in flight; re-extract keeps it but resets both chunks for the new job.
-async fn supersede_during_the_second_reply(rebuild: bool) -> anyhow::Result<()> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Interruption {
+    RebuildInFlight,
+    ReextractInFlight,
+    RebuildDuringApply,
+    PurgeDuringApply,
+}
+
+// facts 上的触发器 DDL 会锁整张表，两条屏障用例必须串行到清理结束。
+static FACTS_TRIGGER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// 第一块留下缓存的 Acme id；重建会删掉它，单篇重抽则保留实体、重置分块。
+/// 写入阶段的屏障放在真正的 INSERT 上，确保重建发生在 epoch 检查之后。
+async fn interrupt_the_second_chunk(interruption: Interruption) -> anyhow::Result<()> {
+    let during_apply = matches!(
+        interruption,
+        Interruption::RebuildDuringApply | Interruption::PurgeDuringApply
+    );
+    let _trigger_guard = if during_apply {
+        Some(FACTS_TRIGGER_LOCK.lock().await)
+    } else {
+        None
+    };
     let pause = Arc::new(Pause::default());
     let Some(f) = Fx::new(replies(), true, Some(pause.clone())).await? else {
         return Ok(());
     };
+    let rebuild = interruption != Interruption::ReextractInFlight;
+    let barrier = format!("pause_extraction_{}", f.doc.simple());
+    let mut gate = None;
+    let mut gate_pid = 0i32;
+    if during_apply {
+        let mut tx = f.pool.begin().await?;
+        gate_pid = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *tx)
+            .await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(1361, $1)")
+            .bind(gate_pid)
+            .execute(&mut *tx)
+            .await?;
+        gate = Some(tx);
+    }
     let run = tokio::time::timeout(Duration::from_secs(30), async {
         let extraction = crate::extraction::extract_document(&f.state, f.doc, Proposer::default());
         tokio::pin!(extraction);
@@ -260,15 +295,63 @@ async fn supersede_during_the_second_reply(rebuild: bool) -> anyhow::Result<()> 
             }
             _ = pause.arrived.notified() => {}
         }
+        if during_apply {
+            // 标识符和条件都来自本夹具的 UUID；别的知识库不会等这把锁。
+            sqlx::raw_sql(&format!(
+                "CREATE FUNCTION {barrier}() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN
+                   IF NEW.kb_id = '{}'::uuid THEN
+                     PERFORM pg_advisory_xact_lock(1361, {gate_pid});
+                   END IF;
+                   RETURN NEW;
+                 END $$;
+                 CREATE TRIGGER {barrier} BEFORE INSERT ON facts
+                 FOR EACH ROW EXECUTE FUNCTION {barrier}();",
+                f.kb
+            ))
+            .execute(&f.pool)
+            .await?;
+            pause.resume.notify_one();
+            loop {
+                let blocked: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)))",
+                )
+                .bind(gate_pid)
+                .fetch_one(&f.pool)
+                .await?;
+                if blocked {
+                    break;
+                }
+                tokio::select! {
+                    result = &mut extraction => {
+                        result?;
+                        anyhow::bail!("extraction finished before the INSERT barrier");
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+                }
+            }
+        }
         if rebuild {
             utopia_store::graph::purge_graph(&f.pool, f.kb).await?;
-            let queued = utopia_store::documents::queue_extraction(&f.pool, f.kb, None).await?;
-            anyhow::ensure!(queued == vec![f.doc], "rebuild must queue the document");
+            if interruption != Interruption::PurgeDuringApply {
+                let queued = utopia_store::documents::queue_extraction(&f.pool, f.kb, None).await?;
+                anyhow::ensure!(queued == vec![f.doc], "rebuild must queue the document");
+            }
         } else {
             utopia_store::documents::queue_extraction_one(&f.pool, f.doc).await?;
         }
+        if let Some(tx) = gate.take() {
+            tx.rollback().await?;
+        }
         pause.resume.notify_one();
-        extraction.await?;
+        let result = extraction.await;
+        if interruption == Interruption::PurgeDuringApply {
+            // 同样的外键失败，没有新 epoch 就仍是当前任务的错误，不能一律吞掉。
+            let error = result.err().ok_or_else(|| anyhow::anyhow!("current job lost its error"))?;
+            anyhow::ensure!(format!("{error:#}").contains("facts_subject_same_kb"), "{error:#}");
+            return Ok(());
+        }
+        result?;
 
         let doc = utopia_store::documents::get(&f.pool, f.doc).await?;
         anyhow::ensure!(doc.graph_status == "queued", "the new job keeps its status");
@@ -304,16 +387,36 @@ async fn supersede_during_the_second_reply(rebuild: bool) -> anyhow::Result<()> 
     })
     .await;
     pause.resume.notify_one();
+    if let Some(tx) = gate.take() {
+        tx.rollback().await?;
+    }
+    if during_apply {
+        sqlx::raw_sql(&format!(
+            "DROP TRIGGER IF EXISTS {barrier} ON facts; DROP FUNCTION IF EXISTS {barrier}();"
+        ))
+        .execute(&f.pool)
+        .await?;
+    }
     f.cleanup().await?;
     run?
 }
 
 #[tokio::test]
 async fn a_rebuild_discards_an_extraction_reply_that_is_already_in_flight() -> anyhow::Result<()> {
-    supersede_during_the_second_reply(true).await
+    interrupt_the_second_chunk(Interruption::RebuildInFlight).await
 }
 
 #[tokio::test]
 async fn reextract_discards_an_extraction_reply_that_is_already_in_flight() -> anyhow::Result<()> {
-    supersede_during_the_second_reply(false).await
+    interrupt_the_second_chunk(Interruption::ReextractInFlight).await
+}
+
+#[tokio::test]
+async fn a_rebuild_after_the_epoch_check_does_not_fail_the_superseded_job() -> anyhow::Result<()> {
+    interrupt_the_second_chunk(Interruption::RebuildDuringApply).await
+}
+
+#[tokio::test]
+async fn an_apply_error_without_a_replacement_epoch_is_still_returned() -> anyhow::Result<()> {
+    interrupt_the_second_chunk(Interruption::PurgeDuringApply).await
 }
