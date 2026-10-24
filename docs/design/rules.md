@@ -83,6 +83,8 @@ passage; derived edges are gold behind a toggle; blocked derivations are ghost e
 `list_rules` and `rule_matches`, read-only [0002, 0017, 0021]. `list_rules` includes the
 active ontology axioms, using the same inverse normalization as the reasoner; retired
 declarations are excluded even though their compiled rules remain for historical proofs.
+When `materialize_inferences` is off, the section says that derivation is off for this
+base and nothing is derived from these declarations.
 In chat and MCP, a derived fact names the property its axiom was declared on (for example,
 `inverse of works_at`), which can differ from the conclusion's property. `rule_matches`
 continues to take business rule IDs.

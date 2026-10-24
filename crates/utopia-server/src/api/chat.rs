@@ -524,10 +524,10 @@ pub(super) fn base_tools() -> serde_json::Value {
             "type": "function",
             "function": {
                 "name": "list_rules",
-                "description": "The business rules and active ontology axioms of this base. \
+                "description": "The business rules and declared ontology axioms of this base. \
                     Business rules show what each one concludes and the exact conditions it \
                     tests, thresholds included. Ontology axioms name the defining properties \
-                    and the relations they imply. Read the rule to \
+                    and the relations they imply, and say when derivation is off for this base. Read the rule to \
                     explain WHY something was concluded, or to answer \"what counts as X here\". \
                     Do not re-implement a rule's comparison yourself; ask entity_facts or \
                     rule_matches for what it actually concluded. rule_matches takes business \

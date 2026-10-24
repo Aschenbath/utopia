@@ -1515,9 +1515,8 @@ pub struct AxiomRule {
     pub target: String,
 }
 
-/// Read the declarations the compiler uses, including normalized inverse pairs.
-/// Stored rules also contain retired declarations, and new ones need not have
-/// been compiled yet; listing them must not run materialization or write rules.
+/// 读编译器采用的声明，包含补齐的逆关系对。
+/// 已存规则还保留撤销的声明，新声明则可能尚未编译；列出它们不能物化或写规则。
 pub async fn active_axiom_rules(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<AxiomRule>> {
     let mut conn = pool.acquire().await?;
     let ax = axioms(&mut conn, kb_id).await?;
@@ -1547,29 +1546,6 @@ pub async fn active_axiom_rules(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<Axi
     }
     rules.sort_by(|a, b| a.predicate.cmp(&b.predicate).then(a.kind.cmp(b.kind)));
     Ok(rules)
-}
-
-/// A proof names the property the rule was declared on, which can differ from
-/// its conclusion's property. Retired rules still explain historical facts.
-pub async fn axiom_rule_names(
-    pool: &PgPool,
-    kb_id: Uuid,
-    ids: &[Uuid],
-) -> AppResult<HashMap<Uuid, String>> {
-    if ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-    Ok(sqlx::query_as(
-        "SELECT r.id, r.kind || ' of ' || p.key
-           FROM rules r JOIN relation_types p ON p.id=r.predicate_id
-          WHERE r.kb_id=$1 AND p.kb_id=$1 AND r.id=ANY($2)",
-    )
-    .bind(kb_id)
-    .bind(ids)
-    .fetch_all(pool)
-    .await?
-    .into_iter()
-    .collect())
 }
 
 /// 取边时一并拿回来的随行信息（精度与置信度，落库要用）。
@@ -3177,6 +3153,7 @@ pub async fn blocked_proof(
 }
 
 /// 按 id 取一条派生（失效的也取：证明要能回看）。
+/// 公理名字取声明它的谓词，不取结论谓词；撤销的公理也仍要能解释历史事实。
 async fn derived_one(
     pool: &PgPool,
     kb_id: Uuid,
@@ -3193,7 +3170,7 @@ async fn derived_one(
                          d.object_value #>> '{}') AS object,
                 r.label AS predicate,
                 COALESCE(ru.kind, 'business') AS rule,
-                ar.name AS rule_name,
+                COALESCE(ar.name, ru.kind || ' of ' || rp.key) AS rule_name,
                 v.seq AS rule_version, v.definition AS rule_definition,
                 d.valid_from, d.valid_to, d.confidence, d.derived_at,
                 COALESCE(
@@ -3217,6 +3194,8 @@ async fn derived_one(
            LEFT JOIN entities o ON o.id = d.object_id
            JOIN relation_types r ON r.id = d.predicate_id
            LEFT JOIN rules ru ON ru.id = d.rule_id
+           LEFT JOIN relation_types rp ON rp.id = ru.predicate_id
+                AND rp.kb_id = d.kb_id AND ru.kb_id = d.kb_id
            LEFT JOIN attribute_rules ar ON ar.id = d.attribute_rule_id
            LEFT JOIN attribute_rule_versions v ON v.id = d.attribute_rule_version_id
            LEFT JOIN entity_types ct ON ct.id = ar.conclude_type_id
@@ -3260,7 +3239,7 @@ pub async fn derived_for_entity(
                          d.object_value #>> '{{}}') AS object,
                 r.label AS predicate,
                 COALESCE(ru.kind, 'business') AS rule,
-                ar.name AS rule_name,
+                COALESCE(ar.name, ru.kind || ' of ' || rp.key) AS rule_name,
                 v.seq AS rule_version, v.definition AS rule_definition,
                 d.valid_from, d.valid_to, d.confidence, d.derived_at,
                 COALESCE(
@@ -3284,6 +3263,8 @@ pub async fn derived_for_entity(
            LEFT JOIN entities o ON o.id = d.object_id
            JOIN relation_types r ON r.id = d.predicate_id
            LEFT JOIN rules ru ON ru.id = d.rule_id
+           LEFT JOIN relation_types rp ON rp.id = ru.predicate_id
+                AND rp.kb_id = d.kb_id AND ru.kb_id = d.kb_id
            LEFT JOIN attribute_rules ar ON ar.id = d.attribute_rule_id
            LEFT JOIN attribute_rule_versions v ON v.id = d.attribute_rule_version_id
            LEFT JOIN entity_types ct ON ct.id = ar.conclude_type_id

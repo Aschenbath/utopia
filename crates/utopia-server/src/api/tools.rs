@@ -682,7 +682,21 @@ pub async fn list_rules(ctx: &ToolCtx<'_>) -> ToolResult {
         text = "This base has no business rules.".to_string();
     }
     if !axioms.is_empty() {
-        text.push_str("\n\nOntology axioms (from property declarations):\n");
+        // 声明存在不等于本库正在据此派生；关闭开关时仍列定义，但必须说明没有执行。
+        let Ok(kb) = utopia_store::kbs::get(&ctx.state.pool, ctx.kb_id).await else {
+            return ToolResult::new(
+                "Could not read the rules.".to_string(),
+                Step::new("tool", "list_rules", "failed")
+                    .status("failed")
+                    .json(),
+            )
+            .error();
+        };
+        text.push_str(if kb.materialize_inferences {
+            "\n\nOntology axioms (from property declarations):\n"
+        } else {
+            "\n\nOntology axioms (derivation is off for this base; nothing is derived from these):\n"
+        });
         let lines: Vec<_> = axioms
             .iter()
             .map(|a| {

@@ -2553,12 +2553,15 @@ async fn rule_reads_include_active_ontology_axioms_without_compiling_them() -> a
         assert_eq!(listed["isError"], false);
         let text = listed["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("Weight rule"), "{text}");
-        assert!(text.contains("Ontology axioms"), "{text}");
+        assert!(
+            text.contains("Ontology axioms (from property declarations):"),
+            "{text}"
+        );
         for line in expected {
             assert!(text.contains(line), "{line} missing from {text}");
         }
         assert!(!text.contains("foreign_axiom"), "{text}");
-        // The fixture retains an old symmetric rule whose declaration is gone.
+        // 夹具保留了一条旧对称规则，但它的声明已经撤销，不能把历史规则列成现行公理。
         assert!(!text.contains("symmetric of works_for"), "{text}");
         step_has(
             &step_of(&f, &[], "list_rules", json!({})).await,
@@ -2590,6 +2593,44 @@ async fn rule_reads_include_active_ontology_axioms_without_compiling_them() -> a
         assert_eq!(
             empty["content"][0]["text"],
             "This base has no business rules or active ontology axioms."
+        );
+        Ok(())
+    }
+    .await;
+    f.clean().await?;
+    result
+}
+
+#[tokio::test]
+async fn rule_reads_mark_axioms_as_inactive_when_derivation_is_off() -> anyhow::Result<()> {
+    let Some(f) = Fixture::new().await? else {
+        return Ok(());
+    };
+    let result: anyhow::Result<()> = async {
+        sqlx::query("UPDATE knowledge_bases SET materialize_inferences=false WHERE id=$1")
+            .bind(f.kb)
+            .execute(&f.state.pool)
+            .await?;
+        sqlx::query(
+            "UPDATE relation_types SET is_transitive=true WHERE kb_id=$1 AND key='works_for'",
+        )
+        .bind(f.kb)
+        .execute(&f.state.pool)
+        .await?;
+        let listed = f.call("list_rules", json!({})).await?;
+        assert_eq!(listed["isError"], false);
+        let text = listed["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains(
+                "Ontology axioms (derivation is off for this base; nothing is derived from these):"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "transitive of works_for: X works_for Y AND Y works_for Z ⇒ X works_for Z"
+            ),
+            "{text}"
         );
         Ok(())
     }
@@ -2647,6 +2688,11 @@ async fn derived_axioms_name_the_source_property_even_after_retirement() -> anyh
                 text.contains("Acme · employs · Alice [rule: inverse of works_for]"),
                 "{text}"
             );
+            assert!(response["structuredContent"]["derived_facts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|d| d["predicate"] == "employs" && d["rule_name"] == "inverse of works_for"));
         }
         Ok(())
     }

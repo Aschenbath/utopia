@@ -1347,7 +1347,8 @@ pub struct DerivedFactView {
     pub predicate: String,
     /// transitive | symmetric | inverse | sub_property，或 `business`（业务规则）
     pub rule: String,
-    /// 业务规则的名字。公理推的为 None——公理没有名字，`rule` 那一列就是它的全部身份
+    /// 业务规则的名字，或公理的种类及声明谓词（如 `inverse of works_for`）。
+    /// 逆关系等公理的声明谓词可以不同于结论谓词，不能拿结论的谓词来充当解释。
     pub rule_name: Option<String>,
     /// 凭业务规则定义的哪一版推出的（0060），和那一版的定义本身。公理推的为 None
     pub rule_version: Option<i32>,
