@@ -181,6 +181,13 @@ impl Source {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(true)
     }
+
+    /// statements 来源的 config 写了 `{"names": "identity"}`：它推来的每个名字各指一个
+    /// 确定的东西（0071），按字面归并、不算名字向量。其余来源照旧。
+    pub fn names_are_identities(&self) -> bool {
+        self.kind == "statements"
+            && self.config.get("names").and_then(serde_json::Value::as_str) == Some("identity")
+    }
 }
 
 #[cfg(test)]
@@ -216,6 +223,25 @@ mod source_extracts_tests {
         assert!(with(serde_json::json!({ "extract": "no" })).extracts());
         assert!(with(serde_json::json!({ "extract": 0 })).extracts());
         assert!(!with(serde_json::json!({ "extract": false })).extracts());
+    }
+
+    fn of_kind(kind: &str, config: serde_json::Value) -> Source {
+        Source {
+            kind: kind.into(),
+            ..with(config)
+        }
+    }
+
+    #[test]
+    fn only_a_statements_source_with_the_string_identity_has_identity_names() {
+        let identity = serde_json::json!({ "names": "identity" });
+        assert!(of_kind("statements", identity.clone()).names_are_identities());
+        assert!(!of_kind("api", identity).names_are_identities());
+        assert!(!of_kind("statements", serde_json::json!({})).names_are_identities());
+        assert!(!of_kind("statements", serde_json::json!({ "names": true })).names_are_identities());
+        assert!(
+            !of_kind("statements", serde_json::json!({ "names": "prose" })).names_are_identities()
+        );
     }
 }
 
@@ -272,6 +298,8 @@ pub enum SourceKind {
     Rss,
     GithubIssues,
     GithubRepo,
+    /// gitlab.com 项目默认分支的文件（#1327）；自建 GitLab 没有验证过
+    GitlabRepo,
     JiraIssues,
     S3,
     AzureBlob,
@@ -939,6 +967,9 @@ pub struct GraphChange {
     pub predicate_label: Option<String>,
     pub object_name: Option<String>,
     pub object_value: Option<serde_json::Value>,
+    /// corrected 事件的前值，来自 supersedes 指向的行；那次断言可能在查询窗口之外。
+    pub previous_object_name: Option<String>,
+    pub previous_object_value: Option<serde_json::Value>,
     /// 这条断言说的是**世界轴**上的哪一段——与 `at` 正交，别读混
     pub valid_from: Option<DateTime<Utc>>,
     pub valid_to: Option<DateTime<Utc>>,
@@ -1347,7 +1378,8 @@ pub struct DerivedFactView {
     pub predicate: String,
     /// transitive | symmetric | inverse | sub_property，或 `business`（业务规则）
     pub rule: String,
-    /// 业务规则的名字。公理推的为 None——公理没有名字，`rule` 那一列就是它的全部身份
+    /// 业务规则的名字，或公理的种类及声明谓词（如 `inverse of works_for`）。
+    /// 逆关系等公理的声明谓词可以不同于结论谓词，不能拿结论的谓词来充当解释。
     pub rule_name: Option<String>,
     /// 凭业务规则定义的哪一版推出的（0060），和那一版的定义本身。公理推的为 None
     pub rule_version: Option<i32>,
