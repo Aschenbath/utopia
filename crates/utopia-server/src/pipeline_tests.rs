@@ -362,8 +362,8 @@ async fn a_large_statements_payload_is_searchable_without_embedding() -> anyhow:
         .mount(&f.server)
         .await;
 
-    // Still within the push route's 64 KiB limit, but over a typical embedding
-    // model's token limit. The complete contract must reach extraction (#1375).
+    // 保持在 push 路由 64 KiB 上限以内，同时超过常见 embedding 模型的输入上限。
+    // 完整契约必须能进入确定性抽取，不能先被 embedding 拦住（#1375）。
     let payload = serde_json::json!({
         "external_id": "large-observation",
         "e": [["cup-7", "cup", true], ["kitchen table", "table", true]],

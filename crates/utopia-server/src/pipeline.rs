@@ -228,8 +228,8 @@ async fn run(state: &AppState, input: &ProcessingInput) -> anyhow::Result<()> {
     tokio::task::spawn_blocking(move || search.reindex_document(&kb, &did, &chunk_pairs)).await??;
 
     // 4. embedding（工作区配置了 embedding 模型才做；没配也算 ready，先享受 BM25 搜索）
-    // A statements chunk is the complete JSON contract; embedding it can exceed
-    // the model's input limit and block deterministic extraction (#1375).
+    // statements 单块保留完整 JSON 契约，可能超过 embedding 模型的输入上限；
+    // 确定性抽取不应因此被阻塞（#1375）。
     if !pushed_statements {
         if let Some((settings, client)) = embedder(settings.as_ref()) {
             if !documents::set_status_if_current(&state.pool, input, "embedding").await? {
