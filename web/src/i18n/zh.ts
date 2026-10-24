@@ -49,6 +49,8 @@ export const zh: Strings = {
     docsUrl: "https://utopia.bi/docs",
   },
   err: {
+    bad_case_expectation: "请选择属性及方向，或选择预期无绑定。",
+
     bad_email: "这看起来不像一个邮箱地址。",
     password_too_short: "密码至少 8 位。",
     bad_display_name: "显示名需要 1–64 个字符。",
@@ -534,6 +536,7 @@ export const zh: Strings = {
       phrase_is_value: "已保留，但短语就是那个值",
       phrase_is_subject: "已保留，但短语就是主语的名字",
       object_is_value: "已保留，宾语按值记下",
+      attr_datatype: "已保留为开放陈述，但值按属性声明的类型读不出来",
     },
     reExtractSource: "重新抽取",
     reExtractTitle: "重新抽取这个来源？",
@@ -580,6 +583,7 @@ export const zh: Strings = {
       custom: "自定义",
       github_issues: "GitHub 工单",
       github_repo: "GitHub 仓库文件",
+      gitlab_repo: "GitLab 项目文件",
       jira_issues: "Jira 工单",
       s3: "S3 / MinIO",
       azure_blob: "Azure Blob",
@@ -601,6 +605,9 @@ export const zh: Strings = {
       github_repo:
         "读取一个仓库默认分支上的 markdown 文件。每个文件成为一篇文档，" +
         "日期取最后一次改动它的提交；没变的文件不会重抓。",
+      gitlab_repo:
+        "读取一个 gitlab.com 项目默认分支上的 markdown 文件，做法与 GitHub 仓库文件相同。" +
+        "私有项目要一个带 read_api 的令牌。自建 GitLab 没有验证过。",
       s3:
         "从 S3 桶里读文档，或者任何说同一套协议的东西（MinIO、Ceph、R2）。" +
         "**端点留空就是 AWS**，填了就是自建。每个对象成为一篇文档，" +
@@ -674,6 +681,7 @@ export const zh: Strings = {
     rssHydrationCounts: (c: { pending: number; queued: number; retrying: number; complete: number; terminal: number }) =>
       `待处理 ${c.pending} · 排队 ${c.queued} · 重试 ${c.retrying} · 完成 ${c.complete} · 终止 ${c.terminal}`,
     repoField: "仓库（owner/name）",
+    gitlabProjectField: "项目（group/name，可带子组）",
     jiraUrlField: "Jira 地址",
     jiraProjectField: "项目 key",
     s3BucketField: "桶名",
@@ -692,9 +700,10 @@ export const zh: Strings = {
     notionTokenField: "内部集成令牌",
     notionQueryField: "搜索词（可选——留空则取全部已分享页面）",
     tokenField: "GitHub 令牌（可选，不再显示）",
+    gitlabTokenField: "带 read_api 的 GitLab 令牌（可选，不再显示）",
     includePullRequests: "把 PR 也当工单收进来",
-    includeGlobsField: "包含的 glob（逗号分隔，可选）",
-    excludeGlobsField: "排除的 glob（逗号分隔，可选）",
+    includeGlobsField: "包含的 glob（逗号分隔，可选；填了就替换默认值）",
+    excludeGlobsField: "排除的 glob（逗号分隔，可选；填了就替换默认值）",
     interval: "同步计划",
     intervalManual: "仅手动",
     intervalEvery: (m: number) =>
@@ -1057,7 +1066,8 @@ export const zh: Strings = {
       openRegHint: "关闭后注册表单不再开放，只有管理员能在此创建账户。",
       workers: "后台工作线程",
       workersHint:
-        "同时运行的任务数的外层上限（1–256），作用是防止工作无限堆积。" +
+        "最多同时运行多少个模型任务（抽取、消解，1–256），另有两个名额保留给同步这类入库任务：" +
+        "它们不调模型，所以不必排在模型任务后面。这是防止工作无限堆积的外层上限；" +
         "真正的节流是下面的按模型上限，所以这个数留得比它们之和宽裕些。即时生效。",
       workersApply: "应用",
       modelConcurrency: "模型并发",
@@ -1157,6 +1167,12 @@ export const zh: Strings = {
       packsPick: "搜索本体包…",
       packsNone: "不选 —— 本体从文档里长出来",
       packsCount: (c: number, p: number) => `${c} 个类 · ${p} 个属性`,
+      scenariosLabel: "场景包",
+      scenariosHint: "按业务场景预置的类、属性和要回答的问题，建出来就是这个库自己的本体。可不选。",
+      scenariosPick: "搜索场景…",
+      scenariosNone: "不选 —— 之后在本体页手工建",
+      scenariosCount: (c: number, p: number, q: number) =>
+        `${c} 个类 · ${p} 个属性 · ${q} 个问题`,
       name: "名称",
       description: "描述",
       visibility: "可见性",
@@ -1186,6 +1202,15 @@ export const zh: Strings = {
     chatLabel: "对话",
     embedLabel: "向量",
     ok: (reply: string) => `已连通，认证通过（${reply}）`,
+    /** 任务发出的每种请求各一行（#1354） */
+    chatShapes: {
+      plain: "普通请求",
+      streaming: "流式、温度 0、带完成上限（抽取）",
+      tools: "带一个工具（对话、第二眼）",
+    },
+    chatShapeOk: "通过",
+    chatShapeRefused: (error: string) => `被拒：${error}`,
+    chatShapeTimedOut: (error: string) => `超时（${error}）`,
     okDim: (dim: number) => `已连通，认证通过（维度 ${dim}）`,
     unsaved: "有未保存的修改。先保存这张卡，再测试。",
     readersTitle: "读扫描件与录音",
@@ -1233,7 +1258,11 @@ export const zh: Strings = {
     caseHideEvidence: "收起原文证据",
     caseMake: "添加回归案例",
     caseAddTitle: "添加属性回归案例",
-    caseAddHint: "保存这条开放陈述应绑定的属性及方向，再将已有的对齐决定与此预期比较。",
+    caseExpectBound: "绑定到属性",
+    caseNoneHint: "只有明确判为无绑定才通过。未定或已绑定均失败；尚无判定时保持未检查。",
+    caseHumanConflict: "失败：与人工绑定冲突",
+    caseHumanConflictHint: "此案例预期无绑定，但人已将陈述绑定到属性。案例失败，正式人工绑定保留。",
+    caseAddHint: "保存这条开放陈述应绑定到属性，还是保持无绑定，再将对齐决定与此预期比较。",
     caseExpectedProperty: "预期属性",
     caseDirection: "方向",
     caseForward: "主语 → 宾语",

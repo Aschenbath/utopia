@@ -140,6 +140,7 @@ pub fn router(state: AppState, cfg: &AppConfig) -> Router {
         .route("/workspaces/{id}/kbs", get(kbs::list).post(kbs::create))
         // 建库界面用的静态清单，与具体工作区无关
         .route("/ontology-packs", get(kbs::list_packs))
+        .route("/scenario-packs", get(kbs::list_scenario_packs))
         .route("/workspaces/{id}/my-kbs", get(kbs::my_kbs))
         .route(
             "/workspaces/{id}/settings",
@@ -473,6 +474,11 @@ pub fn router(state: AppState, cfg: &AppConfig) -> Router {
         .route(
             "/kbs/{id}/sources/{source_id}/runs",
             get(sources_routes::runs),
+        )
+        // 按推送时的 external_id 读回文档（#1276）：id 里可能有 `/`，所以走查询参数
+        .route(
+            "/kbs/{id}/sources/{source_id}/documents/by-external-id",
+            get(documents_routes::by_external_id),
         )
         .route(
             "/kbs/{id}/sources/{source_id}/re-extract",

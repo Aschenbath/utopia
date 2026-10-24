@@ -153,12 +153,49 @@ Content-Type: application/json
 
 Any other key is refused with `422`, so a mistaken `predicate` or `class` field cannot pass as a typed fact: the contract has no slot for one. A `subject`, or the entity of an `n` row, that is not listed in `e` is refused the same way, rather than dropped later in silence. A body over 64 KiB or with more than 200 statements is refused too.
 
+If every name your system pushes is already unique, such as `owner/repo:src/a.ts#parseDate`, set `{"names": "identity"}` in the source's config. A name from that source attaches to the entity with the same name (ignoring case, in the same class or none) and is created when there is none, whatever the surrounding text. It gets no name vector, so it queues no near-name pairs. A name that exists only under another class is created in this source's class, and still queues the type-drift review unless the two classes are declared disjoint.
+
 Two things to know before wiring a system to it:
 
 - **Send events, not state.** A row that *is* the current state of a system belongs on a mounted database, read at query time. Pushing it here copies state into the ledger and the two drift.
 - **A new push under the same identity does not close the old statement.** The earlier one becomes stale and goes to review; deciding that an interval ended is done on the typed layer, by alignment and the temporal engine, not by the push.
 
 The response is the API push's: `{ "action": "created" }` · `updated` · `unchanged` · `marked_missing` · `duplicate` (with `duplicate_of`). It is never `moved`: the stored document carries its `external_id`, so two identities never share content.
+
+---
+
+## Reading a pushed document back
+
+An API or Statements source's document can be read back by the identity it was pushed under: its `external_id`, or for an API push without one, its `filename`. The identity goes in the query string, URL-encoded, so it may contain `/`.
+
+```
+GET {your-utopia-base}/api/v1/kbs/{kb_id}/sources/{source_id}/documents/by-external-id?external_id=note-42
+Authorization: Bearer utp_pat_…
+```
+
+The credential is a personal access token (or a signed-in session) of someone who can view the base; a token limited to other bases gets `404`. The source's push token is **not** accepted here, so a leaked push token can only push.
+
+```json
+{
+  "id": "0199…",
+  "external_id": "note-42",
+  "filename": "runbook.md",
+  "mime": "text/plain",
+  "sha256": "9f2c…",
+  "size_bytes": 57,
+  "status": "ready",
+  "doc_time": "2026-08-20T09:00:00Z",
+  "updated_at": "2026-08-20T09:00:04Z",
+  "version": 2,
+  "content": "# Runbook v2 …",
+  "versions": [
+    { "version": 1, "sha256": "41aa…", "size_bytes": 54, "ingested_at": "2026-08-19T10:00:00Z" },
+    { "version": 2, "sha256": "9f2c…", "size_bytes": 57, "ingested_at": "2026-08-20T09:00:04Z" }
+  ]
+}
+```
+
+`content` is the current version's text; older versions are at `GET /api/v1/documents/{id}/content?version=N`. An identity marked "Not in source", a document in the trash or purged, and an identity this source never pushed are all `404`.
 
 ---
 
