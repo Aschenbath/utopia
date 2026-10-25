@@ -1864,6 +1864,7 @@ export const zh: Strings = {
       escalate_unsure: "裁决的把握不够",
       escalate_sample: "抽给人看的一份；裁决器本有把握",
       escalate_impact: "留给人；这次合并不会只留在图里",
+      escalate_identity: "留给人；来源把一侧的名字声明为身份标识",
       proposed: "agent 看过了，留了一条建议",
       governed: "agent 按先例裁的",
       namesake: "同一篇文档里有两个同名实体",

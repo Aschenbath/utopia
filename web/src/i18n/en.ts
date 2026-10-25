@@ -2136,6 +2136,8 @@ export const en = {
       escalate_sample: "Sampled for a person; the adjudicator was confident",
       /* 执行闸门（0027）：合并会立刻送出图外的东西，把握再高也留给人 */
       escalate_impact: "Held for a person; the merge would not stay in the graph",
+      escalate_identity:
+        "Held for a person; a source treats one side's names as identifiers",
       proposed: "The agent looked and left a proposal",
       governed: "Decided by the agent from precedent",
       namesake: "Two entities with this name in one document",
