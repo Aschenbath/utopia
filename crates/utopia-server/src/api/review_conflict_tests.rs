@@ -153,6 +153,21 @@ async fn human_conflict_dates_and_settlement_commit_with_the_actor() -> anyhow::
              WHERE c.id=$1 AND a.action='conflict.retime_new'")
             .bind(conflict).fetch_one(&pool).await?;
         assert_eq!((resolution.as_str(), actor, &detail["new_from_precision"]), ("retimed_new", editor, &json!("month")));
+        // 实体历史把重定时那一行记在人头上，不记给引擎
+        let subject: Uuid = sqlx::query_scalar("SELECT subject_id FROM facts WHERE id=$1")
+            .bind(new).fetch_one(&pool).await?;
+        let retimed: Uuid = sqlx::query_scalar("SELECT id FROM facts WHERE supersedes=$1 AND invalidated_at IS NULL")
+            .bind(new).fetch_one(&pool).await?;
+        let (history, _) = utopia_store::graph::entity_history(&pool, kb, subject, 50, 0).await?;
+        for event in history.iter().filter(|e| e.kind == "corrected") {
+            if event.fact_id == Some(retimed) {
+                assert_eq!((event.actor_name.as_deref(), event.action.as_deref()),
+                    (Some("editor"), Some("conflict.retime_new")));
+            } else {
+                assert_ne!(event.action.as_deref(), Some("conflict.retime_new"));
+            }
+        }
+        assert!(history.iter().any(|e| e.kind == "corrected" && e.fact_id == Some(retimed)));
 
         for explicit in [false, true] {
             let (old, _, c) = pair(&pool, kb, predicate, false).await?;
