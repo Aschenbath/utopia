@@ -25,6 +25,8 @@
 //! - `a_due_base_is_queued_once`：`queue_due_inferences` 扫全库到期的库。0050 起新建的库开着
 //!   推理又从没推过，别的测试刚建的库全算到期，会被它排上推理任务——数自己库任务的测试
 //!   （比如 lib 单元测试里的 `phrase_bindings_delivery_tests`）就会多数出一个。
+//! - `a_sync_runs_while_model_work_holds_every_slot`：同样起真实的 `run_worker`，同样会认领
+//!   库里任何排队任务，不是自己的就报错。
 //!
 //! 新加测试默认放这个目录；只有碰上面那类全局状态时才放顶层，并在这里补一行为什么。
 mod a_batch_decides_like_a_person;
@@ -117,6 +119,7 @@ mod an_end_date_closes_the_open_span;
 mod an_event_holds_at_the_moment_it_names;
 mod an_exploration_says_what_it_covered;
 mod an_export_carries_the_whole_ledger;
+mod an_identity_name_attaches_by_its_exact_name;
 mod an_instance_list_names_what_a_type_lacks;
 mod an_open_statement_keeps_the_documents_words;
 mod an_sso_login_finds_or_opens_its_account;
@@ -149,6 +152,7 @@ mod negative_binding_definition_edit;
 mod no_predicate_still_shows;
 mod ontology_regressions;
 mod phrase_signature_evidence;
+mod rejecting_a_statement_retires_its_typed_row;
 mod review_stages;
 mod rss_full_content;
 mod rss_ledger_contract;
