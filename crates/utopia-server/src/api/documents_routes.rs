@@ -85,12 +85,13 @@ pub(crate) async fn require_reader_kb(
     state: &AppState,
     reader: &SessionOrToken,
     kb_id: Uuid,
-) -> ApiResult<()> {
-    utopia_store::access::require_kb(&state.pool, &reader.user, kb_id, Role::Viewer).await?;
+) -> ApiResult<utopia_core::models::KnowledgeBase> {
+    let kb =
+        utopia_store::access::require_kb(&state.pool, &reader.user, kb_id, Role::Viewer).await?;
     if !reader.reaches(kb_id) {
         return Err(AppError::NotFound.into());
     }
-    Ok(())
+    Ok(kb)
 }
 
 /// Serve the retained original named by the document ledger.
@@ -226,11 +227,11 @@ pub async fn by_external_id(
 ) -> ApiResult<Response> {
     require_reader_kb(&state, &reader, kb_id).await?;
     let source = super::sources_routes::source_in_kb(&state, kb_id, source_id).await?;
-    if !super::sources_routes::is_push_kind(&source.kind) {
+    if !crate::pushed_keys::is_push_kind(&source.kind) {
         return Err(AppError::NotFound.into());
     }
     let external_id = query.external_id.trim();
-    let key = super::sources_routes::pushed_key(&source, external_id);
+    let key = crate::pushed_keys::pushed_key(&source, external_id);
     let found = utopia_store::documents::find_by_external_key(&state.pool, source.id, &key)
         .await?
         .ok_or(AppError::NotFound)?;
@@ -448,11 +449,11 @@ pub async fn detail(
 /// 反向证据链：文档各分块抽出的事实（文档查看器右栏）。
 pub async fn extractions(
     State(state): State<AppState>,
-    AuthUser(user): AuthUser,
+    reader: SessionOrToken,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let doc = utopia_store::documents::get(&state.pool, id).await?;
-    utopia_store::access::require_kb(&state.pool, &user, doc.kb_id, Role::Viewer).await?;
+    require_reader_kb(&state, &reader, doc.kb_id).await?;
     let facts = utopia_store::graph::document_extractions(&state.pool, id).await?;
     Ok(Json(json!({ "facts": facts })))
 }

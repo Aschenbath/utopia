@@ -67,7 +67,7 @@ async fn an_upgrade_reindexes_already_queued_materialization() -> anyhow::Result
         let mut upgrade = PgConnection::connect(&url).await?;
         sqlx::raw_sql(&format!(
             "SET search_path TO {schema}; {}",
-            include_str!("../../../migrations/0118_human_phrase_materialization_is_intake.sql")
+            include_str!("../../../migrations/0123_human_phrase_materialization_is_intake.sql")
         ))
         .execute(&mut upgrade)
         .await?;
