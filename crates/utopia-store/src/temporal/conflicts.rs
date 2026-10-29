@@ -21,7 +21,7 @@ pub async fn resolve_review_conflict(
     resolve(pool, kb_id, conflict_id, decision, Some(actor_id)).await
 }
 
-/// Retain the store entry point used by existing human-review callers.
+/// 不记操作者的入口：只有 store 的测试在用，人工审核走 [`resolve_review_conflict`]。
 pub async fn resolve_conflict(
     pool: &PgPool,
     kb_id: Uuid,
@@ -53,9 +53,11 @@ async fn resolve(
     decision: ConflictDecision<'_>,
     actor_id: Option<Uuid>,
 ) -> AppResult<()> {
-    let action = match decision.action {
-        "close" => "close_old",
-        "retime_new" | "keep" | "reject_new" => decision.action,
+    let (action, event) = match decision.action {
+        "close" => ("close_old", "conflict.close_old"),
+        "retime_new" => ("retime_new", "conflict.retime_new"),
+        "keep" => ("keep", "conflict.keep_both"),
+        "reject_new" => ("reject_new", "conflict.reject_new"),
         other => return Err(AppError::Validation(format!("Unknown resolution: {other}"))),
     };
     for precision in [decision.close_precision, decision.new_precision] {
@@ -118,6 +120,9 @@ async fn resolve(
     ).bind(old).bind(new).fetch_one(&mut *tx).await?;
     let stored = match action {
         "close_old" => {
+            // 闭合点带着它的精度走：人给了日期就用人给的精度，没给就闭合在新事实的
+            // 起点——那个起点是几月还是几号，闭合点就是几月还是几号。从前一律写 day，
+            // 「2023 年 6 月接任」把前任闭合成了 6 月 1 日
             let (at, precision) = match decision.close_at {
                 Some(at) => (at, decision.close_precision),
                 None => (
@@ -180,12 +185,7 @@ async fn resolve(
         &mut tx,
         Some(kb_id),
         actor_id,
-        match action {
-            "close_old" => "conflict.close_old",
-            "retime_new" => "conflict.retime_new",
-            "keep" => "conflict.keep_both",
-            _ => "conflict.reject_new",
-        },
+        event,
         "conflict",
         Some(conflict_id),
         detail,
