@@ -1,6 +1,6 @@
 # 0071 · A source may declare its names identities
 
-- **Status**: Implemented · 2026-10-25 · #1333, #1390, [#1248](https://github.com/deeplethe/utopia/issues/1248) · open: none
+- **Status**: Implemented · 2026-10-25 · #1333, #1390, #1425 · open: none
 - **Written**: 2026-10-19 (conventions in the [README](README.md))
 - **Related**: [0054](0054-a-source-may-push-statements-in-the-open-contract.md) decision 3 sends pushed statements down the same resolution path as prose, and this record narrows that for one kind of source; [0041](0041-a-name-is-a-claim-about-an-entity.md) owns name facts and name-vector recall; [#1248](https://github.com/deeplethe/utopia/issues/1248) meets the same problem from the merge side and is decided here as decision 7; [#1296](https://github.com/deeplethe/utopia/issues/1296) measured what the recall costs; [#1308](https://github.com/deeplethe/utopia/pull/1308) is the disjointness fix that stands on its own
 

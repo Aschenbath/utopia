@@ -66,7 +66,7 @@ async fn decide_pair(
         .execute(&pool)
         .await?;
 
-        // An alias, with mixed prose/identity evidence, must protect either side.
+        // 别名同样算数，证据里散文和标识混在一起也算：名字带标识的是哪一侧都得拦下
         let named = if governance { left } else { right };
         for evidence in [prose_chunk, chunk] {
             utopia_store::names::record(
@@ -168,7 +168,7 @@ async fn decide_pair(
             }
         }
         if held && !governance {
-            // A stored model verdict must consult the source again when replayed.
+            // 缓存的模型判决重放时也得再查一次来源，不能直接沿用
             sqlx::query("UPDATE resolution_reviews SET stage='adjudicating' WHERE id=$1")
                 .bind(review)
                 .execute(&pool)
@@ -185,7 +185,7 @@ async fn decide_pair(
             );
             assert_eq!(server.received_requests().await.unwrap().len(), calls);
 
-            // Turning the declaration off releases the cached verdict without another model call.
+            // 关掉声明后，缓存的判决直接放行，不再调用模型
             sqlx::query("UPDATE sources SET config='{}'::jsonb WHERE id=$1")
                 .bind(source)
                 .execute(&pool)
