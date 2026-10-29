@@ -62,12 +62,7 @@ impl SearchIndex {
             .register(JIEBA, tantivy_jieba::JiebaTokenizer::new());
 
         let writer = index.writer(WRITER_HEAP)?;
-        // Every write reloads under the writer lock. An asynchronous reload can
-        // finish later with an older commit and hide a document just indexed.
-        let reader = index
-            .reader_builder()
-            .reload_policy(tantivy::ReloadPolicy::Manual)
-            .try_into()?;
+        let reader = index.reader()?;
         let analyzer = index
             .tokenizers()
             .get(JIEBA)
