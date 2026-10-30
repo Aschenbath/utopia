@@ -73,7 +73,8 @@ const initial: Kb = {
   id: "kb-a", workspace_id: "workspace", name: "Research", kind: "general",
   description: "Original description", visibility: "open", is_default: false,
   auto_extend_ontology: false, materialize_inferences: false,
-  auto_type_resolution: false, governance: false, governance_since: null,
+  auto_type_resolution: false,
+  auto_confirm_mappings: false, governance: false, governance_since: null,
   inference_interval_minutes: 60, last_inference_at: null, ontology_lang: "en",
 };
 let server: Kb;

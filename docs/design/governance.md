@@ -18,6 +18,12 @@ on their own page [0011, 0015, 0017, 0025]. Every human decision is a ledger eve
 (`review.merge`, `review.keep`, `merge.revert`, `fact.*`, `conflict.*`) and may carry a `rationale`,
 asked as "What told you?", optional, written as `why` on the event [0026].
 
+**Mappings are outside the governor.** A concept mapping is configuration, not a claim in the
+graph [0011], so automatic confirmation has its own switch (`auto_confirm_mappings`, default off)
+and neither an `agent_decisions` row nor a fuse. It keeps the record and the way back: each write
+commits with `mapping.auto_confirmed`, and an Editor can revert one, which returns it to pending
+and out of exploration's reach [0011, #504].
+
 **The governor.** `knowledge_bases.governance`, on by default; the `govern` job is enqueued when the
 switch turns on, after an extraction that leaves pairs, after a person's decision, and hourly for
 backlog, at most one waiting per base; it re-reads the switch before every cluster [0025 d2]. A
@@ -106,8 +112,8 @@ for 589 pairs [0025 d10].
   `reject_new`); a date must be in the evidence and a stale fact is confirmed only by a quote in the
   current version; every action records its undo in `detail`; reverts of any kind count for the
   fuse. #725 splits the PR: the temporal fixes merge first, the conflict actions become the
-  conflicts queue, the low-confidence handling is dropped. Cut 2 (violations, defects, mappings)
-  is open.
+  conflicts queue, the low-confidence handling is dropped. Cut 2 (violations, defects) is open;
+  mappings left it [0011, #504].
 - **Queues organised by what a decision changes** [#725]: ontology proposals; alignment (a
   signature or rule the aligner cannot settle; the signature half is built, #754); time anchors (a missing or conflicting document
   date, an unanchored mention); identity (pairs evidence cannot settle, merges the gate held);

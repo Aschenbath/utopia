@@ -142,6 +142,19 @@ pub async fn revise(
     Ok(Json(json!({ "ok": true })))
 }
 
+/// 撤回一条自动确认（0011 的 #504 修订）。审计与撤回同一个事务，在 store 里写。
+pub async fn revert(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path((kb_id, mapping_id)): Path<(Uuid, Uuid)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_kb(&state, &user, kb_id, Role::Editor).await?;
+    utopia_store::mappings::revert_automatic(&state.pool, kb_id, mapping_id, user.id).await?;
+    // 它回到了待看，审阅页的计数跟着变
+    state.emit_review(kb_id);
+    Ok(Json(json!({ "ok": true })))
+}
+
 /// 一条口径的改版历史。0006 说留痕是为了答得出「上季度这个数是怎么算的」，
 /// 这是那句话的兑现处。
 pub async fn revisions(

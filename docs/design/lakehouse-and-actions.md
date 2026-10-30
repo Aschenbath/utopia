@@ -22,7 +22,12 @@ against a real cluster; Databricks and Snowflake are covered by protocol replays
 **The semantic layer.** `concept_mappings` (concept, source, table, expr, sql, unit, summary,
 status, revisions) is configuration outside the ledger with its own page, proposed by exploration
 and confirmed by a person; rerunning exploration does not erase a rejection; a Viewer reads, an
-Editor revises; chat reads confirmed mappings into its prompt, capped at 30 [0011]. A definition
+Editor revises. A base may opt into automatic confirmation at confidence ≥ 0.8 with a
+rationale and an expression or SQL (default off, #504); exploration may refresh a definition it
+confirmed but never demotes it, and human decisions and edits remain protected. An Editor can
+revert an automatic confirmation, which returns it to pending. The mappings page shows the
+decision origin and evidence; automatic writes and reverts commit with their audit events. Chat reads confirmed mappings
+into its prompt, capped at 30 [0011]. A definition
 can be written by hand (#563), and a one-page conventions document in the schema folder moved a
 bench from 2 to 14 of 18 with no code [0036]. The concept exploration used to create (`Metric` and
 `Dimension` entities with a SQL expression in a side table) is the wrong kind of thing and is to

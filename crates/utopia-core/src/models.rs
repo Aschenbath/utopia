@@ -1196,6 +1196,9 @@ pub struct KnowledgeBase {
     /// 治理开关（0025，**缺省开**，见 0050）：开着，govern 任务按先进先出过等人的
     /// 重复对，先读台账里人的先例再裁；关掉，任务在两簇之间看到就停
     pub governance: bool,
+    /// 探索提的口径够不够格自动生效（0011，#504，缺省关）。它只管往后的写入：
+    /// 关掉不撤销已生效的，要撤一条用撤回
+    pub auto_confirm_mappings: bool,
     /// 这次打开治理的时刻；保险丝只数它之后的撤回（0025 决定 9）。
     /// 新库生下来就开着治理，这一格于是等于建库的时刻（0050）
     pub governance_since: Option<DateTime<Utc>>,
@@ -1264,7 +1267,7 @@ pub struct MappingRevision {
     pub id: Uuid,
     pub before: serde_json::Value,
     /// 改的人。**裸外键 + 用户软删除**，所以归因不会因为人离职而丢；
-    /// 真被硬删过才会是 NULL
+    /// 真被硬删过，或这一版是自动确认换掉的（#504），才会是 NULL
     pub changed_by_name: Option<String>,
     pub changed_at: DateTime<Utc>,
 }
@@ -1327,6 +1330,16 @@ pub struct ConceptMapping {
     /// 人从零写的口径记写的人；探索提的为空（#562）。`decided_by` 分不出这件事——
     /// 探索提的经人确认之后同样有 decided_by
     pub written_by: Option<Uuid>,
+    /// 表态或改过这一条的人。为空不等于机器确认：评测脚本直接写的真值同样为空，
+    /// 机器确认看 `auto_confirmed_at`
+    pub decided_by: Option<Uuid>,
+    /// 模型对当前这版定义的置信度（0–1）；人一改就清空，它说的是上一版
+    pub confidence: Option<f64>,
+    /// 模型给当前这版定义的理由，随 `confidence` 一起清空
+    pub rationale: Option<String>,
+    /// 机器确认这一版的时刻；人表态、修改或撤回后清空。只有这一格非空的才能被探索
+    /// 刷新、被撤回（#504）
+    pub auto_confirmed_at: Option<DateTime<Utc>>,
 }
 
 /// 一处公理违规，配好展示所需的三元组文本（见 `axiom_violations`）。

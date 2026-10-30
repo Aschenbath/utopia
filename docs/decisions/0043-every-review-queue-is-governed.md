@@ -65,9 +65,13 @@ Agent rows for facts and conflicts carry their summary in place of two names. A 
 
 ## Open questions
 
-- **Cut 2: violations, ontology defects, concept mappings.** A violation's `fact_retracted` and `fact_closed` fit this shape. `axiom_relaxed` changes the ontology, and `fixed` for a defect means a person changed it; both need a gate before an agent applies them.
+- **Cut 2: violations, ontology defects.** Concept mappings left this cut; see Revisions. A violation's `fact_retracted` and `fact_closed` fit this shape. `axiom_relaxed` changes the ontology, and `fixed` for a defect means a person changed it; both need a gate before an agent applies them.
 - **The second look.** The fact and conflict queues have no tool loop yet (0025 decision 5); the batch sees the evidence directly. Add one when proposals keep asking for something the batch could not see.
 - **The interface.** The Agent queue shows these rows with minimal changes; the queue cards themselves don't yet show the agent's proposal inline, as duplicate cards do.
+
+## Revisions
+
+- 2026-10-30 (#504, #1332): concept mappings are exempt from decision 1 and leave cut 2. A mapping is configuration outside the graph ([0011](0011-a-mapping-is-not-a-fact.md)), and #725 already moves it off the review queues. Its automatic confirmation therefore has its own switch, like `auto_type_resolution`, and no `agent_decisions` row, precedent read or fuse. It keeps an audit event for each write and a revert. The other queues are unchanged.
 
 ## Status history
 

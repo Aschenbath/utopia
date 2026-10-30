@@ -1,6 +1,6 @@
 # 0011 · A mapping is configuration
 
-- **Status**: Implemented (#126, #140, #148) · open: the evidence chain
+- **Status**: Implemented (#126, #140, #148, #1332) · open: the evidence chain
 - **Written**: 2026-08-31 · condensed into English 2026-09-03
 - **Related**: [0009](0009-no-type-is-a-type.md) removes the builtin entity classes,
   [0010](0010-no-relation-is-no-relation.md) the fallback relation, #125 the other eight
@@ -70,6 +70,45 @@ rebuilding all three.
 
 ## Revisions
 
+- 2026-10-30 (#504, #1332): a base may opt into automatic confirmation of exploration's
+  definitions with `auto_confirm_mappings`, default off. This stays outside the governor:
+  a mapping is configuration and not a queue over the graph, so it has its own switch, as
+  `auto_type_resolution` does, and no `agent_decisions` row or fuse; 0043 and
+  `design/governance.md` carry the matching note. What it keeps from the governor's rules
+  is that every automatic decision is recorded and can be taken back.
+  - **The gate.** Exploration keeps `confidence` (0–1) and `rationale` apart from status. A
+    score of at least 0.8, a nonempty rationale and an expression or SQL are required;
+    anything less leaves the proposal waiting for a person. The threshold is an opt-in gate,
+    not a measured guarantee of correctness or a reason to turn it on by default. No
+    live-model accuracy improvement is claimed. An Editor may change the switch, because an
+    Editor may already confirm a definition; other base settings keep their Admin gate.
+  - **What marks it.** `auto_confirmed_at` is set while the current definition stands on an
+    automatic confirmation. `decided_by IS NULL` is not enough: `scripts/bench/ask.mjs`
+    seeds confirmed truth that way, and that truth must not be rewritten.
+  - **What exploration may change.** A definition no person has touched while it waits, and
+    a machine-confirmed definition when the new one passes the gate with the switch on. The
+    replaced definition goes to `concept_mapping_revisions` with no actor. Weaker evidence or
+    a switch turned off changes nothing: an effective definition is never silently demoted,
+    and turning the switch off revokes nothing. Anything a person confirmed, rejected or
+    edited, including an edit of a still-pending proposal, is out of reach. An edit clears
+    the model's evidence; the history snapshot keeps it for the preceding definition.
+  - **The revert.** `POST /kbs/{id}/mappings/{mapping_id}/revert` (Editor) takes a
+    machine-confirmed definition out of effect at once and returns it to pending under the
+    person's name, so the next exploration does not confirm it again. The definition stays
+    as it is, since the row holds one version: an older one is in the history, and a person
+    restores it by editing. Rejecting says the definition is wrong and must not return; a
+    revert says the machine should not have decided.
+  - **The record.** Each automatic write commits with `mapping.auto_confirmed` (the
+    definition and its evidence) and each revert with `mapping.auto_confirm_reverted`, so
+    a failed audit writes nothing. The upsert judges protection holding the row lock, and a
+    person's revision locks the row before taking its snapshot. Readers expose the evidence
+    and the decision's actor, and the mappings page marks automatic definitions.
+  - The gate does not answer 0036's dead end. A definition such as `sum(amt_pay)` runs, looks
+    right and can carry a high score while being off by a hundred, and a score cannot tell.
+    What bounds that here is the default-off switch, the record and the revert, not the
+    threshold.
+  - This applies to the existing concept definitions. Table-alignment adoption in 0036 and
+    the retirement of this table's role in #556 remain their own decisions.
 - 2026-09-02: the status line said "planned" while the record arrived in the same commit as
   its implementation. The status line is the implementing PR's responsibility; now a README
   rule.

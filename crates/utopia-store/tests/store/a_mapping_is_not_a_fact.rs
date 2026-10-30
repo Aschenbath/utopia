@@ -187,3 +187,456 @@ async fn a_rejected_mapping_does_not_come_back() -> anyhow::Result<()> {
         .await?;
     run
 }
+
+/// 一个打开了自动确认的库，给下面每条自动确认的性质各用一份。
+struct Auto {
+    pool: PgPool,
+    org: Uuid,
+    kb: Uuid,
+    ent: Uuid,
+}
+
+impl Auto {
+    async fn new() -> anyhow::Result<Option<Self>> {
+        let Some(url) = utopia_store::test_db::url() else {
+            return Ok(None);
+        };
+        let pool = PgPool::connect(&url).await?;
+        utopia_store::db::migrate(&pool).await?;
+        let (org, kb, ent) = fixture(&pool).await?;
+        let auto = Self { pool, org, kb, ent };
+        auto.switch(true).await?;
+        Ok(Some(auto))
+    }
+
+    async fn switch(&self, on: bool) -> anyhow::Result<()> {
+        sqlx::query("UPDATE knowledge_bases SET auto_confirm_mappings = $2 WHERE id = $1")
+            .bind(self.kb)
+            .bind(on)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn person(&self) -> anyhow::Result<Uuid> {
+        let user = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO users (id, org_id, email, display_name, password_hash)
+             VALUES ($1, $2, $1 || '@auto-map.test', 'Editor', 'unused')",
+        )
+        .bind(user)
+        .bind(self.org)
+        .execute(&self.pool)
+        .await?;
+        Ok(user)
+    }
+
+    async fn propose(
+        &self,
+        confidence: Option<f64>,
+        rationale: Option<&str>,
+        expr: Option<&str>,
+    ) -> utopia_core::AppResult<(Uuid, bool)> {
+        utopia_store::mappings::propose_with_evidence(
+            &self.pool,
+            self.kb,
+            self.ent,
+            "warehouse",
+            Some("orders"),
+            expr,
+            None,
+            None,
+            Some("Revenue"),
+            false,
+            confidence,
+            rationale,
+        )
+        .await
+    }
+
+    /// 一条过得了门槛的提议：开关开着它就直接生效。
+    async fn grounded(&self, expr: &str) -> anyhow::Result<(Uuid, bool)> {
+        Ok(self
+            .propose(Some(0.9), Some("Grounded"), Some(expr))
+            .await?)
+    }
+
+    async fn effective(&self) -> anyhow::Result<Vec<utopia_core::models::ConceptMapping>> {
+        Ok(utopia_store::mappings::confirmed(&self.pool, self.kb, 10).await?)
+    }
+
+    async fn pending(&self) -> anyhow::Result<Vec<utopia_core::models::ConceptMapping>> {
+        Ok(utopia_store::mappings::proposed(&self.pool, self.kb, 10, 0).await?)
+    }
+
+    async fn events(&self, action: &str) -> anyhow::Result<Vec<(Option<Uuid>, serde_json::Value)>> {
+        Ok(sqlx::query_as(
+            "SELECT actor_id, detail FROM audit_events WHERE kb_id = $1 AND action = $2",
+        )
+        .bind(self.kb)
+        .bind(action)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    async fn cleanup(self) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM knowledge_bases WHERE id = $1")
+            .bind(self.kb)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_base_that_has_not_opted_in_only_collects_proposals() -> anyhow::Result<()> {
+    let Some(a) = Auto::new().await? else {
+        return Ok(());
+    };
+    a.switch(false).await?;
+    a.propose(
+        Some(1.0),
+        Some("The schema states revenue"),
+        Some("SUM(amount)"),
+    )
+    .await?;
+    assert!(a.effective().await?.is_empty());
+    assert_eq!(a.pending().await?.len(), 1);
+    a.cleanup().await
+}
+
+#[tokio::test]
+async fn missing_or_invalid_evidence_leaves_a_proposal_waiting() -> anyhow::Result<()> {
+    let Some(a) = Auto::new().await? else {
+        return Ok(());
+    };
+    for (confidence, rationale, expr) in [
+        (None, Some("Grounded"), Some("SUM(amount)")),
+        (Some(0.79), Some("Grounded"), Some("SUM(amount)")),
+        (Some(f64::NAN), Some("Grounded"), Some("SUM(amount)")),
+        (Some(1.1), Some("Grounded"), Some("SUM(amount)")),
+        (Some(0.9), Some("  "), Some("SUM(amount)")),
+        (Some(0.9), Some("Grounded"), None),
+    ] {
+        a.propose(confidence, rationale, expr).await?;
+        assert!(a.effective().await?.is_empty());
+    }
+    a.cleanup().await
+}
+
+#[tokio::test]
+async fn the_threshold_itself_confirms_and_the_readers_show_its_evidence() -> anyhow::Result<()> {
+    let Some(a) = Auto::new().await? else {
+        return Ok(());
+    };
+    let (id, written) = a
+        .propose(
+            Some(0.8),
+            Some("  The schema states revenue  "),
+            Some("SUM(amount)"),
+        )
+        .await?;
+    assert!(written);
+    let auto = a.effective().await?.remove(0);
+    assert_eq!(auto.confidence, Some(0.8));
+    assert_eq!(auto.rationale.as_deref(), Some("The schema states revenue"));
+    assert_eq!(auto.decided_by, None);
+    assert!(auto.auto_confirmed_at.is_some());
+    let page = utopia_store::mappings::page(&a.pool, a.kb, None, None, 10, 0)
+        .await?
+        .0;
+    assert_eq!(page[0].rationale, auto.rationale);
+    let by_id = utopia_store::mappings::by_ids(&a.pool, a.kb, &[id]).await?;
+    assert_eq!(by_id[0].confidence, Some(0.8));
+    a.cleanup().await
+}
+
+#[tokio::test]
+async fn an_automatic_write_is_audited_with_no_actor_and_its_definition() -> anyhow::Result<()> {
+    let Some(a) = Auto::new().await? else {
+        return Ok(());
+    };
+    a.grounded("SUM(amount)").await?;
+    let events = a.events("mapping.auto_confirmed").await?;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].0, None);
+    assert_eq!(events[0].1["definition"]["expr"], "SUM(amount)");
+    assert_eq!(events[0].1["rationale"], "Grounded");
+    a.cleanup().await
+}
+
+#[tokio::test]
+async fn a_failed_audit_undoes_the_automatic_write() -> anyhow::Result<()> {
+    let Some(a) = Auto::new().await? else {
+        return Ok(());
+    };
+    a.propose(None, None, None).await?;
+    // 触发器只认这个库，别的测试可以同时跑
+    let (kb, fault) = (a.kb, format!("auto_mapping_fault_{}", a.kb.simple()));
+    sqlx::raw_sql(&format!(
+        "CREATE FUNCTION {fault}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+           IF NEW.kb_id = '{kb}' AND NEW.action = 'mapping.auto_confirmed' THEN
+             RAISE EXCEPTION 'injected mapping audit failure'; END IF; RETURN NEW; END $$;
+         CREATE TRIGGER {fault} BEFORE INSERT ON audit_events
+           FOR EACH ROW EXECUTE FUNCTION {fault}();"
+    ))
+    .execute(&a.pool)
+    .await?;
+    let failed = a.grounded("SUM(amount)").await;
+    sqlx::raw_sql(&format!(
+        "DROP TRIGGER {fault} ON audit_events; DROP FUNCTION {fault}();"
+    ))
+    .execute(&a.pool)
+    .await?;
+    assert!(failed.is_err());
+    assert!(a.effective().await?.is_empty());
+    assert_eq!(a.pending().await?[0].expr, None);
+    a.cleanup().await
+}
+
+#[tokio::test]
+async fn a_better_definition_refreshes_an_automatic_one_and_keeps_the_old() -> anyhow::Result<()> {
+    let Some(a) = Auto::new().await? else {
+        return Ok(());
+    };
+    let (id, _) = a.grounded("SUM(amount)").await?;
+    assert_eq!(a.grounded("SUM(net_amount)").await?, (id, true));
+    assert_eq!(
+        a.effective().await?[0].expr.as_deref(),
+        Some("SUM(net_amount)")
+    );
+    let revisions = utopia_store::mappings::revisions(&a.pool, a.kb, id).await?;
+    assert_eq!(revisions.len(), 1);
+    assert_eq!(revisions[0].before["expr"], "SUM(amount)");
+    assert_eq!(revisions[0].changed_by_name, None);
+    a.cleanup().await
+}
+
+#[tokio::test]
+async fn the_same_definition_again_adds_no_version() -> anyhow::Result<()> {
+    let Some(a) = Auto::new().await? else {
+        return Ok(());
+    };
+    let (id, _) = a.grounded("SUM(amount)").await?;
+    a.grounded("SUM(amount)").await?;
+    assert!(utopia_store::mappings::revisions(&a.pool, a.kb, id)
+        .await?
+        .is_empty());
+    a.cleanup().await
+}
+
+#[tokio::test]
+async fn weaker_evidence_does_not_demote_an_automatic_definition() -> anyhow::Result<()> {
+    let Some(a) = Auto::new().await? else {
+        return Ok(());
+    };
+    let (id, _) = a.grounded("SUM(amount)").await?;
+    let result = a
+        .propose(Some(0.7), Some("Uncertain"), Some("SUM(other)"))
+        .await?;
+    assert_eq!(result, (id, false));
+    let kept = a.effective().await?.remove(0);
+    assert_eq!(kept.expr.as_deref(), Some("SUM(amount)"));
+    assert_eq!(kept.confidence, Some(0.9));
+    a.cleanup().await
+}
+
+#[tokio::test]
+async fn turning_the_switch_off_neither_revokes_nor_refreshes() -> anyhow::Result<()> {
+    let Some(a) = Auto::new().await? else {
+        return Ok(());
+    };
+    let (id, _) = a.grounded("SUM(amount)").await?;
+    a.switch(false).await?;
+    assert_eq!(
+        a.effective().await?.len(),
+        1,
+        "the switch alone revokes nothing"
+    );
+    assert_eq!(a.grounded("SUM(other)").await?, (id, false));
+    assert_eq!(a.effective().await?[0].expr.as_deref(), Some("SUM(amount)"));
+    a.cleanup().await
+}
+
+/// `scripts/bench/ask.mjs` 就是这样写真值的：已确认、没有 decided_by。开关开不开都不能动它。
+#[tokio::test]
+async fn exploration_leaves_a_confirmed_row_it_did_not_confirm() -> anyhow::Result<()> {
+    let Some(a) = Auto::new().await? else {
+        return Ok(());
+    };
+    let (id, _) = a.propose(None, None, Some("SUM(truth)")).await?;
+    sqlx::query("UPDATE concept_mappings SET status = 'confirmed' WHERE id = $1")
+        .bind(id)
+        .execute(&a.pool)
+        .await?;
+    assert_eq!(a.grounded("SUM(amount)").await?, (id, false));
+    a.switch(false).await?;
+    assert_eq!(a.grounded("SUM(amount)").await?, (id, false));
+    assert_eq!(a.effective().await?[0].expr.as_deref(), Some("SUM(truth)"));
+    a.cleanup().await
+}
+
+#[tokio::test]
+async fn editing_a_pending_proposal_keeps_it_from_exploration() -> anyhow::Result<()> {
+    let Some(a) = Auto::new().await? else {
+        return Ok(());
+    };
+    let user = a.person().await?;
+    let (id, _) = a
+        .propose(Some(0.5), Some("Unsure"), Some("SUM(amount)"))
+        .await?;
+    utopia_store::mappings::revise(
+        &a.pool,
+        a.kb,
+        id,
+        Some("orders"),
+        Some("SUM(human_amount)"),
+        None,
+        None,
+        None,
+        false,
+        user,
+    )
+    .await?;
+    assert_eq!(a.grounded("SUM(amount)").await?, (id, false));
+    let human = a.pending().await?.remove(0);
+    assert_eq!(human.expr.as_deref(), Some("SUM(human_amount)"));
+    assert_eq!(human.decided_by, Some(user));
+    a.cleanup().await
+}
+
+#[tokio::test]
+async fn editing_clears_the_evidence_of_the_preceding_definition() -> anyhow::Result<()> {
+    let Some(a) = Auto::new().await? else {
+        return Ok(());
+    };
+    let user = a.person().await?;
+    let (id, _) = a.grounded("SUM(amount)").await?;
+    utopia_store::mappings::revise(
+        &a.pool,
+        a.kb,
+        id,
+        Some("orders"),
+        Some("SUM(human_amount)"),
+        None,
+        None,
+        None,
+        false,
+        user,
+    )
+    .await?;
+    let edited = a.effective().await?.remove(0);
+    assert_eq!(edited.confidence, None);
+    assert_eq!(edited.rationale, None);
+    assert_eq!(edited.auto_confirmed_at, None);
+    let revisions = utopia_store::mappings::revisions(&a.pool, a.kb, id).await?;
+    assert_eq!(revisions[0].before["confidence"], 0.9);
+    a.cleanup().await
+}
+
+#[tokio::test]
+async fn a_persons_decision_ends_the_automation_on_that_row() -> anyhow::Result<()> {
+    let Some(a) = Auto::new().await? else {
+        return Ok(());
+    };
+    let user = a.person().await?;
+    let (id, _) = a.grounded("SUM(amount)").await?;
+    for status in ["confirmed", "rejected"] {
+        utopia_store::mappings::decide(&a.pool, a.kb, id, status, user).await?;
+        assert_eq!(a.grounded("SUM(other)").await?, (id, false));
+        let row = utopia_store::mappings::by_ids(&a.pool, a.kb, &[id])
+            .await?
+            .remove(0);
+        assert_eq!(row.status, status);
+        assert_eq!(row.expr.as_deref(), Some("SUM(amount)"));
+        assert_eq!(row.auto_confirmed_at, None);
+    }
+    a.cleanup().await
+}
+
+#[tokio::test]
+async fn a_revert_takes_the_definition_out_of_effect_and_records_who() -> anyhow::Result<()> {
+    let Some(a) = Auto::new().await? else {
+        return Ok(());
+    };
+    let user = a.person().await?;
+    let (id, _) = a.grounded("SUM(amount)").await?;
+    utopia_store::mappings::revert_automatic(&a.pool, a.kb, id, user).await?;
+    assert!(a.effective().await?.is_empty());
+    let back = a.pending().await?.remove(0);
+    assert_eq!(back.expr.as_deref(), Some("SUM(amount)"));
+    assert_eq!(back.decided_by, Some(user));
+    assert_eq!(back.auto_confirmed_at, None);
+    let events = a.events("mapping.auto_confirm_reverted").await?;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].0, Some(user));
+    assert_eq!(events[0].1["before"]["expr"], "SUM(amount)");
+    assert_eq!(
+        utopia_store::mappings::revisions(&a.pool, a.kb, id)
+            .await?
+            .len(),
+        1
+    );
+    a.cleanup().await
+}
+
+#[tokio::test]
+async fn exploration_does_not_confirm_a_reverted_definition_again() -> anyhow::Result<()> {
+    let Some(a) = Auto::new().await? else {
+        return Ok(());
+    };
+    let user = a.person().await?;
+    let (id, _) = a.grounded("SUM(amount)").await?;
+    utopia_store::mappings::revert_automatic(&a.pool, a.kb, id, user).await?;
+    assert_eq!(a.grounded("SUM(amount)").await?, (id, false));
+    assert!(a.effective().await?.is_empty());
+    a.cleanup().await
+}
+
+#[tokio::test]
+async fn a_person_can_still_confirm_a_reverted_definition() -> anyhow::Result<()> {
+    let Some(a) = Auto::new().await? else {
+        return Ok(());
+    };
+    let user = a.person().await?;
+    let (id, _) = a.grounded("SUM(amount)").await?;
+    utopia_store::mappings::revert_automatic(&a.pool, a.kb, id, user).await?;
+    utopia_store::mappings::decide(&a.pool, a.kb, id, "confirmed", user).await?;
+    assert_eq!(a.effective().await?.len(), 1);
+    a.cleanup().await
+}
+
+#[tokio::test]
+async fn only_an_automatic_confirmation_can_be_reverted() -> anyhow::Result<()> {
+    let Some(a) = Auto::new().await? else {
+        return Ok(());
+    };
+    let user = a.person().await?;
+    let (id, _) = a.grounded("SUM(amount)").await?;
+    utopia_store::mappings::decide(&a.pool, a.kb, id, "confirmed", user).await?;
+    let refused = utopia_store::mappings::revert_automatic(&a.pool, a.kb, id, user).await;
+    assert!(matches!(refused, Err(utopia_core::AppError::Conflict(_))));
+    assert_eq!(a.effective().await?[0].decided_by, Some(user));
+    let missing =
+        utopia_store::mappings::revert_automatic(&a.pool, a.kb, Uuid::now_v7(), user).await;
+    assert!(matches!(missing, Err(utopia_core::AppError::NotFound)));
+    a.cleanup().await
+}
+
+#[tokio::test]
+async fn concurrent_automatic_proposals_return_the_stored_id() -> anyhow::Result<()> {
+    let Some(a) = Auto::new().await? else {
+        return Ok(());
+    };
+    let (x, y) = tokio::join!(a.grounded("COUNT(*)"), a.grounded("COUNT(*)"));
+    let (x, y) = (x?, y?);
+    assert_eq!(x, y);
+    let ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT target_id FROM audit_events WHERE kb_id = $1 AND action = 'mapping.auto_confirmed'",
+    )
+    .bind(a.kb)
+    .fetch_all(&a.pool)
+    .await?;
+    assert_eq!(ids, vec![x.0, x.0]);
+    a.cleanup().await
+}

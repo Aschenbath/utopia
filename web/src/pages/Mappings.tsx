@@ -366,6 +366,13 @@ function MappingRow({
     onSettled: () => onDecisionPending(false),
   });
 
+  const revert = useMutation({
+    mutationFn: () => api.revertMapping(kbId, m.id),
+    onSuccess: onChanged,
+    onError: (e: unknown) => toast.error((e as Error).message),
+  });
+
+  const automatic = m.auto_confirmed_at !== null;
   const how = howComputed(m);
   return (
     <div className={cn("px-4 py-3", picked && "u-picked")}>
@@ -393,6 +400,9 @@ function MappingRow({
             {S.mapping.derivedBadge}
           </Chip>
         )}
+        {automatic && (
+          <Chip tone="warn" className="text-fine">{S.mapping.autoConfirmed}</Chip>
+        )}
         <span className="flex-1" />
         <Status tone={TONE[m.status]} className="text-fine">
           {statusLabel(m.status)}
@@ -409,6 +419,13 @@ function MappingRow({
       </div>
       {m.summary && (
         <p className="mt-1 text-small text-ink-2">{m.summary}</p>
+      )}
+
+      {m.confidence !== null && (
+        <p className="mt-1 text-small text-ink-2">{S.mapping.confidence(m.confidence)}</p>
+      )}
+      {m.rationale && (
+        <p className="mt-1 text-small text-ink-2">{S.mapping.rationale(m.rationale)}</p>
       )}
 
       {editing ? (
@@ -431,7 +448,7 @@ function MappingRow({
            拒绝**静止时就该是红的**：它是点了就生效的那一下，人要在按之前
            看出来它跟「编辑」不是一类，而不是划过去才发现。 */
         <div className="mt-2 -ml-2 flex items-center gap-1 flex-wrap">
-          {m.status === "proposed" && (
+          {(m.status === "proposed" || automatic) && (
             <>
               <Button variant="secondary" size="sm" className="ml-2"
                 disabled={decide.isPending || batchPending || picked}
@@ -448,6 +465,14 @@ function MappingRow({
                 {S.mapping.reject}
               </Button>
             </>
+          )}
+          {automatic && (
+            <Button variant="ghost" size="sm"
+              disabled={revert.isPending || batchPending}
+              onClick={() => revert.mutate()}
+            >
+              {S.mapping.revertAutomatic}
+            </Button>
           )}
           <Button variant="ghost" size="sm" onClick={() => setEditing(true)}>
             {S.mapping.edit}

@@ -55,6 +55,10 @@ pub struct UpdateKbReq {
     /// 打开那一刻就排一轮，关掉后任务在两簇之间看到就停。见 docs/decisions/0025
     #[serde(default)]
     pub governance: Option<bool>,
+    /// 口径自动确认开关（缺省关）：Editor 就能改，因为确认一条口径本来就是 Editor 的权限。
+    /// 见 docs/decisions/0011 的 #504 修订
+    #[serde(default)]
+    pub auto_confirm_mappings: Option<bool>,
     /// 人写的数据约定（「测试单不算数」这类 schema 里没有的规则），问数与探索的
     /// 提示词都读它。探索生成的描述在另一个字段，PATCH 不了。见 #570
     #[serde(default)]
@@ -122,6 +126,7 @@ pub async fn create(
             None,
             None,
             Some(v),
+            None,
             None,
             None,
             None,
@@ -210,7 +215,44 @@ pub async fn update(
     Path(id): Path<Uuid>,
     Json(req): Json<UpdateKbReq>,
 ) -> ApiResult<Json<KnowledgeBase>> {
-    kb_with_role(&state, &user, id, Role::Admin).await?;
+    // 只改口径开关的请求 Editor 就够，夹带别的字段照旧要 Admin。**这里故意解构、不写 `..`**：
+    // 往 `UpdateKbReq` 加字段时这里编译不过，加字段的人得想清楚它归谁改；
+    // 从前是一串 `is_none()`，漏列一个，新字段就成了 Editor 能改的
+    let UpdateKbReq {
+        name,
+        description,
+        visibility,
+        auto_extend_ontology,
+        ontology_lang,
+        materialize_inferences,
+        inference_interval_minutes,
+        auto_type_resolution,
+        governance,
+        auto_confirm_mappings,
+        data_conventions,
+    } = &req;
+    let setting_only = auto_confirm_mappings.is_some()
+        && name.is_none()
+        && description.is_none()
+        && visibility.is_none()
+        && auto_extend_ontology.is_none()
+        && ontology_lang.is_none()
+        && materialize_inferences.is_none()
+        && inference_interval_minutes.is_none()
+        && auto_type_resolution.is_none()
+        && governance.is_none()
+        && data_conventions.is_none();
+    kb_with_role(
+        &state,
+        &user,
+        id,
+        if setting_only {
+            Role::Editor
+        } else {
+            Role::Admin
+        },
+    )
+    .await?;
     let kb = utopia_store::kbs::update(
         &state.pool,
         id,
@@ -224,6 +266,7 @@ pub async fn update(
         req.auto_type_resolution,
         req.governance,
         req.data_conventions.as_deref().map(str::trim),
+        req.auto_confirm_mappings,
     )
     .await?;
     // 打开开关就自动开始处理：排一轮，同库已排着的不重复
@@ -244,6 +287,7 @@ pub async fn update(
             "name": req.name,
             "visibility": req.visibility,
             "governance": req.governance,
+            "auto_confirm_mappings": req.auto_confirm_mappings,
             "data_conventions": req.data_conventions.is_some(),
         }),
     )
@@ -495,4 +539,304 @@ pub async fn list_packs(AuthUser(_): AuthUser) -> ApiResult<Json<serde_json::Val
         })
         .collect();
     Ok(Json(json!({ "packs": packs })))
+}
+
+#[cfg(test)]
+mod mapping_confirmation_tests {
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Request, StatusCode};
+    use serde_json::{json, Value};
+    use std::sync::Arc;
+    use tower::ServiceExt;
+    use uuid::Uuid;
+
+    /// 一个库三种角色，外加一个 Editor 不是成员的库。
+    struct Fixture {
+        pool: sqlx::PgPool,
+        state: crate::state::AppState,
+        cfg: utopia_core::config::AppConfig,
+        _dir: tempfile::TempDir,
+        kb: Uuid,
+        other: Uuid,
+        admin: Uuid,
+        editor: Uuid,
+        viewer: Uuid,
+    }
+
+    impl Fixture {
+        async fn new() -> anyhow::Result<Option<Self>> {
+            let Some(url) = utopia_store::test_db::url() else {
+                return Ok(None);
+            };
+            let pool = sqlx::PgPool::connect(&url).await?;
+            utopia_store::db::migrate(&pool).await?;
+            let [org, ws, kb, other, admin, editor, viewer] =
+                std::array::from_fn(|_| Uuid::now_v7());
+            sqlx::raw_sql(&format!(
+                "INSERT INTO organizations(id,name) VALUES ('{org}','auto-mapping-route');
+                 INSERT INTO workspaces(id,org_id,name) VALUES ('{ws}','{org}','auto-mapping-route');
+                 INSERT INTO knowledge_bases(id,workspace_id,name,visibility) VALUES
+                   ('{kb}','{ws}','mappings','restricted'), ('{other}','{ws}','other','restricted');
+                 INSERT INTO users(id,org_id,email,display_name,password_hash) VALUES
+                   ('{admin}','{org}','{admin}@map.test','Admin','unused'),
+                   ('{editor}','{org}','{editor}@map.test','Editor','unused'),
+                   ('{viewer}','{org}','{viewer}@map.test','Viewer','unused');
+                 INSERT INTO kb_members(kb_id,user_id,role) VALUES
+                   ('{kb}','{admin}','admin'), ('{kb}','{editor}','editor'), ('{kb}','{viewer}','viewer');"
+            ))
+            .execute(&pool)
+            .await?;
+            let dir = tempfile::tempdir()?;
+            let cfg = utopia_core::config::AppConfig {
+                data_dir: dir.path().to_string_lossy().into_owned(),
+                ..Default::default()
+            };
+            let state = crate::state::AppState::new(
+                pool.clone(),
+                &cfg,
+                Arc::new(utopia_search::SearchIndex::open(
+                    &dir.path().join("search"),
+                )?),
+                "test-only".into(),
+            );
+            Ok(Some(Self {
+                pool,
+                state,
+                cfg,
+                _dir: dir,
+                kb,
+                other,
+                admin,
+                editor,
+                viewer,
+            }))
+        }
+
+        async fn send(
+            &self,
+            user: Uuid,
+            method: &str,
+            path: String,
+            body: Value,
+        ) -> anyhow::Result<(StatusCode, Value)> {
+            let token = crate::auth::issue_token(&self.state, user)?;
+            let response = crate::api::router(self.state.clone(), &self.cfg)
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header("authorization", format!("Bearer {token}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))?,
+                )
+                .await?;
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), 1024 * 1024).await?;
+            Ok((
+                status,
+                serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+            ))
+        }
+
+        async fn patch(
+            &self,
+            user: Uuid,
+            base: Uuid,
+            body: Value,
+        ) -> anyhow::Result<(StatusCode, Value)> {
+            self.send(user, "PATCH", format!("/api/v1/kbs/{base}"), body)
+                .await
+        }
+
+        async fn switch_is_on(&self) -> anyhow::Result<bool> {
+            Ok(utopia_store::kbs::get(&self.pool, self.kb)
+                .await?
+                .auto_confirm_mappings)
+        }
+
+        /// 库里放一条机器确认的口径，返回它的 id。
+        async fn automatic_mapping(&self) -> anyhow::Result<Uuid> {
+            let entity = Uuid::now_v7();
+            sqlx::query(
+                "INSERT INTO entities (id, kb_id, canonical_name) VALUES ($1, $2, 'Revenue')",
+            )
+            .bind(entity)
+            .bind(self.kb)
+            .execute(&self.pool)
+            .await?;
+            sqlx::query("UPDATE knowledge_bases SET auto_confirm_mappings = true WHERE id = $1")
+                .bind(self.kb)
+                .execute(&self.pool)
+                .await?;
+            let (id, written) = utopia_store::mappings::propose_with_evidence(
+                &self.pool,
+                self.kb,
+                entity,
+                "warehouse",
+                None,
+                Some("SUM(amount)"),
+                None,
+                None,
+                None,
+                false,
+                Some(0.9),
+                Some("The schema states revenue"),
+            )
+            .await?;
+            assert!(written);
+            Ok(id)
+        }
+
+        async fn cleanup(self) -> anyhow::Result<()> {
+            sqlx::query("DELETE FROM knowledge_bases WHERE id = ANY($1)")
+                .bind(&[self.kb, self.other][..])
+                .execute(&self.pool)
+                .await?;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn an_editor_can_turn_the_switch_on_and_off() -> anyhow::Result<()> {
+        let Some(f) = Fixture::new().await? else {
+            return Ok(());
+        };
+        assert!(!f.switch_is_on().await?);
+        let (status, body) = f
+            .patch(f.editor, f.kb, json!({"auto_confirm_mappings": true}))
+            .await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["auto_confirm_mappings"], true);
+        let (status, body) = f
+            .patch(f.editor, f.kb, json!({"auto_confirm_mappings": false}))
+            .await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["auto_confirm_mappings"], false);
+        f.cleanup().await
+    }
+
+    #[tokio::test]
+    async fn each_change_of_the_switch_is_audited_with_its_actor() -> anyhow::Result<()> {
+        let Some(f) = Fixture::new().await? else {
+            return Ok(());
+        };
+        f.patch(f.editor, f.kb, json!({"auto_confirm_mappings": true}))
+            .await?;
+        f.patch(f.editor, f.kb, json!({"auto_confirm_mappings": false}))
+            .await?;
+        let events: Vec<Value> = sqlx::query_scalar(
+            "SELECT detail FROM audit_events
+              WHERE kb_id = $1 AND actor_id = $2 AND action = 'kb.updated' ORDER BY created_at",
+        )
+        .bind(f.kb)
+        .bind(f.editor)
+        .fetch_all(&f.pool)
+        .await?;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["auto_confirm_mappings"], true);
+        assert_eq!(events[1]["auto_confirm_mappings"], false);
+        f.cleanup().await
+    }
+
+    #[tokio::test]
+    async fn a_viewer_cannot_change_the_switch() -> anyhow::Result<()> {
+        let Some(f) = Fixture::new().await? else {
+            return Ok(());
+        };
+        let (status, _) = f
+            .patch(f.viewer, f.kb, json!({"auto_confirm_mappings": true}))
+            .await?;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(!f.switch_is_on().await?);
+        f.cleanup().await
+    }
+
+    #[tokio::test]
+    async fn an_editor_of_another_base_does_not_see_this_one() -> anyhow::Result<()> {
+        let Some(f) = Fixture::new().await? else {
+            return Ok(());
+        };
+        let (status, _) = f
+            .patch(f.editor, f.other, json!({"auto_confirm_mappings": true}))
+            .await?;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        f.cleanup().await
+    }
+
+    #[tokio::test]
+    async fn a_request_that_changes_anything_else_still_needs_an_admin() -> anyhow::Result<()> {
+        let Some(f) = Fixture::new().await? else {
+            return Ok(());
+        };
+        let (status, _) = f
+            .patch(
+                f.editor,
+                f.kb,
+                json!({"auto_confirm_mappings": true, "name": "Changed"}),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(!f.switch_is_on().await?);
+        f.cleanup().await
+    }
+
+    #[tokio::test]
+    async fn a_request_without_the_switch_leaves_it_as_it_is() -> anyhow::Result<()> {
+        let Some(f) = Fixture::new().await? else {
+            return Ok(());
+        };
+        f.patch(f.admin, f.kb, json!({"auto_confirm_mappings": true}))
+            .await?;
+        let (status, _) = f
+            .patch(f.admin, f.kb, json!({"description": "Changed"}))
+            .await?;
+        assert_eq!(status, StatusCode::OK);
+        assert!(f.switch_is_on().await?);
+        f.cleanup().await
+    }
+
+    #[tokio::test]
+    async fn an_editor_can_revert_an_automatic_confirmation() -> anyhow::Result<()> {
+        let Some(f) = Fixture::new().await? else {
+            return Ok(());
+        };
+        let id = f.automatic_mapping().await?;
+        let (status, _) = f
+            .send(
+                f.editor,
+                "POST",
+                format!("/api/v1/kbs/{}/mappings/{id}/revert", f.kb),
+                json!({}),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::OK);
+        assert!(utopia_store::mappings::confirmed(&f.pool, f.kb, 10)
+            .await?
+            .is_empty());
+        f.cleanup().await
+    }
+
+    #[tokio::test]
+    async fn a_viewer_cannot_revert_an_automatic_confirmation() -> anyhow::Result<()> {
+        let Some(f) = Fixture::new().await? else {
+            return Ok(());
+        };
+        let id = f.automatic_mapping().await?;
+        let (status, _) = f
+            .send(
+                f.viewer,
+                "POST",
+                format!("/api/v1/kbs/{}/mappings/{id}/revert", f.kb),
+                json!({}),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            utopia_store::mappings::confirmed(&f.pool, f.kb, 10)
+                .await?
+                .len(),
+            1
+        );
+        f.cleanup().await
+    }
 }

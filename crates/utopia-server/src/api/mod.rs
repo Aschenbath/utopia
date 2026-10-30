@@ -257,6 +257,10 @@ pub fn router(state: AppState, cfg: &AppConfig) -> Router {
             axum::routing::patch(mapping_routes::revise),
         )
         .route(
+            "/kbs/{id}/mappings/{mapping_id}/revert",
+            post(mapping_routes::revert),
+        )
+        .route(
             "/kbs/{id}/mappings/{mapping_id}/revisions",
             get(mapping_routes::revisions),
         )
