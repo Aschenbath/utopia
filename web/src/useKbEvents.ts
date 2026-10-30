@@ -53,28 +53,42 @@ export function createInvalidationCoalescer(
   return { push, flush };
 }
 
+/**
+ * 一个库的两层合并：快的键按 `SETTLE_MS`，全图 overview 按 `OVERVIEW_SETTLE_MS`。
+ *
+ * overview 到点只失效它自己（#1463）：从前到点是 `push` 再 `flush`，快那层攒着的键
+ * 跟着提前失效，没等够自己的静默期。只有 `flushAll` 才经快的那层走：重连补上的
+ * `["graph", kbId]` 已覆盖 overview，不再多取一遍。
+ */
+export function createKbInvalidations(invalidate: (key: QueryKey) => void, kbId: string) {
+  const { push, flush } = createInvalidationCoalescer(invalidate, SETTLE_MS);
+  let flushing = false;
+  const overview = createInvalidationCoalescer((key) => {
+    if (flushing) push(key);
+    else invalidate(key);
+  }, OVERVIEW_SETTLE_MS);
+  const pushGraph = () => {
+    push(["graph", kbId, "neighborhood"]);
+    overview.push(["graph", kbId, "overview"]);
+  };
+  const flushAll = () => {
+    flushing = true;
+    overview.flush();
+    flushing = false;
+    flush();
+  };
+  return { push, pushGraph, flushAll };
+}
+
 export function useKbEvents(kbId: string | undefined) {
   const queryClient = useQueryClient();
 
   useEffect(() => {
     if (!kbId) return;
-    const { push, flush } = createInvalidationCoalescer(
+    const { push, pushGraph, flushAll } = createKbInvalidations(
       (key) => queryClient.invalidateQueries({ queryKey: key }),
-      SETTLE_MS,
+      kbId,
     );
-    // overview 到点也经快的那层刷：重连补上的 ["graph", kbId] 已覆盖它，不再多取一遍
-    const overview = createInvalidationCoalescer((key) => {
-      push(key);
-      flush();
-    }, OVERVIEW_SETTLE_MS);
-    const pushGraph = () => {
-      push(["graph", kbId, "neighborhood"]);
-      overview.push(["graph", kbId, "overview"]);
-    };
-    const flushAll = () => {
-      overview.flush();
-      flush();
-    };
 
     const unsubscribe = subscribeEvents(
       `/api/v1/kbs/${kbId}/events`,
